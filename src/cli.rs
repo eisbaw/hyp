@@ -913,3 +913,12 @@ pub fn seed_demo(store: &Store) -> Result<()> {
     store.commit(vec![create(a)], None)?;
     Ok(())
 }
+/// Process exit code for a failed command: 3 when a write lost a race
+/// (a `Conflict`, retry after re-reading), otherwise 1.
+pub fn exit_code(err: &anyhow::Error) -> i32 {
+    if crate::store::Conflict::in_chain(err) {
+        3
+    } else {
+        1
+    }
+}

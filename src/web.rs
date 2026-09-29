@@ -1,6 +1,6 @@
 use crate::{
     model::Snapshot,
-    store::{Change, Store},
+    store::{Change, Conflict, Store},
 };
 use anyhow::Result;
 use axum::{
@@ -27,22 +27,27 @@ pub struct AppState {
     pub port: u16,
     pub events: watch::Sender<String>,
 }
+/// An error answered as `{"error": message}`. The status comes from the error's
+/// type: 409 for a `Conflict` anywhere in the chain, otherwise 422.
 #[derive(Debug)]
-struct ApiError(anyhow::Error);
+struct ApiError {
+    status: StatusCode,
+    error: anyhow::Error,
+}
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let message = format!("{:#}", self.0);
-        let status = if message.starts_with("conflict:") {
+        let message = format!("{:#}", self.error);
+        (self.status, Json(serde_json::json!({"error":message}))).into_response()
+    }
+}
+impl From<anyhow::Error> for ApiError {
+    fn from(error: anyhow::Error) -> Self {
+        let status = if Conflict::in_chain(&error) {
             StatusCode::CONFLICT
         } else {
             StatusCode::UNPROCESSABLE_ENTITY
         };
-        (status, Json(serde_json::json!({"error":message}))).into_response()
-    }
-}
-impl From<anyhow::Error> for ApiError {
-    fn from(e: anyhow::Error) -> Self {
-        Self(e)
+        Self { status, error }
     }
 }
 async fn guard(
@@ -112,12 +117,13 @@ async fn mutate(
     Json(tx): Json<Transaction>,
 ) -> std::result::Result<Json<Snapshot>, ApiError> {
     if headers.get("x-hyp-token").and_then(|v| v.to_str().ok()) != Some(s.token.as_str()) {
-        return Err(ApiError(anyhow::anyhow!("invalid session token")));
+        return Err(ApiError {
+            status: StatusCode::FORBIDDEN,
+            error: anyhow::anyhow!("invalid session token"),
+        });
     }
     if tx.changes.is_empty() || tx.changes.len() > 100 {
-        return Err(ApiError(anyhow::anyhow!(
-            "transaction must contain 1–100 changes"
-        )));
+        return Err(anyhow::anyhow!("transaction must contain 1–100 changes").into());
     }
     let store = s.store.clone();
     let snap =
@@ -135,7 +141,11 @@ async fn events(
     Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
 }
 async fn report(State(s): State<Arc<AppState>>) -> std::result::Result<Html<String>, ApiError> {
-    Ok(Html(export_html(&s.store.snapshot()?)?))
+    let store = s.store.clone();
+    let html = tokio::task::spawn_blocking(move || export_html(&store.snapshot()?))
+        .await
+        .map_err(anyhow::Error::from)??;
+    Ok(Html(html))
 }
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
@@ -162,23 +172,42 @@ pub async fn serve(store: Store, port: u16) -> Result<()> {
         events,
     });
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut watcher = notify::recommended_watcher(move |_: notify::Result<notify::Event>| {
+    let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+        if let Err(err) = event {
+            eprintln!("hyp web: file watcher error (changes are still polled every 2 s): {err}");
+        }
+        // Fails only after the monitor stopped, when nobody needs the wake-up.
         let _ = tx.send(());
     })?;
     watcher.watch(&store.root.join("hyp"), notify::RecursiveMode::Recursive)?;
     let monitor = state.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(2));
+        // Logged once per distinct cause, not on every poll while it persists.
+        let mut last_error: Option<String> = None;
         loop {
             tokio::select! {_ = tick.tick()=>{},event=rx.recv()=>{if event.is_none(){break;}tokio::time::sleep(Duration::from_millis(120)).await;while rx.try_recv().is_ok(){}}}
             let store = monitor.store.clone();
-            match tokio::task::spawn_blocking(move || store.snapshot()).await {
-                Ok(Ok(snap)) => {
+            let result = tokio::task::spawn_blocking(move || store.snapshot())
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|snapshot| snapshot);
+            match result {
+                Ok(snap) => {
+                    if let Some(cause) = last_error.take() {
+                        eprintln!("hyp web: project readable again (was: {cause})");
+                    }
                     if *monitor.events.borrow() != snap.revision {
                         monitor.events.send_replace(snap.revision);
                     }
                 }
-                _ => {
+                Err(err) => {
+                    let cause = format!("{err:#}");
+                    if last_error.as_ref() != Some(&cause) {
+                        eprintln!("hyp web: cannot read project: {cause}");
+                    }
+                    last_error = Some(cause);
+                    // Clients re-fetch /api/snapshot, whose error body carries the cause.
                     monitor.events.send_replace("unavailable".into());
                 }
             }

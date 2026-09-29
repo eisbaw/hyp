@@ -245,6 +245,25 @@ async function main() {
   );
   fs.writeFileSync(filename, original);
   await wait(() => w.document.querySelector("#notice").hidden, "recovery");
+  const hypDir = path.join(root, "hyp");
+  fs.renameSync(hypDir, hypDir + ".moved");
+  await wait(
+    () =>
+      w.document
+        .querySelector("#connection")
+        .textContent.startsWith("Unavailable") &&
+      w.document
+        .querySelector("#notice")
+        .textContent.includes(path.basename(root) + "/hyp"),
+    "unavailable project explained with its cause",
+  );
+  fs.renameSync(hypDir + ".moved", hypDir);
+  await wait(
+    () =>
+      w.document.querySelector("#notice").hidden &&
+      w.document.querySelector("#connection").textContent === "Live",
+    "recovery from unavailable project",
+  );
   const html = cli("export", "--format", "html");
   const report = new JSDOM(html, {
     url: "file:///hyp-report.html",
@@ -258,7 +277,7 @@ async function main() {
   );
   assert.deepEqual(errors, []);
   console.log(
-    "PASS: DOM forms, real HTTP writes, CLI↔UI SSE updates, editor changes, two tabs, dirty-form preservation, conflicts, criteria, evidence interpretations, falsification assessment, all views, malformed-file recovery and offline export.",
+    "PASS: DOM forms, real HTTP writes, CLI↔UI SSE updates, editor changes, two tabs, dirty-form preservation, conflicts, criteria, evidence interpretations, falsification assessment, all views, malformed-file recovery, unavailable-project cause and offline export.",
   );
 }
 main()

@@ -596,3 +596,58 @@ fn archived_references_still_prevent_deletion() {
             .contains("referenced")
     );
 }
+#[test]
+fn conflicts_are_classified_by_type_even_when_wrapped_in_context() {
+    let (_d, store) = project();
+    let stale = store
+        .commit(
+            vec![Change::Create {
+                record: hypothesis(),
+            }],
+            Some("stale-revision"),
+        )
+        .unwrap_err();
+    assert!(format!("{stale:#}").starts_with("conflict:"));
+    assert_eq!(hyp::cli::exit_code(&stale), 3);
+    let wrapped = stale.context("while applying a batch");
+    assert_eq!(hyp::cli::exit_code(&wrapped), 3);
+    let ordinary = anyhow::anyhow!("conflict: looks like one but is only text");
+    assert_eq!(hyp::cli::exit_code(&ordinary), 1);
+}
+#[test]
+fn missing_data_directories_are_recreated_but_non_directories_rejected() {
+    let (_d, store) = project();
+    create(&store, &hypothesis());
+    std::fs::remove_dir(store.root.join("hyp/assets")).unwrap();
+    std::fs::remove_dir(store.root.join("hyp/gaps")).unwrap();
+    std::fs::remove_dir_all(store.root.join(".hyp")).unwrap();
+    let reopened = Store::open(&store.root).unwrap();
+    assert_eq!(reopened.snapshot().unwrap().objects.len(), 1);
+    assert!(store.root.join("hyp/assets").is_dir());
+    assert!(store.root.join("hyp/gaps").is_dir());
+    assert!(store.root.join(".hyp/.gitignore").is_file());
+    let links = store.root.join("hyp/links");
+    std::fs::remove_dir(&links).unwrap();
+    std::fs::write(&links, "not a directory").unwrap();
+    let err = format!("{:#}", Store::open(&store.root).unwrap_err());
+    assert!(err.contains("hyp/links"), "{err}");
+    std::fs::remove_file(&links).unwrap();
+    std::os::unix::fs::symlink(store.root.join("hyp/gaps"), &links).unwrap();
+    let err = format!("{:#}", Store::open(&store.root).unwrap_err());
+    assert!(err.contains("hyp/links"), "{err}");
+}
+#[test]
+fn io_errors_name_the_offending_path() {
+    let (d, store) = project();
+    let moved = d.path().join("moved");
+    std::fs::rename(store.root.join("hyp"), &moved).unwrap();
+    let err = format!("{:#}", store.snapshot().unwrap_err());
+    assert!(
+        err.contains(&store.root.join("hyp").display().to_string()),
+        "{err}"
+    );
+    std::fs::rename(&moved, store.root.join("hyp")).unwrap();
+    std::fs::write(store.root.join("hyp/config.toml"), "schema_version = \"x\"").unwrap();
+    let err = format!("{:#}", Store::open(&store.root).unwrap_err());
+    assert!(err.contains("hyp/config.toml"), "{err}");
+}

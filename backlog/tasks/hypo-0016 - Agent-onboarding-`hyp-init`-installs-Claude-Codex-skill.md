@@ -4,7 +4,7 @@ title: 'Agent onboarding: `hyp init` installs Claude/Codex skill'
 status: To Do
 assignee: []
 created_date: '2026-09-29 22:23'
-updated_date: '2026-09-29 22:31'
+updated_date: '2026-09-29 23:15'
 labels:
   - agents
   - cli
@@ -47,6 +47,7 @@ Per decision-0001, installing agent files must not require or assume Git.
 - [ ] #5 Integration tests: fresh install, re-install, update after a version bump, remove; all in a plain directory without Git
 - [ ] #6 Dogfood: a Claude Code session in a sample project, given only the skill, uses hyp correctly on a small debugging task (transcript summary in the task notes)
 - [ ] #7 Skill content covers the method (hypothesis before action, falsify-if first, cited evidence, conflict retry, no direct file edits) and states the assessment policy: agents may record any assessment, but each must cite at least one evidence ID and a rationale
+- [ ] #8 The machine contract is documented in the README and the skill: exit codes 0/1/2/3, 141 (output pipe closed; a write may already be on disk), HTTP 403/409/422, and that conflict messages start with 'conflict:'
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -58,3 +59,12 @@ Build bottom-up:
 3. Only then add `hyp init --agents` and the install/update/remove commands with managed blocks.
 Depends on HYPO-0007 (a reliable exit code 3 for 'retry on conflict') and HYPO-0002 (agents otherwise hit spurious conflicts).
 <!-- SECTION:PLAN:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Forward-carried from HYPO-0007 and HYPO-0018, for the agent skill:
+- Exit codes: 0 success; 1 any other error; 3 conflict (store::Conflict in the error chain: re-read with 'hyp --json list/show' and retry). Errors go to stderr; with --json as {"error": "..."}, and a conflict message starts with 'conflict:'. There is no machine-readable error kind field yet; add one if the skill needs more than the exit code.
+- Closed stdout: every command except 'hyp web' now dies quietly from SIGPIPE (shell status 141) when its stdout is closed early (hyp list | head). A write command prints after committing, so 'hyp add ... | head -c0' reports 141 although the record was written; under 'set -o pipefail' that looks like a failure. Tell agents not to truncate the output of write commands, or to check with 'hyp list' afterwards.
+- WebUI API: 403 for a missing/invalid x-hyp-token, 409 for conflicts, 422 for other rejected input.
+<!-- SECTION:NOTES:END -->

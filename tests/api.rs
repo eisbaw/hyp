@@ -60,6 +60,9 @@ async fn api_and_cli_store_share_state_and_reject_stale_writes() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::CONFLICT);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(error["error"].as_str().unwrap().starts_with("conflict:"));
 }
 #[tokio::test]
 async fn rejects_foreign_host_origin_and_missing_token() {
@@ -86,7 +89,58 @@ async fn rejects_foreign_host_origin_and_missing_token() {
         serde_json::json!({"expected_revision":store.snapshot().unwrap().revision,"changes":[]}),
     );
     request.headers_mut().remove("x-hyp-token");
-    assert_ne!(app.oneshot(request).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(
+        app.clone().oneshot(request).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    let r = serde_json::json!({"kind":"hypothesis","title":"Forged","scope":"","assumptions":"","lifecycle":"draft","untestable_reason":""});
+    let mut request = req(
+        "POST",
+        "/api/transaction",
+        serde_json::json!({"expected_revision":store.snapshot().unwrap().revision,"changes":[{"op":"create","record":r}]}),
+    );
+    request
+        .headers_mut()
+        .insert("x-hyp-token", "wrong-token".parse().unwrap());
+    assert_eq!(
+        app.oneshot(request).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    assert!(store.snapshot().unwrap().objects.is_empty());
+}
+#[tokio::test]
+async fn report_does_not_block_the_runtime_while_the_store_is_locked() {
+    use fs2::FileExt;
+    let (_dir, app, store) = app();
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(store.root.join(".hyp/write.lock"))
+        .unwrap();
+    lock.lock_exclusive().unwrap();
+    let holder = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        drop(lock);
+    });
+    // On this single-threaded test runtime a handler that blocks on the lock
+    // stalls the timer too, so the request would complete instead of timing out.
+    let pending = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        app.clone()
+            .oneshot(req("GET", "/report.html", serde_json::Value::Null)),
+    )
+    .await;
+    assert!(pending.is_err(), "report blocked the async runtime");
+    holder.join().unwrap();
+    let response = app
+        .oneshot(req("GET", "/report.html", serde_json::Value::Null))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    assert!(String::from_utf8_lossy(&bytes).contains("HYP_EXPORT"));
 }
 #[tokio::test]
 async fn sse_delivers_initial_revision_and_security_headers() {

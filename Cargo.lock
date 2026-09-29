@@ -452,6 +452,7 @@ dependencies = [
  "clap",
  "fs2",
  "http-body-util",
+ "libc",
  "notify",
  "serde",
  "serde_json",

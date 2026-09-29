@@ -20,6 +20,24 @@ pub const DIRECTORIES: &[&str] = &[
     "assessments",
     "gaps",
 ];
+/// A write precondition failed: the project or an object changed since the
+/// caller read it. The CLI exits with code 3 and the API answers 409 when this
+/// type is anywhere in the error chain, so wrapping it in `.context()` does not
+/// change its classification. The message starts with "conflict:", which the
+/// WebUI and agents read.
+#[derive(Debug)]
+pub struct Conflict(pub String);
+impl std::fmt::Display for Conflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "conflict: {}", self.0)
+    }
+}
+impl std::error::Error for Conflict {}
+impl Conflict {
+    pub fn in_chain(err: &anyhow::Error) -> bool {
+        err.chain().any(|cause| cause.is::<Conflict>())
+    }
+}
 #[derive(Debug, Clone)]
 pub struct Store {
     pub root: PathBuf,
@@ -81,7 +99,8 @@ fn atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 fn safe_dir(path: &Path) -> Result<()> {
-    let meta = fs::symlink_metadata(path)?;
+    let meta =
+        fs::symlink_metadata(path).with_context(|| format!("cannot inspect {}", path.display()))?;
     ensure!(
         meta.is_dir() && !meta.file_type().is_symlink(),
         "expected a real directory: {}",
@@ -89,18 +108,31 @@ fn safe_dir(path: &Path) -> Result<()> {
     );
     Ok(())
 }
+/// Create `path` if it is missing, then require a real directory. Copies,
+/// syncs and Git clones drop empty directories, so their absence is normal.
+/// The parent must already exist: a missing `hyp/` is not silently recreated.
+fn ensure_dir(path: &Path) -> Result<()> {
+    match fs::create_dir(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => {
+            return Err(e).with_context(|| format!("cannot create {}", path.display()));
+        }
+    }
+    safe_dir(path)
+}
 impl Store {
     pub fn init(root: &Path) -> Result<Self> {
-        fs::create_dir_all(root)?;
-        let root = root.canonicalize()?;
+        fs::create_dir_all(root).with_context(|| format!("cannot create {}", root.display()))?;
+        let root = root
+            .canonicalize()
+            .with_context(|| format!("cannot open {}", root.display()))?;
         ensure!(
             !root.join("hyp").exists(),
             "hyp/ already exists; refusing to overwrite it"
         );
-        fs::create_dir(root.join("hyp"))?;
-        for dir in DIRECTORIES.iter().copied().chain(["assets"]) {
-            fs::create_dir(root.join("hyp").join(dir))?;
-        }
+        fs::create_dir(root.join("hyp"))
+            .with_context(|| format!("cannot create {}", root.join("hyp").display()))?;
         let config = Config {
             schema_version: 1,
             name: root
@@ -113,9 +145,9 @@ impl Store {
             &root.join("hyp/config.toml"),
             toml::to_string_pretty(&config)?.as_bytes(),
         )?;
-        fs::create_dir_all(root.join(".hyp"))?;
-        atomic(&root.join(".hyp/.gitignore"), b"*\n")?;
-        Ok(Self { root })
+        let store = Self { root };
+        store.ensure_layout()?;
+        Ok(store)
     }
     pub fn open(path: &Path) -> Result<Self> {
         let mut path = path
@@ -125,10 +157,13 @@ impl Store {
             path.pop();
         }
         loop {
-            if path.join("hyp/config.toml").is_file() {
+            let config = path.join("hyp/config.toml");
+            if config.is_file() {
                 safe_dir(&path.join("hyp"))?;
-                let cfg: Config =
-                    toml::from_str(&fs::read_to_string(path.join("hyp/config.toml"))?)?;
+                let text = fs::read_to_string(&config)
+                    .with_context(|| format!("cannot read {}", config.display()))?;
+                let cfg: Config = toml::from_str(&text)
+                    .with_context(|| format!("invalid {}", config.display()))?;
                 ensure!(
                     cfg.schema_version == 1,
                     "unsupported schema version {}",
@@ -141,13 +176,20 @@ impl Store {
             ensure!(path.pop(), "no hyp project found; run hyp init");
         }
     }
+    /// Idempotent: creates missing data directories and `.hyp/` (with a
+    /// `.gitignore`, harmless without Git) and rejects symlinks or files in
+    /// their place.
     fn ensure_layout(&self) -> Result<()> {
         safe_dir(&self.root.join("hyp"))?;
         for dir in DIRECTORIES.iter().copied().chain(["assets"]) {
-            safe_dir(&self.root.join("hyp").join(dir))?;
+            ensure_dir(&self.root.join("hyp").join(dir))?;
         }
-        fs::create_dir_all(self.root.join(".hyp"))?;
-        safe_dir(&self.root.join(".hyp"))?;
+        ensure_dir(&self.root.join(".hyp"))?;
+        let gitignore = self.root.join(".hyp/.gitignore");
+        if fs::symlink_metadata(&gitignore).is_err() {
+            atomic(&gitignore, b"*\n")
+                .with_context(|| format!("cannot write {}", gitignore.display()))?;
+        }
         Ok(())
     }
     fn lock(&self) -> Result<File> {
@@ -164,8 +206,10 @@ impl Store {
             .truncate(false)
             .read(true)
             .write(true)
-            .open(path)?;
-        f.lock_exclusive()?;
+            .open(&path)
+            .with_context(|| format!("cannot open {}", path.display()))?;
+        f.lock_exclusive()
+            .with_context(|| format!("cannot lock {}", path.display()))?;
         self.recover()?;
         Ok(f)
     }
@@ -203,8 +247,10 @@ impl Store {
             !journal.symlink_metadata()?.file_type().is_symlink(),
             "transaction journal is a symlink"
         );
-        let writes: BTreeMap<String, Option<String>> =
-            serde_json::from_slice(&fs::read(&journal)?)?;
+        let writes: BTreeMap<String, Option<String>> = serde_json::from_slice(
+            &fs::read(&journal).with_context(|| format!("cannot read {}", journal.display()))?,
+        )
+        .with_context(|| format!("invalid {}", journal.display()))?;
         for (relative, body) in &writes {
             let path = self.target(relative)?;
             match body {
@@ -228,8 +274,10 @@ impl Store {
     fn read_unlocked(&self) -> Result<Snapshot> {
         let mut snap = Snapshot::default();
         for dir in DIRECTORIES {
-            let mut files = fs::read_dir(self.root.join("hyp").join(dir))?
-                .collect::<std::io::Result<Vec<_>>>()?;
+            let path = self.root.join("hyp").join(dir);
+            let mut files = fs::read_dir(&path)
+                .and_then(|entries| entries.collect::<std::io::Result<Vec<_>>>())
+                .with_context(|| format!("cannot read {}", path.display()))?;
             files.sort_by_key(|f| f.file_name());
             for file in files {
                 let path = file.path();
@@ -308,10 +356,9 @@ impl Store {
         let before = self.read_unlocked()?;
         before.assert_healthy()?;
         if let Some(expected) = expected_project {
-            ensure!(
-                expected == before.revision,
-                "conflict: project changed; reload and retry"
-            );
+            if expected != before.revision {
+                bail!(Conflict("project changed; reload and retry".into()));
+            }
         }
         let mut after = before.clone();
         let mut writes = BTreeMap::new();
@@ -352,10 +399,9 @@ impl Store {
                     expected_revision,
                 } => {
                     let old = after.find(&record.id)?;
-                    ensure!(
-                        old.revision == expected_revision,
-                        "conflict: object changed; reload and retry"
-                    );
+                    if old.revision != expected_revision {
+                        bail!(Conflict("object changed; reload and retry".into()));
+                    }
                     ensure!(
                         old.record.data.kind() == record.data.kind(),
                         "cannot change object kind"
@@ -386,10 +432,9 @@ impl Store {
                     expected_revision,
                 } => {
                     let old = after.find(&id)?;
-                    ensure!(
-                        old.revision == expected_revision,
-                        "conflict: object changed; reload and retry"
-                    );
+                    if old.revision != expected_revision {
+                        bail!(Conflict("object changed; reload and retry".into()));
+                    }
                     ensure!(
                         !matches!(old.record.data, Data::Assessment { .. } | Data::Run { .. }),
                         "historical assessments and runs cannot be archived"
@@ -403,10 +448,9 @@ impl Store {
                     expected_revision,
                 } => {
                     let old = after.find(&id)?.clone();
-                    ensure!(
-                        old.revision == expected_revision,
-                        "conflict: object changed; reload and retry"
-                    );
+                    if old.revision != expected_revision {
+                        bail!(Conflict("object changed; reload and retry".into()));
+                    }
                     ensure!(old.record.archived, "archive before deleting");
                     ensure!(
                         !matches!(old.record.data, Data::Assessment { .. } | Data::Run { .. }),
@@ -490,10 +534,9 @@ impl Store {
             }
         }
         // Verify a second time immediately before writing to detect ordinary editor saves.
-        ensure!(
-            self.read_unlocked()?.revision == before.revision,
-            "conflict: files changed during transaction"
-        );
+        if self.read_unlocked()?.revision != before.revision {
+            bail!(Conflict("files changed during transaction".into()));
+        }
         atomic(
             &self.root.join(".hyp/transaction.json"),
             &serde_json::to_vec(&writes)?,
