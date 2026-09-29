@@ -1,4 +1,4 @@
-/* Optional DOM/API integration test. This complements, not replaces, renderer testing. */
+/* DOM/API integration test in jsdom against the real server and CLI. Run by `just e2e` and the e2e-dom flake check. Complements, not replaces, renderer testing. */
 const { JSDOM, VirtualConsole } = require("jsdom");
 const { spawn, execFileSync } = require("node:child_process");
 const fs = require("node:fs");

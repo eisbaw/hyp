@@ -5,6 +5,12 @@
     let
       systems = [ "x86_64-linux" "aarch64-linux" ];
       eachSystem = nixpkgs.lib.genAttrs systems;
+      # node_modules for scripts/*.cjs, built from the committed scripts/package-lock.json.
+      # Shared by the dev shell (NODE_PATH) and checks.e2e-dom, so both run the same jsdom.
+      jsTestDeps = pkgs: pkgs.importNpmLock.buildNodeModules {
+        npmRoot = ./scripts;
+        nodejs = pkgs.nodejs;
+      };
     in {
       packages = eachSystem (system:
         let pkgs = import nixpkgs { inherit system; };
@@ -33,8 +39,9 @@
         let pkgs = import nixpkgs { inherit system; };
         in {
           default = pkgs.mkShell {
-            packages = with pkgs; [ cargo rustc rustfmt clippy rust-analyzer git nodejs ];
+            packages = with pkgs; [ cargo rustc rustfmt clippy rust-analyzer git nodejs just ];
             RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
+            NODE_PATH = "${jsTestDeps pkgs}/node_modules";
           };
         });
       checks = eachSystem (system:
@@ -57,6 +64,13 @@
             doCheck = false;
             installPhase = "mkdir -p $out";
           });
+          # jsdom UI test against the packaged binary and a real server on loopback.
+          e2e-dom = pkgs.runCommand "hyp-e2e-dom" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
+            export HYP_BIN=${self.packages.${system}.default}/bin/hyp
+            export NODE_PATH=${jsTestDeps pkgs}/node_modules
+            node ${./scripts/dom-test.cjs}
+            touch $out
+          '';
         });
       formatter = eachSystem (system: nixpkgs.legacyPackages.${system}.nixfmt);
     };

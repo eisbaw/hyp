@@ -4,10 +4,11 @@ title: 'Describe hyp as Git-friendly, not Git-native'
 status: To Do
 assignee: []
 created_date: '2026-09-29 22:21'
-updated_date: '2026-09-29 22:30'
+updated_date: '2026-09-29 22:31'
 labels:
   - docs
   - design
+  - mvp
 dependencies: []
 priority: medium
 ---

@@ -4,7 +4,7 @@ title: Add GitHub Actions CI driven by the nix flake
 status: To Do
 assignee: []
 created_date: '2026-09-29 22:16'
-updated_date: '2026-09-29 22:30'
+updated_date: '2026-09-29 22:40'
 labels:
   - tooling
   - ci
@@ -29,3 +29,9 @@ Do not push to GitHub or enable the workflow on a remote without explicit approv
 - [ ] #4 All CI logic lives in the flake (`nix flake check` including the DOM e2e check); the GitHub workflow is a thin wrapper, so switching CI hosts means only a new wrapper
 - [ ] #5 The repository currently has no remote: do not add one or push without explicit approval
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Forward-carried from HYPO-0011: nix flake check -L now includes checks.<system>.e2e-dom (jsdom UI test against the packaged binary), so CI running nix flake check covers the same DOM test as just e2e. npm tarballs are fetched as fixed-output derivations from the committed scripts/package-lock.json (importNpmLock); CI needs registry.npmjs.org reachable or a cache that has them.
+<!-- SECTION:NOTES:END -->

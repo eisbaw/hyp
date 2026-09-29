@@ -2,7 +2,7 @@
 
 Rust CLI + local WebUI for agents (primarily) and humans to track tentative claims: hypotheses, falsification criteria, predictions, cited evidence, experiments and assessments, stored as Markdown files under `hyp/`.
 
-- Build and test inside the flake dev shell: `nix develop -c cargo test --locked`, `nix develop -c cargo clippy --all-targets -- -D warnings`, `nix flake check`. Recipes move to a Justfile with HYPO-0011.
+- Recipes are in the `Justfile`; run them inside the flake dev shell: `nix develop -c just test`, `just lint`, `just fmt-check`, `just e2e` (Rust tests plus the jsdom UI test; run before every commit), `just check` (`nix flake check`, sees only Git-tracked files). `nix develop -c just` lists them all.
 - Design decisions live in `backlog/decisions/`. Most important:
   - decision-0001: hyp never requires or shells out to Git, but stays Git-friendly.
   - decision-0002: agents are the primary users; prefer rules the tool enforces over prose, and keep `--json`, exit codes and error messages stable.

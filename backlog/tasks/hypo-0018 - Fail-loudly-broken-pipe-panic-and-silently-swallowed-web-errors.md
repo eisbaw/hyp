@@ -4,10 +4,12 @@ title: 'Fail loudly: broken-pipe panic and silently swallowed web errors'
 status: To Do
 assignee: []
 created_date: '2026-09-29 22:30'
+updated_date: '2026-09-29 22:31'
 labels:
   - bug
   - cli
   - web
+  - mvp
 dependencies: []
 priority: medium
 ---

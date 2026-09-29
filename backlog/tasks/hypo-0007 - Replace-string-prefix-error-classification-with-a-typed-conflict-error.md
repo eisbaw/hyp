@@ -4,10 +4,12 @@ title: Replace string-prefix error classification with a typed conflict error
 status: To Do
 assignee: []
 created_date: '2026-09-29 22:15'
+updated_date: '2026-09-29 22:31'
 labels:
   - refactor
   - web
   - cli
+  - mvp
 dependencies: []
 priority: low
 ---

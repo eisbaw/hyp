@@ -4,10 +4,11 @@ title: A project with missing empty data directories cannot be opened
 status: To Do
 assignee: []
 created_date: '2026-09-29 22:15'
-updated_date: '2026-09-29 22:27'
+updated_date: '2026-09-29 22:31'
 labels:
   - bug
   - storage
+  - mvp
 dependencies: []
 priority: high
 ---

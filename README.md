@@ -19,7 +19,7 @@ Omit `--demo` for an empty notebook. `init` creates a `hyp/` data directory and 
 
 ```bash
 nix build                      # result/bin/hyp
-nix flake check                # package tests, formatting and clippy
+nix flake check                # package tests, formatting, clippy and the jsdom UI test
 nix run . -- --help
 ```
 
@@ -161,23 +161,24 @@ The Cargo workspace currently has one package, with clear library modules rather
 - `web` — Axum API, embedded assets, local-request guards and SSE.
 - `web/` — dependency-free browser interface. No npm runtime dependency.
 
+Development recipes live in the `Justfile` and run inside the flake dev shell, which provides `just`, the Rust toolchain, Node and `jsdom`:
+
 ```bash
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test --locked
+nix develop -c just          # list recipes
+nix develop -c just e2e      # Rust tests plus the jsdom UI test
 ```
 
-The tests cover semantic workflows, stale writes, concurrent writers, invalid transaction rollback, crash recovery, immutable histories, frozen experiment plans, source-change review tracking, symlinks, attachments, export escaping and HTTP guards.
+The Rust tests cover semantic workflows, stale writes, concurrent writers, invalid transaction rollback, crash recovery, immutable histories, frozen experiment plans, source-change review tracking, symlinks, attachments, export escaping and HTTP guards.
 
-An optional browser integration suite is in `scripts/browser-test.cjs`; install Playwright/Chromium separately and run `node scripts/browser-test.cjs`. It starts its own temporary project and server, exercises GUI/CLI synchronization and conflicts, and shuts everything down. Set `HYP_BIN` to test a packaged executable and `CHROMIUM_PATH` to use a system Chromium. These optional browser dependencies are not part of the shipped application.
+`scripts/dom-test.cjs` drives the real UI forms, HTTP server and SSE in `jsdom`, without a rendering engine; it does not verify visual layout. It runs in `just e2e` and as the `e2e-dom` flake check. Its npm dependencies are pinned in `scripts/package-lock.json` and built by the flake; do not `npm install` them into the tree.
+
+An optional browser suite is in `scripts/browser-test.cjs`. It is not yet wired into the flake (HYPO-0017): install Playwright/Chromium separately and run `node scripts/browser-test.cjs`. Set `HYP_BIN` to test a packaged executable and `CHROMIUM_PATH` to use a system Chromium.
 
 ## Scope of this release
 
 This is a local, single-worktree tool. It supports multiple CLI processes and browser tabs, not networked multi-user collaborative editing. It reads the notebook into memory and rescans files; it is intended for small and medium research/debugging notebooks, not millions of evidence records. Full snapshot refreshes favour correctness and simplicity over incremental-index complexity.
 
 No AI-generated judgments, automated experiment execution, Bayesian scoring, MCP server, remote hosting, user accounts or statistical-analysis engine are included.
-
-The lighter `scripts/dom-test.cjs` uses optional `jsdom` to exercise the same UI forms, real HTTP server and SSE without a rendering engine. Run it with `node scripts/dom-test.cjs` after making `jsdom` available to Node. It does not verify visual layout.
 
 See [VALIDATION.md](VALIDATION.md) for the checks run on this release.
 

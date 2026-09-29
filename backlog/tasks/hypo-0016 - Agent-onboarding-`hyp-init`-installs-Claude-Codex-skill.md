@@ -4,11 +4,12 @@ title: 'Agent onboarding: `hyp init` installs Claude/Codex skill'
 status: To Do
 assignee: []
 created_date: '2026-09-29 22:23'
-updated_date: '2026-09-29 22:30'
+updated_date: '2026-09-29 22:31'
 labels:
   - agents
   - cli
   - feature
+  - mvp
 dependencies:
   - HYPO-0007
   - HYPO-0002
