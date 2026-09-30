@@ -113,8 +113,9 @@ criterion before it can be `investigating`.
 
 - `0` success.
 - `1` the input is wrong (unknown or ambiguous ID, invalid value, a judgment
-  without evidence, unlinked evidence, malformed token) or the project has errors
-  (`hyp check` names them). Fix that; retrying unchanged will not help.
+  without evidence, unlinked evidence, malformed token), the write would add a
+  project error, or the project has files hyp cannot load (`hyp check` names
+  them). Fix that; retrying unchanged will not help.
 - `2` invalid command-line arguments (see `hyp <command> --help`).
 - `3` conflict: something the write depended on changed since you read it.
   Nothing was written. Re-read: look at the IDs the message names (for
@@ -133,7 +134,13 @@ start with `conflict:`.
 Never edit files under `hyp/` directly; use the commands (`hyp set ID` with
 `--title`, `--body`, `--tags` or `--lifecycle` changes a record). If files
 were changed outside hyp (an editor, a merge or a sync), run `hyp check` and
-fix what it reports before writing. For batches, `hyp apply` takes a JSON
+fix what it reports before writing. A diagnostic may carry a `note:` and
+`repair:` commands (`hyp --json check`: `.repair.note`, `.repair.commands` as
+argv arrays, run in the project directory). Read the note first. A missing
+record may still be arriving from a sync or merge: prefer restoring it over
+deleting what references it, because a delete cannot be undone without
+version control. A malformed or invalid file must be restored or fixed by
+hand. For batches, `hyp apply` takes a JSON
 array of changes on stdin; each states what it depends on (see
 `hyp apply --help` and the hyp README).
 

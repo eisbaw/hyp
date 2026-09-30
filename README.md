@@ -183,7 +183,7 @@ Run `hyp web [--port 7432]`. The server binds to IPv4 loopback only. Browse manu
 - Create/edit/archive/restore/delete forms, plus advanced JSON editing for mutable records.
 - Incoming changes preserve dirty forms; conflicting saves are rejected and the draft remains available to copy/reconcile.
 - External editor and CLI saves update open tabs using filesystem notifications and SSE. A two-second reconciliation scan catches missed notifications. Reconnects fetch a full snapshot.
-- Malformed files show diagnostics and block writes. An already open browser preserves the last readable state and marks it stale.
+- Malformed files show diagnostics and block writes. An already open browser preserves the last readable state and marks it stale. Errors between records (see "Files and concurrency") show as a notice with their repair; saving still works unless it adds a new error.
 
 Notes are displayed as escaped, pre-wrapped text. Markdown is retained in files and exports; the UI does not execute raw HTML. Binary attachments are copied through the CLI and can be inspected as metadata in the WebUI. They are not served as executable browser content.
 
@@ -197,6 +197,13 @@ All authoritative content is under `hyp/`:
 - `.hyp/` at the project root — write lock and temporary recovery journal; not project data. It contains a `.gitignore` that ignores it.
 
 Markdown files have YAML front matter and an ordinary notes body. IDs are UUIDs with readable type prefixes. Renaming files independently of IDs is rejected. Unknown schema fields, broken references and invalid states are reported by `hyp check`. `hyp check --strict` also fails on warnings such as a hypothesis with neither a falsification criterion nor an untestable reason.
+
+`hyp check` reports every rule a record breaks, one diagnostic each. Each has a stable `code` (`hyp --json check`); `(path, code)` identifies it, and the message may change. Two kinds of error differ in what they block:
+
+- `malformed` (a file hyp cannot load: bad front matter, a filename or directory that does not match the record, a duplicate ID), `attachment` (missing, unsafe or changed) and `invalid` (a record breaking rules of its own fields, including a reference by short ID or to a record of the wrong kind, which the ID prefix gives) block every write (`blocks_writes: true`). Fix the file by hand, or restore it.
+- `dangling_reference` (a referenced record does not exist), `cycle` (`depends_on` or `supersedes` links, or assessment supersession) and `inconsistent` (other rules between records, such as an investigating hypothesis without an active criterion) are errors between loaded records, as a merge, sync or hand edit leaves them. They do not block writes: a write is rejected if, for any record, it adds a `(path, code)` the project did not already have. So an unrelated write still works, and so does the write that repairs them.
+
+Where hyp knows a repair, the diagnostic carries it: `--json` as `"repair": {"note": "...", "commands": [["hyp", "archive", "L-..."], ...]}` (`note` may be null, `commands` empty), and plain `hyp check` as `note:` and `repair:` lines. Run the commands in order, as argv arrays, in the project directory (they carry no `--project`). A cycle's repair archives the link. For a dangling reference the note comes first: restore the missing record from the source of the merge or sync. That loses nothing, and after a partial sync the record may simply not have arrived yet. Only a link also gets commands (archive, then delete) for when the record is gone for good; a delete cannot be undone without version control. Other records whose referenced record is missing get only the note.
 
 A process-shared advisory lock serializes tool writes. Each change carries an optimistic precondition on what it depends on (see above), so stale writes are rejected without turning unrelated concurrent writes into conflicts. Atomic file replacements and an fsynced roll-forward journal recover interrupted multi-file operations. Reads through hyp recover pending transactions under the same lock. Manual editors, sync tools and version control do not honour that lock: ordinary overlapping saves are detected where possible, but arbitrary simultaneous external writes cannot be made transactional. Avoid a checkout, merge or sync during a tool write. Run `hyp check` after one.
 
@@ -212,7 +219,7 @@ hyp never runs `git` and does not need a repository; a plain directory is the no
 - No generated index or cache files under `hyp/`; everything there is authoritative.
 - `.hyp/` (lock and journal) ignores itself.
 
-Committing, pushing and resolving conflicts are yours. Commit the complete `hyp/` directory when you want a history checkpoint. After a merge, checkout or sync, run `hyp check`: it reports broken references and malformed files, and `hyp list --needs-review` shows hypotheses whose current assessment was based on records that have since changed. Two assessments of the same hypothesis made on different branches both remain current heads after the merge; record a new assessment to reconcile them.
+Committing, pushing and resolving conflicts are yours. Commit the complete `hyp/` directory when you want a history checkpoint. After a merge, checkout or sync, run `hyp check`: it reports broken references and malformed files, with how to repair a broken reference or a dependency cycle, and `hyp list --needs-review` shows hypotheses whose current assessment was based on records that have since changed. Two assessments of the same hypothesis made on different branches both remain current heads after the merge; record a new assessment to reconcile them.
 
 ## Exports
 

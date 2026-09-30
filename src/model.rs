@@ -26,6 +26,31 @@ values!(Relation { Supports => "supports", Contradicts => "contradicts", Qualifi
 values!(ExperimentStatus { Planned => "planned", Running => "running", Completed => "completed", Cancelled => "cancelled" });
 values!(Outcome { Observed => "observed", Inconclusive => "inconclusive", Failed => "failed" });
 values!(Kind { Hypothesis => "hypothesis", Prediction => "prediction", Criterion => "criterion", Evidence => "evidence", Link => "link", Experiment => "experiment", Run => "run", Assessment => "assessment", Gap => "gap" });
+impl Kind {
+    pub fn prefix(self) -> &'static str {
+        match self {
+            Self::Hypothesis => "H",
+            Self::Prediction => "P",
+            Self::Criterion => "F",
+            Self::Evidence => "E",
+            Self::Link => "L",
+            Self::Experiment => "X",
+            Self::Run => "R",
+            Self::Assessment => "A",
+            Self::Gap => "G",
+        }
+    }
+    /// The kind a full ID (`<prefix>-<UUID>`) names; None for anything else,
+    /// such as a short ID.
+    pub fn of_id(id: &str) -> Option<Self> {
+        let (prefix, uuid) = id.split_once('-')?;
+        uuid::Uuid::parse_str(uuid).ok()?;
+        <Self as clap::ValueEnum>::value_variants()
+            .iter()
+            .copied()
+            .find(|k| k.prefix() == prefix)
+    }
+}
 
 /// A copy of a record as it was when an experiment or run was created. On a
 /// create only `id` is input (an experiment target); the server fills in the
@@ -147,17 +172,7 @@ impl Data {
         }
     }
     pub fn prefix(&self) -> &'static str {
-        match self {
-            Self::Hypothesis { .. } => "H",
-            Self::Prediction { .. } => "P",
-            Self::Criterion { .. } => "F",
-            Self::Evidence { .. } => "E",
-            Self::Link { .. } => "L",
-            Self::Experiment { .. } => "X",
-            Self::Run { .. } => "R",
-            Self::Assessment { .. } => "A",
-            Self::Gap { .. } => "G",
-        }
+        self.kind_value().prefix()
     }
     pub fn owner(&self) -> Option<&str> {
         match self {
@@ -249,11 +264,126 @@ impl Entry {
         }
     }
 }
+values!(Code {
+    Malformed => "malformed",
+    Attachment => "attachment",
+    Invalid => "invalid",
+    DanglingReference => "dangling_reference",
+    Cycle => "cycle",
+    Inconsistent => "inconsistent",
+    NoCriterion => "no_criterion",
+});
+impl Code {
+    pub fn severity(self) -> &'static str {
+        match self {
+            Self::NoCriterion => "warning",
+            _ => "error",
+        }
+    }
+    /// Whether this problem blocks every write. hyp cannot load a malformed
+    /// file (it may hold a record other records depend on) and cannot trust a
+    /// broken attachment; an invalid record breaks rules of its own fields,
+    /// including naming a record by a short ID or one of the wrong kind (the
+    /// ID prefix gives the kind). The other errors are between loaded
+    /// records, as a merge, sync or hand edit leaves them; writes that add no
+    /// new error may repair them (see `Store::commit_written`).
+    pub fn blocks_writes(self) -> bool {
+        matches!(self, Self::Malformed | Self::Attachment | Self::Invalid)
+    }
+}
+/// How to remove a problem. `note` comes first: where it names a lossless
+/// fix (restoring a record), prefer that over the commands. Each command is
+/// an argv array, run in the project directory (hyp finds the project from
+/// there, as without `--project`), in order.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Repair {
+    pub note: Option<String>,
+    pub commands: Vec<Vec<String>>,
+}
+/// A problem `hyp check` reports: one per rule a record breaks.
+/// `(path, code)` identifies it across reads; the message is for people and
+/// may change.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Diagnostic {
     pub path: String,
     pub message: String,
     pub severity: String,
+    pub code: Code,
+    pub blocks_writes: bool,
+    pub repair: Option<Repair>,
+}
+impl Diagnostic {
+    pub fn new(path: impl Into<String>, code: Code, message: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            message: message.into(),
+            severity: code.severity().into(),
+            code,
+            blocks_writes: code.blocks_writes(),
+            repair: None,
+        }
+    }
+    pub fn identity(&self) -> (&str, Code) {
+        (&self.path, self.code)
+    }
+}
+/// A rule that `Snapshot::validate` found record-wise broken.
+#[derive(Debug)]
+pub struct Violation {
+    pub code: Code,
+    pub message: String,
+    pub repair: Option<Repair>,
+}
+impl std::fmt::Display for Violation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+impl std::error::Error for Violation {}
+/// The violations of one record, in the order the rules are checked.
+#[derive(Default)]
+struct Violations(Vec<Violation>);
+impl Violations {
+    fn require(&mut self, ok: bool, code: Code, message: impl FnOnce() -> String) {
+        if !ok {
+            self.push(code, message(), None);
+        }
+    }
+    fn push(&mut self, code: Code, message: String, repair: Option<Repair>) {
+        self.0.push(Violation {
+            code,
+            message,
+            repair,
+        });
+    }
+}
+/// The repair of record `r`'s reference to `missing`, which does not exist.
+/// Restoring it is lossless, and after a partial sync it may only be late,
+/// so that comes first. Only a link, which nothing references and which
+/// holds no content of its own beyond its explanation, is offered deletion.
+fn dangling_repair(r: &Record, missing: &str) -> Repair {
+    let restore = format!(
+        "Restore {missing} from the source of the merge or sync: that loses nothing, \
+         and after a partial sync it may still be arriving."
+    );
+    if !matches!(r.data, Data::Link { .. }) {
+        return Repair {
+            note: Some(restore),
+            commands: vec![],
+        };
+    }
+    let hyp = |op: &str| vec!["hyp".to_string(), op.to_string(), r.id.clone()];
+    let mut commands = vec![hyp("archive"), hyp("delete")];
+    if r.archived {
+        commands.remove(0);
+    }
+    Repair {
+        note: Some(format!(
+            "{restore} Only if it is gone for good, remove this link with the commands; \
+             a delete cannot be undone without version control."
+        )),
+        commands,
+    }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HypothesisState {
@@ -508,121 +638,251 @@ impl Snapshot {
         self.revision =
             hash(serde_json::to_vec(&(&self.objects, &self.diagnostics)).unwrap_or_default());
     }
-    pub fn validate(&self, r: &Record) -> Result<()> {
-        ensure!(!r.title.trim().is_empty(), "title is required");
-        ensure!(r.title.len() <= 2000, "title is too long");
-        ensure!(
-            r.id.starts_with(&format!("{}-", r.data.prefix()))
-                && uuid::Uuid::parse_str(&r.id[2..]).is_ok(),
-            "invalid object ID"
+    /// Every rule record `r` breaks in this state: first rules of its own
+    /// fields (`Code::Invalid`), then rules between it and other records
+    /// (`DanglingReference`, `Cycle`, `Inconsistent`). Empty if it is valid.
+    pub fn validate(&self, r: &Record) -> Vec<Violation> {
+        let mut out = Violations::default();
+        Self::validate_fields(r, &mut out);
+        self.validate_relations(r, &mut out);
+        out.0
+    }
+    /// The rules record `r` must satisfy on its own. Referenced records are
+    /// typed by their ID prefix, which every record's own ID must carry, so a
+    /// reference of the wrong kind is found even while its target is missing.
+    fn validate_fields(r: &Record, out: &mut Violations) {
+        use Code::Invalid;
+        // A reference that is not a full ID is reported once, below.
+        let is = |id: &str, kinds: &[Kind]| Kind::of_id(id).is_none_or(|k| kinds.contains(&k));
+        out.require(!r.title.trim().is_empty(), Invalid, || {
+            "title is required".into()
+        });
+        out.require(r.title.len() <= 2000, Invalid, || {
+            "title is too long".into()
+        });
+        out.require(
+            Kind::of_id(&r.id) == Some(r.data.kind_value()),
+            Invalid,
+            || "invalid object ID".into(),
         );
         for field in [&r.created_at, &r.updated_at] {
-            chrono::DateTime::parse_from_rfc3339(field)?;
+            if let Err(e) = chrono::DateTime::parse_from_rfc3339(field) {
+                out.push(Invalid, e.to_string(), None);
+            }
         }
         for id in r.data.references() {
-            ensure!(
-                self.find(id)?.record.id == id,
-                "stored references must use full IDs"
-            );
+            out.require(Kind::of_id(id).is_some(), Invalid, || {
+                "stored references must use full IDs".into()
+            });
         }
         if let Some(owner) = r.data.owner() {
-            ensure!(
-                matches!(self.find(owner)?.record.data, Data::Hypothesis { .. }),
-                "owner must be a hypothesis"
-            );
+            out.require(is(owner, &[Kind::Hypothesis]), Invalid, || {
+                "owner must be a hypothesis".into()
+            });
         }
-        let evidence_check = |ids: &[String]| -> Result<()> {
+        let evidence_check = |out: &mut Violations, ids: &[String]| {
             for id in ids {
-                ensure!(
-                    matches!(self.find(id)?.record.data, Data::Evidence { .. }),
-                    "{id} is not evidence"
+                out.require(is(id, &[Kind::Evidence]), Invalid, || {
+                    format!("{id} is not evidence")
+                });
+            }
+        };
+        let claim = [Kind::Hypothesis, Kind::Prediction, Kind::Criterion];
+        match &r.data {
+            Data::Evidence {
+                source,
+                attachments,
+                ..
+            } => {
+                out.require(!source.trim().is_empty(), Invalid, || {
+                    "evidence source is required".into()
+                });
+                for a in attachments {
+                    out.require(
+                        a.path.starts_with("assets/")
+                            && !a.path.contains("..")
+                            && !a.path.contains('\\'),
+                        Invalid,
+                        || "unsafe attachment path".into(),
+                    );
+                    out.require(
+                        a.sha256.len() == 64 && a.sha256.bytes().all(|b| b.is_ascii_hexdigit()),
+                        Invalid,
+                        || "invalid attachment hash".into(),
+                    );
+                }
+            }
+            Data::Link { from, to, relation } => {
+                out.require(from != to, Invalid, || {
+                    "cannot link an object to itself".into()
+                });
+                match relation {
+                    Relation::Supports | Relation::Contradicts | Relation::Qualifies => {
+                        out.require(is(from, &[Kind::Evidence]), Invalid, || {
+                            "evidence links must start at evidence".into()
+                        });
+                        out.require(is(to, &claim), Invalid, || {
+                            "evidence must target a hypothesis, prediction or criterion".into()
+                        });
+                        out.require(!r.body.trim().is_empty(), Invalid, || {
+                            "evidence links require an explanation".into()
+                        });
+                    }
+                    _ => {
+                        out.require(
+                            is(from, &[Kind::Hypothesis]) && is(to, &[Kind::Hypothesis]),
+                            Invalid,
+                            || "hypothesis relations require two hypotheses".into(),
+                        );
+                    }
+                }
+            }
+            Data::Experiment { targets, .. } => {
+                for t in targets {
+                    out.require(is(&t.id, &claim), Invalid, || {
+                        "invalid experiment target".into()
+                    });
+                    out.require(
+                        t.revision.len() == 64 && !t.title.is_empty() && !t.body.is_empty(),
+                        Invalid,
+                        || {
+                            format!(
+                                "experiment target {} is missing its frozen revision, title or body",
+                                t.id
+                            )
+                        },
+                    );
+                }
+            }
+            Data::Run {
+                experiment,
+                plan,
+                evidence,
+                ..
+            } => {
+                out.require(is(experiment, &[Kind::Experiment]), Invalid, || {
+                    "run requires an experiment".into()
+                });
+                out.require(
+                    plan.id == *experiment
+                        && plan.revision.len() == 64
+                        && !plan.title.is_empty()
+                        && !plan.body.is_empty(),
+                    Invalid,
+                    || {
+                        "invalid frozen experiment plan: it must name the experiment and keep \
+                         its revision, title and body"
+                            .into()
+                    },
+                );
+                evidence_check(out, evidence);
+            }
+            Data::Assessment {
+                judgment,
+                confidence,
+                evidence,
+                criterion,
+                based_on,
+                supersedes,
+                ..
+            } => {
+                out.require(!r.body.trim().is_empty(), Invalid, || {
+                    "assessment requires a rationale".into()
+                });
+                out.require(
+                    confidence.is_none_or(|x| x.is_finite() && (0.0..=1.0).contains(&x)),
+                    Invalid,
+                    || "confidence must be between 0 and 1".into(),
+                );
+                evidence_check(out, evidence);
+                out.require(based_on.len() == 64, Invalid, || {
+                    "assessment requires a state fingerprint".into()
+                });
+                if *judgment == Judgment::Falsified {
+                    out.require(criterion.is_some() && !evidence.is_empty(), Invalid, || {
+                        "falsified requires a criterion and evidence".into()
+                    });
+                }
+                if let Some(c) = criterion {
+                    out.require(is(c, &[Kind::Criterion]), Invalid, || {
+                        "criterion must belong to the assessed hypothesis".into()
+                    });
+                }
+                for s in supersedes {
+                    out.require(s != &r.id, Invalid, || {
+                        "assessment cannot supersede itself".into()
+                    });
+                    out.require(is(s, &[Kind::Assessment]), Invalid, || {
+                        "superseded assessment belongs to another hypothesis".into()
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    /// The rules between record `r` and the other records of this state.
+    /// A missing record is reported once, as `DanglingReference`; rules that
+    /// would need it are skipped.
+    fn validate_relations(&self, r: &Record, out: &mut Violations) {
+        for id in r.data.references() {
+            if Kind::of_id(id).is_some() && self.get(id).is_none() {
+                out.push(
+                    Code::DanglingReference,
+                    format!("references {id}, which does not exist"),
+                    Some(dangling_repair(r, id)),
                 );
             }
-            Ok(())
-        };
+        }
+        let owner_of = |id: &str| self.get(id).map(|e| e.record.data.owner());
         match &r.data {
             Data::Hypothesis {
                 lifecycle: Lifecycle::Investigating,
                 untestable_reason,
                 ..
             } => {
-                ensure!(
+                out.require(
                     !untestable_reason.trim().is_empty() || self.has_active_criterion(&r.id),
-                    "investigating requires a falsification criterion or untestable_reason"
+                    Code::Inconsistent,
+                    || {
+                        "investigating requires a falsification criterion or untestable_reason"
+                            .into()
+                    },
                 );
             }
-            Data::Evidence {
-                source,
-                attachments,
-                ..
-            } => {
-                ensure!(!source.trim().is_empty(), "evidence source is required");
-                for a in attachments {
-                    ensure!(
-                        a.path.starts_with("assets/")
-                            && !a.path.contains("..")
-                            && !a.path.contains('\\'),
-                        "unsafe attachment path"
-                    );
-                    ensure!(
-                        a.sha256.len() == 64 && a.sha256.bytes().all(|b| b.is_ascii_hexdigit()),
-                        "invalid attachment hash"
-                    );
-                }
-            }
-            Data::Link { from, to, relation } => {
-                ensure!(from != to, "cannot link an object to itself");
-                let a = &self.find(from)?.record;
-                let b = &self.find(to)?.record;
-                match relation {
-                    Relation::Supports | Relation::Contradicts | Relation::Qualifies => {
-                        ensure!(
-                            matches!(a.data, Data::Evidence { .. }),
-                            "evidence links must start at evidence"
+            // Archived links are not part of the graph, so they close no cycle.
+            Data::Link { from, to, relation }
+                if !r.archived
+                    && matches!(relation, Relation::DependsOn | Relation::Supersedes) =>
+            {
+                let mut pending = vec![to.as_str()];
+                let mut visited = BTreeSet::new();
+                while let Some(n) = pending.pop() {
+                    if n == from {
+                        out.push(
+                            Code::Cycle,
+                            format!("{relation} cycle detected"),
+                            Some(Repair {
+                                note: Some("Archiving any one link of the cycle breaks it.".into()),
+                                commands: vec![vec!["hyp".into(), "archive".into(), r.id.clone()]],
+                            }),
                         );
-                        ensure!(
-                            matches!(
-                                b.data,
-                                Data::Hypothesis { .. }
-                                    | Data::Prediction { .. }
-                                    | Data::Criterion { .. }
-                            ),
-                            "evidence must target a hypothesis, prediction or criterion"
-                        );
-                        ensure!(
-                            !r.body.trim().is_empty(),
-                            "evidence links require an explanation"
-                        );
+                        break;
                     }
-                    _ => {
-                        ensure!(
-                            matches!(a.data, Data::Hypothesis { .. })
-                                && matches!(b.data, Data::Hypothesis { .. }),
-                            "hypothesis relations require two hypotheses"
-                        );
+                    if !visited.insert(n) {
+                        continue;
                     }
-                }
-                if matches!(relation, Relation::DependsOn | Relation::Supersedes) {
-                    let mut pending = vec![to.clone()];
-                    let mut visited = BTreeSet::new();
-                    while let Some(n) = pending.pop() {
-                        ensure!(&n != from, "{relation} cycle detected");
-                        if !visited.insert(n.clone()) {
+                    for e in &self.objects {
+                        if e.record.id == r.id || e.record.archived {
                             continue;
                         }
-                        for e in &self.objects {
-                            if e.record.id == r.id || e.record.archived {
-                                continue;
-                            }
-                            if let Data::Link {
-                                from: a,
-                                to: b,
-                                relation: rel,
-                            } = &e.record.data
-                            {
-                                if a == &n && rel == relation {
-                                    pending.push(b.clone());
-                                }
+                        if let Data::Link {
+                            from: a,
+                            to: b,
+                            relation: rel,
+                        } = &e.record.data
+                        {
+                            if a == n && rel == relation {
+                                pending.push(b);
                             }
                         }
                     }
@@ -634,100 +894,51 @@ impl Snapshot {
                 ..
             } => {
                 for t in targets {
-                    let target = &self.find(&t.id)?.record;
-                    ensure!(
-                        target.id == *hypothesis || target.data.owner() == Some(hypothesis),
-                        "experiment target belongs to a different hypothesis"
-                    );
-                    ensure!(
-                        matches!(
-                            target.data,
-                            Data::Hypothesis { .. }
-                                | Data::Prediction { .. }
-                                | Data::Criterion { .. }
-                        ),
-                        "invalid experiment target"
-                    );
-                    ensure!(
-                        t.revision.len() == 64 && !t.title.is_empty() && !t.body.is_empty(),
-                        "experiment target {} is missing its frozen revision, title or body",
-                        t.id
-                    );
+                    if let Some(owner) = owner_of(&t.id) {
+                        out.require(
+                            t.id == *hypothesis || owner == Some(hypothesis),
+                            Code::Inconsistent,
+                            || "experiment target belongs to a different hypothesis".into(),
+                        );
+                    }
                 }
-            }
-            Data::Run {
-                experiment,
-                plan,
-                evidence,
-                ..
-            } => {
-                ensure!(
-                    matches!(self.find(experiment)?.record.data, Data::Experiment { .. }),
-                    "run requires an experiment"
-                );
-                ensure!(
-                    plan.id == *experiment
-                        && plan.revision.len() == 64
-                        && !plan.title.is_empty()
-                        && !plan.body.is_empty(),
-                    "invalid frozen experiment plan: it must name the experiment and keep \
-                     its revision, title and body"
-                );
-                evidence_check(evidence)?;
             }
             Data::Assessment {
                 hypothesis,
-                judgment,
-                confidence,
-                evidence,
                 criterion,
-                based_on,
                 supersedes,
+                ..
             } => {
-                ensure!(!r.body.trim().is_empty(), "assessment requires a rationale");
-                ensure!(
-                    confidence.is_none_or(|x| x.is_finite() && (0.0..=1.0).contains(&x)),
-                    "confidence must be between 0 and 1"
-                );
-                evidence_check(evidence)?;
-                ensure!(
-                    based_on.len() == 64,
-                    "assessment requires a state fingerprint"
-                );
-                if *judgment == Judgment::Falsified {
-                    ensure!(
-                        criterion.is_some() && !evidence.is_empty(),
-                        "falsified requires a criterion and evidence"
-                    );
-                }
-                if let Some(c) = criterion {
-                    ensure!(
-                        matches!(&self.find(c)?.record.data,Data::Criterion{hypothesis:h} if h==hypothesis),
-                        "criterion must belong to the assessed hypothesis"
-                    );
+                if let Some(owner) = criterion.as_deref().and_then(owner_of) {
+                    out.require(owner == Some(hypothesis), Code::Inconsistent, || {
+                        "criterion must belong to the assessed hypothesis".into()
+                    });
                 }
                 for s in supersedes {
-                    ensure!(s != &r.id, "assessment cannot supersede itself");
-                    ensure!(
-                        matches!(&self.find(s)?.record.data,Data::Assessment{hypothesis:h,..} if h==hypothesis),
-                        "superseded assessment belongs to another hypothesis"
-                    );
-                    let mut todo = vec![s.as_str()];
-                    let mut seen = BTreeSet::new();
-                    while let Some(id) = todo.pop() {
-                        ensure!(id != r.id, "assessment supersession cycle");
-                        if seen.insert(id) {
-                            if let Data::Assessment { supersedes, .. } = &self.find(id)?.record.data
-                            {
-                                todo.extend(supersedes.iter().map(String::as_str));
-                            }
+                    if let Some(owner) = owner_of(s) {
+                        out.require(owner == Some(hypothesis), Code::Inconsistent, || {
+                            "superseded assessment belongs to another hypothesis".into()
+                        });
+                    }
+                }
+                let mut todo: Vec<&str> = supersedes.iter().map(String::as_str).collect();
+                let mut seen = BTreeSet::new();
+                while let Some(id) = todo.pop() {
+                    if id == r.id {
+                        out.push(Code::Cycle, "assessment supersession cycle".into(), None);
+                        break;
+                    }
+                    if seen.insert(id) {
+                        if let Some(Data::Assessment { supersedes, .. }) =
+                            self.get(id).map(|e| &e.record.data)
+                        {
+                            todo.extend(supersedes.iter().map(String::as_str));
                         }
                     }
                 }
             }
             _ => {}
         }
-        Ok(())
     }
     /// Rules for creating record `r` in this state, on top of `validate`.
     /// They are not checked on stored records: assessments are immutable
@@ -768,19 +979,29 @@ impl Snapshot {
         }
         Ok(())
     }
-    pub fn assert_healthy(&self) -> Result<()> {
-        let errors: Vec<_> = self
-            .diagnostics
-            .iter()
-            .filter(|d| d.severity == "error")
-            .collect();
-        if !errors.is_empty() {
-            bail!(
-                "project has {} validation errors; run hyp check and repair files before writing: {}",
-                errors.len(),
-                errors[0].message
-            );
-        }
-        Ok(())
+    /// Fails while a diagnostic blocks writes (`Code::blocks_writes`).
+    /// Other errors do not block here; `Store::commit_written` rejects only
+    /// writes that add one.
+    pub fn assert_writable(&self) -> Result<()> {
+        let errors = || self.diagnostics.iter().filter(|d| d.severity == "error");
+        let blocking: Vec<_> = errors().filter(|d| d.blocks_writes).collect();
+        let Some(first) = blocking.first() else {
+            return Ok(());
+        };
+        let others = errors().count() - blocking.len();
+        let n = match blocking.len() {
+            1 => "1 error blocks".to_string(),
+            n => format!("{n} errors block"),
+        };
+        let more = match others {
+            0 => String::new(),
+            1 => " (1 more does not)".into(),
+            m => format!(" ({m} more do not)"),
+        };
+        bail!(
+            "{n} writes{more}; run hyp check and repair files before writing: {}: {}",
+            first.path,
+            first.message
+        );
     }
 }

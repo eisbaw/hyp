@@ -1,6 +1,7 @@
 /* DOM/API integration test in jsdom against the real server and CLI. Run by `just e2e` and the e2e-dom flake check. Complements, not replaces, renderer testing. */
 const { JSDOM, VirtualConsole } = require("jsdom");
 const { spawn, execFileSync } = require("node:child_process");
+const crypto = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -426,6 +427,49 @@ async function main() {
   );
   fs.writeFileSync(filename, original);
   await wait(() => w.document.querySelector("#notice").hidden, "recovery");
+  // A sync brings a link to evidence that did not arrive: an error between
+  // records. The UI keeps rendering, names the repair and still saves.
+  const dangling = "L-" + crypto.randomUUID();
+  const missing = "E-" + crypto.randomUUID();
+  const stamp = new Date().toISOString();
+  fs.writeFileSync(
+    path.join(root, "hyp", "links", dangling + ".md"),
+    `---\nid: ${dangling}\ntitle: Synced link\ntags: []\narchived: false\ncreated_at: ${stamp}\nupdated_at: ${stamp}\nkind: link\nfrom: ${missing}\nto: ${h.record.id}\nrelation: supports\n---\nArrived with a sync.\n`,
+  );
+  const noticeText = () => w.document.querySelector("#notice").textContent;
+  await wait(
+    () => noticeText().includes("Saving still works unless it adds a new error"),
+    "error between records explained",
+  );
+  assert.equal(w.document.querySelector("#connection").textContent, "Live");
+  for (const [view, title] of [
+    ["overview", "Hypotheses"],
+    ["matrix", "Evidence matrix"],
+    ["graph", "Relationships"],
+    ["all", "All records"],
+  ]) {
+    w.location.hash = view;
+    await wait(() => h1(w) === title, "view with dangling link " + view);
+  }
+  const checks = w.document.querySelector(".diagnostics").textContent;
+  for (const line of [
+    `Note: Restore ${missing} from the source of the merge or sync`,
+    `Repair: hyp archive ${dangling}\nRepair: hyp delete ${dangling}`,
+  ])
+    assert.ok(checks.includes(line), line + " in " + checks);
+  click(w, "#new");
+  field(w, "title", "Saved while the notebook has an error");
+  await save(w);
+  await wait(
+    () => h1(w) === "Saved while the notebook has an error",
+    "save despite an error between records",
+  );
+  cli("archive", dangling);
+  cli("delete", dangling);
+  await wait(
+    () => w.document.querySelector("#notice").hidden,
+    "repair clears the notice",
+  );
   const hypDir = path.join(root, "hyp");
   fs.renameSync(hypDir, hypDir + ".moved");
   await wait(
@@ -458,7 +502,7 @@ async function main() {
   );
   assert.deepEqual(errors, []);
   console.log(
-    "PASS: DOM forms, real HTTP writes, CLI↔UI SSE updates, editor changes, two tabs, dirty-form preservation, conflicts by status, saves despite unrelated writes, stale assessment rejected, evidence required and linked-only, criteria, evidence interpretations, falsification assessment, experiment and run, all views, malformed-file recovery, unavailable-project cause and offline export.",
+    "PASS: DOM forms, real HTTP writes, CLI↔UI SSE updates, editor changes, two tabs, dirty-form preservation, conflicts by status, saves despite unrelated writes, stale assessment rejected, evidence required and linked-only, criteria, evidence interpretations, falsification assessment, experiment and run, all views, malformed-file recovery, saves and CLI repair despite a dangling link, unavailable-project cause and offline export.",
   );
 }
 main()

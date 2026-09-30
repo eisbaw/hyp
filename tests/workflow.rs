@@ -222,7 +222,7 @@ fn judgments_other_than_untested_require_evidence() {
     )
     .unwrap();
     let s = store.snapshot().unwrap();
-    s.assert_healthy().unwrap();
+    s.assert_writable().unwrap();
     assert_eq!(s.hypotheses[&i.h.id].judgment, Judgment::Supported);
     create(&store, &hypothesis());
 }
@@ -544,7 +544,7 @@ fn archive_restore_delete_and_attachment_integrity() {
     let attachment = dir.path().join("log.txt");
     std::fs::write(&attachment, "timeout").unwrap();
     let s = store.attach(&e.id, &attachment).unwrap().snapshot;
-    s.assert_healthy().unwrap();
+    s.assert_writable().unwrap();
     let entry = s.find(&e.id).unwrap();
     let dest = if let Data::Evidence { attachments, .. } = &entry.record.data {
         store.root.join("hyp").join(&attachments[0].path)
@@ -552,7 +552,7 @@ fn archive_restore_delete_and_attachment_integrity() {
         panic!();
     };
     std::fs::write(&dest, "modified").unwrap();
-    assert!(store.snapshot().unwrap().assert_healthy().is_err());
+    assert!(store.snapshot().unwrap().assert_writable().is_err());
     std::fs::write(&dest, "timeout").unwrap();
     let s = store.snapshot().unwrap();
     let e = s.find(&e.id).unwrap();
@@ -600,7 +600,7 @@ fn storage_symlinks_are_rejected() {
     let outside = dir.path().join("outside.md");
     std::fs::rename(&path, &outside).unwrap();
     std::os::unix::fs::symlink(&outside, &path).unwrap();
-    assert!(store.snapshot().unwrap().assert_healthy().is_err());
+    assert!(store.snapshot().unwrap().assert_writable().is_err());
 }
 
 #[test]
@@ -1828,5 +1828,5 @@ fn stripped_frozen_content_is_a_diagnostic() {
             .any(|m| m.contains("invalid frozen experiment plan")),
         "{messages:?}"
     );
-    assert!(s.assert_healthy().is_err());
+    assert!(s.assert_writable().is_err());
 }

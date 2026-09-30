@@ -1306,3 +1306,349 @@ fn plain_show_summarises_a_hypothesis_for_people() {
         "{text}"
     );
 }
+
+/// The diagnostics `hyp --json check` reports for `path`.
+fn diagnostics_of(p: &Path, path: &str) -> Vec<serde_json::Value> {
+    let out = run(p, &["--json", "check"]);
+    let all: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    all.as_array()
+        .unwrap()
+        .iter()
+        .filter(|d| d["path"] == path)
+        .cloned()
+        .collect()
+}
+/// Runs the repair commands `hyp check` suggests for `path`, as argv arrays
+/// in the project directory (no --project), with the binary under test.
+fn apply_repair(p: &Path, path: &str) {
+    let diagnostics = diagnostics_of(p, path);
+    let commands = diagnostics
+        .iter()
+        .find_map(|d| d["repair"]["commands"].as_array())
+        .unwrap_or_else(|| panic!("no repair for {path}: {diagnostics:?}"));
+    assert!(!commands.is_empty(), "{diagnostics:?}");
+    for command in commands {
+        let argv: Vec<&str> = command
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a.as_str().unwrap())
+            .collect();
+        assert_eq!(argv[0], "hyp", "{command}");
+        let out = Command::new(env!("CARGO_BIN_EXE_hyp"))
+            .args(&argv[1..])
+            .current_dir(p)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{command}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+/// The other half of a `depends_on` cycle, as a merge or sync brings it: a
+/// link file written next to hyp's own. Returns the new link's ID.
+fn drop_reverse_link(p: &Path, link: &str) -> String {
+    let raw = std::fs::read_to_string(p.join(format!("hyp/links/{link}.md"))).unwrap();
+    let mut record = hyp::store::decode(&raw).unwrap();
+    record.id = format!("L-{}", uuid::Uuid::new_v4());
+    if let hyp::model::Data::Link { from, to, .. } = &mut record.data {
+        std::mem::swap(from, to);
+    }
+    std::fs::write(
+        p.join(format!("hyp/links/{}.md", record.id)),
+        hyp::store::encode(&record).unwrap(),
+    )
+    .unwrap();
+    record.id
+}
+
+#[test]
+fn merged_dependency_cycle_is_repaired_with_the_suggested_archive() {
+    let dir = TempDir::new().unwrap();
+    let p = dir.path();
+    ok(p, &["init"]);
+    let a = ok(p, &["add", "A"]).trim().to_string();
+    let b = ok(p, &["add", "B"]).trim().to_string();
+    let ours = ok(
+        p,
+        &["link", &a, &b, "--relation", "depends-on", "--reason", "r"],
+    )
+    .trim()
+    .to_string();
+    let theirs = drop_reverse_link(p, &ours);
+
+    let out = run(p, &["check"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    for id in [&ours, &theirs] {
+        assert!(
+            stdout.contains(&format!(
+                "error hyp/links/{id}.md: depends_on cycle detected\n  \
+                 note: Archiving any one link of the cycle breaks it.\n  \
+                 repair: hyp archive {id}\n"
+            )),
+            "{stdout}"
+        );
+    }
+    let cycle = &diagnostics_of(p, &format!("hyp/links/{theirs}.md"))[0];
+    assert_eq!(cycle["code"], "cycle", "{cycle}");
+    assert_eq!(cycle["blocks_writes"], false, "{cycle}");
+    assert_eq!(
+        cycle["repair"]["commands"],
+        serde_json::json!([["hyp", "archive", theirs]])
+    );
+
+    // A write that leaves the errors as they are is not blocked by them.
+    ok(p, &["add", "Unrelated work"]);
+    // A write that adds an error is rejected: a third link closing the cycle
+    // again, or a hypothesis investigating without a criterion.
+    fails(
+        p,
+        &["link", &b, &a, "--relation", "depends-on", "--reason", "r"],
+        "depends_on cycle detected",
+    );
+    fails(
+        p,
+        &["set", &a, "--lifecycle", "investigating"],
+        "investigating requires a falsification criterion",
+    );
+
+    apply_repair(p, &format!("hyp/links/{theirs}.md"));
+    ok(p, &["check"]);
+    assert!(ok(p, &["--json", "list", "--kind", "link", "--archived"]).contains(&theirs));
+}
+
+#[test]
+fn dangling_reference_after_a_sync_is_repaired_with_the_suggested_commands() {
+    let dir = TempDir::new().unwrap();
+    let p = dir.path();
+    ok(p, &["init"]);
+    let h = ok(p, &["add", "H"]).trim().to_string();
+    let created = ok(p, &["evidence", "add", &h, "Obs", "--source", "log"]);
+    let (e, link) = created.trim().split_once('\n').unwrap();
+    // The sync deleted the evidence but kept the link to it.
+    std::fs::remove_file(p.join(format!("hyp/evidence/{e}.md"))).unwrap();
+
+    let out = run(p, &["check"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "error hyp/links/{link}.md: references {e}, which does not exist\n  \
+             note: Restore {e} from the source of the merge or sync"
+        )),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "  repair: hyp archive {link}\n  repair: hyp delete {link}\n"
+        )),
+        "{stdout}"
+    );
+    let repair = &diagnostics_of(p, &format!("hyp/links/{link}.md"))[0]["repair"];
+    assert_eq!(
+        repair["commands"],
+        serde_json::json!([["hyp", "archive", link], ["hyp", "delete", link]])
+    );
+    assert!(
+        repair["note"].as_str().unwrap().contains("loses nothing"),
+        "{repair}"
+    );
+    apply_repair(p, &format!("hyp/links/{link}.md"));
+    ok(p, &["check"]);
+    assert!(!p.join(format!("hyp/links/{link}.md")).exists());
+}
+
+#[test]
+fn unreadable_files_block_every_write_including_repairs() {
+    let dir = TempDir::new().unwrap();
+    let p = dir.path();
+    ok(p, &["init"]);
+    let a = ok(p, &["add", "A"]).trim().to_string();
+    let b = ok(p, &["add", "B"]).trim().to_string();
+    let ours = ok(
+        p,
+        &["link", &a, &b, "--relation", "depends-on", "--reason", "r"],
+    )
+    .trim()
+    .to_string();
+    let theirs = drop_reverse_link(p, &ours);
+    let broken = format!("hyp/hypotheses/H-{}.md", uuid::Uuid::new_v4());
+    std::fs::write(p.join(&broken), "not front matter").unwrap();
+    let json: serde_json::Value =
+        serde_json::from_slice(&run(p, &["--json", "check"]).stdout).unwrap();
+    let unreadable = json
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["path"] == broken.as_str())
+        .unwrap();
+    assert_eq!(unreadable["code"], "malformed");
+    assert_eq!(unreadable["blocks_writes"], true);
+    let blocked = format!("{broken}: file must start with YAML front matter");
+    fails(p, &["add", "Unrelated work"], &blocked);
+    fails(p, &["archive", &theirs], &blocked);
+    std::fs::remove_file(p.join(&broken)).unwrap();
+    ok(p, &["archive", &theirs]);
+    ok(p, &["check"]);
+}
+
+/// QA repro (HYPO-0003 review): the link already has a known
+/// dangling_reference; turning it into a `depends_on` link from evidence adds
+/// a second, different violation to the same record, which must not hide
+/// behind the first.
+#[test]
+fn a_new_error_cannot_hide_behind_a_known_one_on_the_same_record() {
+    let dir = TempDir::new().unwrap();
+    let p = dir.path();
+    ok(p, &["init"]);
+    let h = ok(p, &["add", "H"]).trim().to_string();
+    let created = ok(p, &["evidence", "add", &h, "Obs", "--source", "log"]);
+    let (e, link) = created.trim().split_once('\n').unwrap();
+    std::fs::remove_file(p.join(format!("hyp/evidence/{e}.md"))).unwrap();
+    let shown: serde_json::Value = serde_json::from_str(&ok(p, &["--json", "show", link])).unwrap();
+    let mut record = shown["entry"]["record"].clone();
+    record["relation"] = "depends_on".into();
+    let update = serde_json::json!([{"op": "update", "record": record,
+        "expected_revision": shown["entry"]["revision"]}]);
+    let out = apply(p, false, &[], &update.to_string());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("hypothesis relations require two hypotheses"),
+        "{stderr}"
+    );
+}
+
+fn codes(diagnostics: &[serde_json::Value]) -> Vec<&str> {
+    diagnostics
+        .iter()
+        .map(|d| d["code"].as_str().unwrap())
+        .collect()
+}
+
+/// A partial sync: the hypothesis file has not arrived yet. Its predictions
+/// and criteria are not offered deletion (it cannot be undone without version
+/// control); restoring is the repair.
+#[test]
+fn records_whose_owner_is_missing_are_never_offered_deletion() {
+    let dir = TempDir::new().unwrap();
+    let p = dir.path();
+    ok(p, &["init"]);
+    let h = ok(p, &["add", "H"]).trim().to_string();
+    let prediction = ok(p, &["predict", &h, "P"]).trim().to_string();
+    let criterion = ok(p, &["falsify-if", &h, "F"]).trim().to_string();
+    std::fs::remove_file(p.join(format!("hyp/hypotheses/{h}.md"))).unwrap();
+    let out = run(p, &["check"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    assert!(!stdout.contains("delete"), "{stdout}");
+    for (dir, id) in [("predictions", &prediction), ("criteria", &criterion)] {
+        let d = &diagnostics_of(p, &format!("hyp/{dir}/{id}.md"))[0];
+        assert_eq!(d["code"], "dangling_reference", "{d}");
+        assert_eq!(d["repair"]["commands"], serde_json::json!([]), "{d}");
+        assert!(
+            d["repair"]["note"]
+                .as_str()
+                .unwrap()
+                .starts_with(&format!("Restore {h} from the source")),
+            "{d}"
+        );
+    }
+}
+
+/// Both halves of a `depends_on` cycle arrived, but one hypothesis did not:
+/// each link breaks two rules, and `hyp check` reports both.
+#[test]
+fn a_record_breaking_two_rules_reports_both() {
+    let dir = TempDir::new().unwrap();
+    let p = dir.path();
+    ok(p, &["init"]);
+    let a = ok(p, &["add", "A"]).trim().to_string();
+    let b = ok(p, &["add", "B"]).trim().to_string();
+    let ours = ok(
+        p,
+        &["link", &a, &b, "--relation", "depends-on", "--reason", "r"],
+    )
+    .trim()
+    .to_string();
+    drop_reverse_link(p, &ours);
+    std::fs::remove_file(p.join(format!("hyp/hypotheses/{b}.md"))).unwrap();
+    assert_eq!(
+        codes(&diagnostics_of(p, &format!("hyp/links/{ours}.md"))),
+        ["dangling_reference", "cycle"]
+    );
+}
+
+/// Replacing a record's known violation with one of another kind is a new
+/// error: the dangling link, pointed at an existing hypothesis, closes a cycle.
+#[test]
+fn replacing_a_known_violation_with_another_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    let p = dir.path();
+    ok(p, &["init"]);
+    let a = ok(p, &["add", "A"]).trim().to_string();
+    let b = ok(p, &["add", "B"]).trim().to_string();
+    let c = ok(p, &["add", "C"]).trim().to_string();
+    ok(
+        p,
+        &["link", &b, &a, "--relation", "depends-on", "--reason", "r"],
+    );
+    let link = ok(
+        p,
+        &["link", &a, &c, "--relation", "depends-on", "--reason", "r"],
+    )
+    .trim()
+    .to_string();
+    std::fs::remove_file(p.join(format!("hyp/hypotheses/{c}.md"))).unwrap();
+    let path = format!("hyp/links/{link}.md");
+    assert_eq!(codes(&diagnostics_of(p, &path)), ["dangling_reference"]);
+    let shown: serde_json::Value =
+        serde_json::from_str(&ok(p, &["--json", "show", &link])).unwrap();
+    let mut record = shown["entry"]["record"].clone();
+    record["to"] = b.clone().into();
+    let update = serde_json::json!([{"op": "update", "record": record,
+        "expected_revision": shown["entry"]["revision"]}]);
+    let out = apply(p, false, &[], &update.to_string());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("depends_on cycle detected"), "{stderr}");
+    assert_eq!(codes(&diagnostics_of(p, &path)), ["dangling_reference"]);
+}
+
+/// Whether a stored short ID is an error does not depend on which records
+/// exist (it used to flip between dangling and inconsistent): it is `invalid`,
+/// reported once, and blocks writes.
+#[test]
+fn a_stored_short_reference_is_invalid_regardless_of_other_records() {
+    let dir = TempDir::new().unwrap();
+    let p = dir.path();
+    ok(p, &["init"]);
+    let h = ok(p, &["add", "H"]).trim().to_string();
+    let prediction = ok(p, &["predict", &h, "P"]).trim().to_string();
+    let file = p.join(format!("hyp/predictions/{prediction}.md"));
+    let raw = std::fs::read_to_string(&file).unwrap();
+    // A prefix of an existing ID, and one that matches nothing.
+    for short in [&h[..6], "H-zz"] {
+        std::fs::write(&file, raw.replace(&h, short)).unwrap();
+        let d = diagnostics_of(p, &format!("hyp/predictions/{prediction}.md"));
+        assert_eq!(codes(&d), ["invalid"], "{short}: {d:?}");
+        assert_eq!(d[0]["message"], "stored references must use full IDs");
+        assert_eq!(d[0]["blocks_writes"], true);
+    }
+    fails(p, &["add", "Other"], "1 error blocks writes; run hyp check");
+    // An error that does not block is counted separately.
+    std::fs::write(&file, &raw).unwrap();
+    let late = ok(p, &["add", "Late"]).trim().to_string();
+    ok(p, &["predict", &late, "Q"]);
+    std::fs::remove_file(p.join(format!("hyp/hypotheses/{late}.md"))).unwrap();
+    std::fs::write(&file, raw.replace(&h, "H-zz")).unwrap();
+    fails(
+        p,
+        &["add", "Other"],
+        "1 error blocks writes (1 more does not); run hyp check",
+    );
+}

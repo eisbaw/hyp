@@ -895,6 +895,14 @@ pub async fn run(cli: Cli) -> Result<()> {
             } else {
                 for d in &s.diagnostics {
                     println!("{} {}: {}", d.severity, d.path, d.message);
+                    if let Some(repair) = &d.repair {
+                        if let Some(note) = &repair.note {
+                            println!("  note: {note}");
+                        }
+                        for command in &repair.commands {
+                            println!("  repair: {}", command.join(" "));
+                        }
+                    }
                 }
                 println!("Checked {} objects", s.objects.len());
             }

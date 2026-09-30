@@ -110,17 +110,15 @@ async function refresh() {
   if (readOnly) return;
   try {
     const next = await fetchJSON("/api/snapshot");
-    if (next.diagnostics.some((d) => d.severity === "error")) {
+    const blocking = next.diagnostics.filter((d) => d.blocks_writes);
+    if (blocking.length) {
       if (!snapshot) {
         snapshot = next;
         render();
       }
       notice(
         "Invalid project files. Showing the last readable state; writes are blocked. " +
-          next.diagnostics
-            .filter((d) => d.severity === "error")
-            .map((d) => `${d.path}: ${d.message}`)
-            .join(" · "),
+          blocking.map((d) => `${d.path}: ${d.message}`).join(" · "),
       );
       connectivity("Invalid files · stale");
       return;
@@ -139,7 +137,7 @@ async function refresh() {
     }
     const changed = !snapshot || snapshot.revision !== next.revision;
     snapshot = next;
-    if (!pending) notice("");
+    if (!pending) notice(repairNotice(next));
     if (connected) connectivity("Live", true);
     if (changed) render();
   } catch (e) {
@@ -152,10 +150,28 @@ function route() {
   [view, selected = ""] = hash.split("/");
   render();
 }
+/** Errors between records, as a merge or sync leaves them, do not block
+ * writes; the server rejects only writes that add an error. */
+function repairNotice(s) {
+  const n = s.diagnostics.filter((d) => d.severity === "error").length;
+  if (!n) return "";
+  return `${n} notebook error${n === 1 ? "" : "s"}, for example from a merge or sync. Saving still works unless it adds a new error. See the checks below for repairs.`;
+}
+/** A diagnostic's repair as `hyp check` prints it: the note, then each
+ * command (an argv array, run in the project directory). */
+function repairLines(r) {
+  if (!r) return "";
+  return [
+    ...(r.note ? [`Note: ${r.note}`] : []),
+    ...r.commands.map((c) => `Repair: ${c.join(" ")}`),
+  ]
+    .map((l) => "\n" + l)
+    .join("");
+}
 function diagnostics() {
   const ds = snapshot.diagnostics;
   if (!ds.length) return "";
-  return `<details class="diagnostics"><summary>${ds.length} notebook check${ds.length === 1 ? "" : "s"} to review</summary><pre>${esc(ds.map((d) => `${d.severity.toUpperCase()} · ${d.path}\n${d.message}`).join("\n\n"))}</pre></details>`;
+  return `<details class="diagnostics"><summary>${ds.length} notebook check${ds.length === 1 ? "" : "s"} to review</summary><pre>${esc(ds.map((d) => `${d.severity.toUpperCase()} · ${d.path}\n${d.message}${repairLines(d.repair)}`).join("\n\n"))}</pre></details>`;
 }
 function render() {
   if (!snapshot) return;

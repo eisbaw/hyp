@@ -561,6 +561,10 @@ impl Store {
     fn relative(r: &Record) -> String {
         format!("{}/{}.md", r.data.directory(), r.id)
     }
+    /// The path diagnostics of record `r` name, relative to the project root.
+    fn path_of(r: &Record) -> String {
+        format!("hyp/{}", Self::relative(r))
+    }
     fn target(&self, relative: &str) -> Result<PathBuf> {
         let components: Vec<_> = relative.split('/').collect();
         ensure!(
@@ -652,22 +656,20 @@ impl Store {
                 };
                 match read() {
                     Ok(e) => snap.objects.push(e),
-                    Err(e) => snap.diagnostics.push(Diagnostic {
-                        path: path.strip_prefix(&self.root)?.display().to_string(),
-                        message: e.to_string(),
-                        severity: "error".into(),
-                    }),
+                    Err(e) => snap.diagnostics.push(Diagnostic::new(
+                        path.strip_prefix(&self.root)?.display().to_string(),
+                        Code::Malformed,
+                        e.to_string(),
+                    )),
                 }
             }
         }
         snap.objects.sort_by(|a, b| a.record.id.cmp(&b.record.id));
         for entry in &snap.objects {
-            if let Err(e) = snap.validate(&entry.record) {
-                snap.diagnostics.push(Diagnostic {
-                    path: format!("hyp/{}", Self::relative(&entry.record)),
-                    message: e.to_string(),
-                    severity: "error".into(),
-                });
+            for v in snap.validate(&entry.record) {
+                let mut d = Diagnostic::new(Self::path_of(&entry.record), v.code, v.message);
+                d.repair = v.repair;
+                snap.diagnostics.push(d);
             }
             if let Data::Evidence { attachments, .. } = &entry.record.data {
                 for a in attachments {
@@ -679,11 +681,11 @@ impl Store {
                         .and_then(|p| fs::read(p).ok())
                         .is_some_and(|bytes| hash(bytes) == a.sha256);
                     if !valid {
-                        snap.diagnostics.push(Diagnostic {
-                            path: a.path.clone(),
-                            message: "attachment missing, unsafe, or hash mismatch".into(),
-                            severity: "error".into(),
-                        });
+                        snap.diagnostics.push(Diagnostic::new(
+                            &a.path,
+                            Code::Attachment,
+                            "attachment missing, unsafe, or hash mismatch",
+                        ));
                     }
                 }
             }
@@ -695,11 +697,11 @@ impl Store {
                 if untestable_reason.trim().is_empty()
                     && !snap.has_active_criterion(&entry.record.id)
                 {
-                    snap.diagnostics.push(Diagnostic {
-                        path: entry.record.id.clone(),
-                        message: "no active falsification criterion".into(),
-                        severity: "warning".into(),
-                    });
+                    snap.diagnostics.push(Diagnostic::new(
+                        &entry.record.id,
+                        Code::NoCriterion,
+                        "no active falsification criterion",
+                    ));
                 }
             }
         }
@@ -713,6 +715,13 @@ impl Store {
     /// `commit`, also returning the object each change named, by full ID (a
     /// create's ID may be assigned here). A change that turned out to be a
     /// no-op is still listed.
+    ///
+    /// Diagnostics that block writes (malformed files, broken attachments,
+    /// invalid records) reject every write. Other errors, between loaded
+    /// records, arrive from merges, syncs and hand edits; a write is accepted
+    /// if it adds no error, identified by `Diagnostic::identity`, that the
+    /// project did not already have. So a write may repair such errors, and
+    /// an unrelated write that leaves them as they are is not blocked by them.
     pub fn commit_written(
         &self,
         changes: Vec<Change>,
@@ -720,7 +729,7 @@ impl Store {
     ) -> Result<Committed> {
         let _lock = self.lock()?;
         let before = self.read_unlocked()?;
-        before.assert_healthy()?;
+        before.assert_writable()?;
         if let Some(expected) = expected_project {
             if expected != before.revision {
                 bail!(Conflict("project changed; reload and retry".into()));
@@ -889,8 +898,21 @@ impl Store {
             });
             after.objects.sort_by(|a, b| a.record.id.cmp(&b.record.id));
         }
+        let known: Vec<(&str, Code)> = before
+            .diagnostics
+            .iter()
+            .filter(|d| d.severity == "error")
+            .map(Diagnostic::identity)
+            .collect();
         for e in &after.objects {
-            after.validate(&e.record)?;
+            let path = Self::path_of(&e.record);
+            if let Some(v) = after
+                .validate(&e.record)
+                .into_iter()
+                .find(|v| !known.contains(&(path.as_str(), v.code)))
+            {
+                return Err(v.into());
+            }
             if let Data::Evidence { attachments, .. } = &e.record.data {
                 for attachment in attachments {
                     let path = self
