@@ -1,11 +1,11 @@
 ---
 id: HYPO-0016
 title: 'Agent onboarding: `hyp init` installs Claude/Codex skill'
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-09-29 22:23'
-updated_date: '2026-09-30 02:19'
+updated_date: '2026-09-30 02:27'
 labels:
   - agents
   - cli
@@ -46,7 +46,7 @@ Per decision-0001, installing agent files must not require or assume Git.
 - [x] #3 Idempotent: re-running does not duplicate content; managed blocks use start/end markers, and user content outside them is preserved; locally modified managed files are not overwritten without `--force`
 - [x] #4 Codex skill/instructions location verified against current Codex documentation, with the source cited in the task notes
 - [x] #5 Integration tests: fresh install, re-install, update after a version bump, remove; all in a plain directory without Git
-- [ ] #6 Dogfood: a Claude Code session in a sample project, given only the skill, uses hyp correctly on a small debugging task (transcript summary in the task notes)
+- [x] #6 Dogfood: a Claude Code session in a sample project, given only the skill, uses hyp correctly on a small debugging task (transcript summary in the task notes)
 - [x] #7 Skill content covers the method (hypothesis before action, falsify-if first, cited evidence, conflict retry, no direct file edits) and states the assessment policy: agents may record any assessment, but each must cite at least one evidence ID and a rationale
 - [x] #8 The machine contract is documented in the README and the skill: exit codes 0/1/2/3, 141 (output pipe closed; a write may already be on disk), HTTP 403/409/422, and that conflict messages start with 'conflict:'
 <!-- AC:END -->
@@ -127,4 +127,15 @@ Re-review fixes (2026-09-30, still uncommitted):
 - The WebUI HTTP codes line was cut from SKILL.md at the orchestrator's request (agents do not run hyp web); the README keeps it. AC #8 ('documented in the README and the skill') is thus met for HTTP codes in the README only, by decision.
 
 Committed the installer and skill after QA GO and architect GO (three review rounds). AC #6 (dogfood with a real Claude Code session) is still open; the orchestrator runs it next.
+
+Dogfood (AC #6), 2026-09-30. Sample project: 3 Python unittest tests; test_c fails only after test_a because add_coupon has a mutable default list; BUG.md suggests float rounding (red herring). Each agent got a git-initialised copy with only the hyp skill installed (hyp init --agents claude / codex), and the prompt 'CI is failing; the report is in BUG.md. Find the root cause and fix it.' hyp was never mentioned.
+- Claude Code 2.1.280 (claude -p, project settings only, 17 turns, about 0.29 USD): loaded the hyp skill on its own; added both hypotheses, linked them competes-with, wrote falsify-if criteria and a prediction BEFORE running experiments; recorded evidence with source and locator; linked the evidence as contradicting the rounding hypothesis; fixed cart.py; recorded verification evidence; assessed the leak 'supported' (0.95) and rounding 'falsified' (with --criterion) using --reviewed tokens from show --json; closed both. No hyp errors. One $(hyp add ...) capture was blocked by Claude Code's permission rules, not by hyp.
+- Codex 0.158 (codex exec, workspace-write): same pattern (2 hypotheses, criteria, predictions, competes-with, 4 evidence records, assessed supported/falsified, re-assessed after its fix, closed both). Its two failed commands were unrelated to hyp.
+Findings filed: closing marks every hypothesis needs-review (HYPO-0009, new AC), long evidence titles and search-before-add guidance (HYPO-0036). Transcripts: scratchpad dogfood-claude.jsonl and dogfood-codex.log (session-local).
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Agent onboarding is shipped: agents/hyp/SKILL.md (embedded), hyp agents print|install|update|remove, hyp init --agents; installs to .claude/skills/hyp and .agents/skills/hyp with a managed marker, refusing edited, foreign, newer or symlink-reached files without --force. Dogfooded with Claude Code and Codex: both used hyp correctly with only the skill. Follow-ups: HYPO-0027, 0028, 0029, 0031, 0036.
+<!-- SECTION:FINAL_SUMMARY:END -->

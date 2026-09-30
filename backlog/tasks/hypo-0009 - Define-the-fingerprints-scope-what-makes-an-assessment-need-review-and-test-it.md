@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-09-29 22:16'
-updated_date: '2026-09-30 01:18'
+updated_date: '2026-09-30 02:26'
 labels:
   - design
 dependencies: []
@@ -29,6 +29,7 @@ If most review flags are noise, users learn to ignore them, and the flag's value
 - [ ] #2 Fingerprint implemented accordingly with tests for both a triggering and a non-triggering change
 - [ ] #3 No-op updates do not change the file (and therefore the revision)
 - [ ] #4 Root cause fixed: the fingerprint hashes a canonical projection of the meaningful fields, not file-byte revisions (which include `updated_at`); object revisions stay raw-byte hashes, which is right for detecting external edits
+- [ ] #5 Dogfood regression: `hyp set H --lifecycle closed` (the skill's finishing step), tag or title edits do not set needs_review on H or on hypotheses linked to it. In the 2026-09-30 test-drive both the Claude Code and the Codex session ended with every hypothesis 'needs review' purely because they closed them
 <!-- AC:END -->
 
 ## Implementation Notes
@@ -47,4 +48,6 @@ Raised to high after the HYPO-0002 Codex round-3 review. The precondition machin
 (b) E is linked to H2; a run of H1's experiment citing E does not enter relevant(H2).
 (c) Links on run-cited evidence now count (changed in HYPO-0002 cycle 3) and pull in other hypotheses, which increases noise (the original concern of this task).
 Decide: a principled closure (e.g. evidence reachable within the hypothesis's own records, plus every interpretation of that evidence) vs narrowing. Keep web/app.js expectedFrom in sync, or better, have the server expose what to state.
+
+Test-drive 2026-09-30: concrete, high-visibility symptom. Both dogfood agents (Claude Code, Codex) followed the skill, assessed, then ran `hyp set H --lifecycle closed`; that changed H's revision, hence its fingerprint, so needs_review became true for H and for the competing hypothesis linked to it. Every finished investigation therefore looks stale.
 <!-- SECTION:NOTES:END -->
