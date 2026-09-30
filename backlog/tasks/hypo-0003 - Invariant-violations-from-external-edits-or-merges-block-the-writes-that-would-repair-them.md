@@ -6,13 +6,13 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-09-29 22:15'
-updated_date: '2026-09-29 22:30'
+updated_date: '2026-09-30 05:33'
 labels:
   - bug
   - validation
   - storage
 dependencies: []
-priority: medium
+priority: high
 ---
 
 ## Description
@@ -35,3 +35,9 @@ Malformed/unparseable files should keep blocking writes. Records that parse but 
 - [ ] #6 Pre-existing errors are identified by a stable diagnostic identity (path + kind), not message text or counts, when deciding whether a change introduces new errors
 - [ ] #7 Repair works from the CLI; the WebUI either allows repair writes or clearly says to use the CLI (today `refresh()` treats any error as 'writes blocked')
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+COMPASS 2026-09-30: cornerstone of the Git-friendly promise (decision-0001): a merge or sync that introduces e.g. a dangling reference blocks all writes with no tool-level recovery. Independent of HYPO-0009; can run in parallel with the ergonomics tasks.
+<!-- SECTION:NOTES:END -->

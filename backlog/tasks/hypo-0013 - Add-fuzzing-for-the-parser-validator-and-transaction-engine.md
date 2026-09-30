@@ -4,11 +4,13 @@ title: 'Add fuzzing for the parser, validator and transaction engine'
 status: To Do
 assignee: []
 created_date: '2026-09-29 22:16'
-updated_date: '2026-09-29 22:30'
+updated_date: '2026-09-30 05:33'
 labels:
   - testing
 dependencies:
   - HYPO-0011
+  - HYPO-0009
+  - HYPO-0008
 priority: medium
 ---
 

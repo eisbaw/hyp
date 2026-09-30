@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-09-29 22:16'
-updated_date: '2026-09-30 02:26'
+updated_date: '2026-09-30 05:34'
 labels:
   - design
 dependencies: []
@@ -50,4 +50,6 @@ Raised to high after the HYPO-0002 Codex round-3 review. The precondition machin
 Decide: a principled closure (e.g. evidence reachable within the hypothesis's own records, plus every interpretation of that evidence) vs narrowing. Keep web/app.js expectedFrom in sync, or better, have the server expose what to state.
 
 Test-drive 2026-09-30: concrete, high-visibility symptom. Both dogfood agents (Claude Code, Codex) followed the skill, assessed, then ran `hyp set H --lifecycle closed`; that changed H's revision, hence its fingerprint, so needs_review became true for H and for the competing hypothesis linked to it. Every finished investigation therefore looks stale.
+
+COMPASS 2026-09-30: settle the scope as a user decision first (proposed decision-0003 'review basis'), then implement HYPO-0031 -> 0009 -> 0026 as one deep-gated change. Open questions for the user: per-kind which field edits invalidate (title/body yes? lifecycle/tags/status no? archiving?); whether linked/competing hypotheses' content counts or only the link; whether an assessment may cite evidence outside the basis (if not, relevant_with/assessment_additions/expectedFrom mostly disappear); migration: accept a one-time needs-review wave or version the scheme in based_on. Watch: the title IS the claim for hypotheses/criteria/predictions/evidence, so 'title edits do not invalidate' must not apply to those kinds.
 <!-- SECTION:NOTES:END -->

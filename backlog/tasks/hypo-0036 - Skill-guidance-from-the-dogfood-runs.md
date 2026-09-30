@@ -4,10 +4,13 @@ title: Skill guidance from the dogfood runs
 status: To Do
 assignee: []
 created_date: '2026-09-30 02:26'
+updated_date: '2026-09-30 05:33'
 labels:
   - agents
   - docs
-dependencies: []
+dependencies:
+  - HYPO-0028
+  - HYPO-0033
 priority: medium
 ---
 

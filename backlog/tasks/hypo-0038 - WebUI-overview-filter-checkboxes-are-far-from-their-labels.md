@@ -4,10 +4,12 @@ title: 'WebUI: overview filter checkboxes are far from their labels'
 status: To Do
 assignee: []
 created_date: '2026-09-30 02:26'
+updated_date: '2026-09-30 05:33'
 labels:
   - webui
   - ux
-dependencies: []
+dependencies:
+  - HYPO-0017
 priority: low
 ---
 

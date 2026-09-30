@@ -4,10 +4,12 @@ title: Human-readable plain `hyp show`
 status: To Do
 assignee: []
 created_date: '2026-09-30 02:26'
+updated_date: '2026-09-30 05:33'
 labels:
   - cli
   - ux
-dependencies: []
+dependencies:
+  - HYPO-0009
 priority: medium
 ---
 

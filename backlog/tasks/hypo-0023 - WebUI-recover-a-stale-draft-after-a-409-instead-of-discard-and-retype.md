@@ -4,11 +4,13 @@ title: 'WebUI: recover a stale draft after a 409 instead of discard-and-retype'
 status: To Do
 assignee: []
 created_date: '2026-09-29 23:50'
+updated_date: '2026-09-30 05:33'
 labels:
   - webui
   - ux
 dependencies:
   - HYPO-0002
+  - HYPO-0009
 priority: medium
 ---
 
