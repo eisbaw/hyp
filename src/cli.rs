@@ -1,11 +1,13 @@
 use crate::{
+    agents::{self, Agent, Operation},
     model::*,
     store::{Change, Conflict, Store},
     web,
 };
 use anyhow::{Context, Result, ensure};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::{
+    collections::BTreeMap,
     io::{Read, Write},
     path::PathBuf,
 };
@@ -13,7 +15,7 @@ use std::{
 #[derive(Parser)]
 #[command(
     version,
-    about = "Git-native hypothesis tracking for humans and agents"
+    about = "Hypothesis tracking for coding and research agents: plain files in any directory, Git-friendly"
 )]
 pub struct Cli {
     #[arg(long, global = true, default_value = ".")]
@@ -29,6 +31,17 @@ pub enum Command {
     Init {
         #[arg(long)]
         demo: bool,
+        /// Also install the hyp skill for these coding agents (see `hyp agents`):
+        /// claude, codex, both comma-separated, or none (the default).
+        #[arg(long, value_name = "LIST", value_parser = parse_init_agents)]
+        agents: Option<AgentList>,
+    },
+    /// Teach coding agents to use hyp: print the hyp skill, or install it
+    /// as a project skill for Claude Code (.claude/skills/hyp/SKILL.md) and
+    /// Codex (.agents/skills/hyp/SKILL.md).
+    Agents {
+        #[command(subcommand)]
+        command: AgentsCommand,
     },
     /// Capture a hypothesis. Use '-' as text to read stdin.
     Add {
@@ -176,6 +189,61 @@ pub enum Command {
         output: Option<PathBuf>,
     },
 }
+/// Agents in `Agent::ALL` order, without duplicates.
+#[derive(Clone)]
+pub struct AgentList(Vec<Agent>);
+impl AgentList {
+    fn of(list: &[Agent]) -> Self {
+        Self(
+            Agent::ALL
+                .into_iter()
+                .filter(|a| list.contains(a))
+                .collect(),
+        )
+    }
+}
+/// `none` alone, or a comma-separated list of agents. A clap value parser,
+/// so a bad list is an argument error (exit 2).
+fn parse_init_agents(value: &str) -> Result<AgentList, String> {
+    if value == "none" {
+        return Ok(AgentList(vec![]));
+    }
+    let list = value
+        .split(',')
+        .map(|name| match name {
+            "none" => Err("none cannot be combined with other agents".to_string()),
+            _ => Agent::from_str(name, false)
+                .map_err(|_| format!("unknown agent {name:?}; use claude, codex, or none")),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(AgentList::of(&list))
+}
+#[derive(Subcommand)]
+pub enum AgentsCommand {
+    /// Print the skill to stdout.
+    Print,
+    /// Install or refresh the skill (default: all agents).
+    Install(AgentsArgs),
+    /// Refresh installed skills to this hyp version; installs nothing new.
+    Update(AgentsArgs),
+    /// Delete skills that hyp installed.
+    Remove(AgentsArgs),
+}
+#[derive(clap::Args)]
+pub struct AgentsArgs {
+    #[arg(
+        long,
+        value_enum,
+        value_delimiter = ',',
+        value_name = "LIST",
+        default_value = "claude,codex"
+    )]
+    agents: Vec<Agent>,
+    /// Also overwrite or delete a skill file that was modified after hyp
+    /// installed it (or overwrite one hyp did not install).
+    #[arg(long)]
+    force: bool,
+}
 #[derive(Subcommand)]
 pub enum EvidenceCommand {
     Add {
@@ -240,18 +308,53 @@ fn hypothesis(s: &Snapshot, id: &str) -> Result<String> {
     );
     Ok(e.record.id.clone())
 }
+fn print_steps(steps: &[agents::Step], json: bool) -> Result<()> {
+    if json {
+        return print_json(&steps);
+    }
+    for step in steps {
+        let action = serde_json::to_value(step.action)?;
+        println!("{} {}", action.as_str().unwrap_or_default(), step.path);
+    }
+    Ok(())
+}
 pub async fn run(cli: Cli) -> Result<()> {
-    if let Command::Init { demo } = cli.command {
+    if let Command::Init { demo, agents } = &cli.command {
+        let agents = agents.clone().map(|list| list.0).unwrap_or_default();
+        // Planned before the project exists, so a blocked skill file fails
+        // `init` before it creates anything.
+        let steps = agents::plan(&cli.project, &agents, Operation::Install, false).context(
+            "cannot install the agent skills (run `hyp init` without --agents, then \
+                 `hyp agents install --force` if hyp should replace or write through them)",
+        )?;
         let store = Store::init(&cli.project)?;
-        if demo {
+        if *demo {
             seed_demo(&store)?;
         }
+        agents::apply(&steps)?;
         if cli.json {
             print_json(&store.snapshot()?)?;
         } else {
             println!("Initialized {}", store.root.display());
+            print_steps(&steps, false)?;
         }
         return Ok(());
+    }
+    if let Command::Agents { command } = &cli.command {
+        let (op, args) = match command {
+            AgentsCommand::Print => {
+                print!("{}", agents::SKILL);
+                return Ok(());
+            }
+            AgentsCommand::Install(args) => (Operation::Install, args),
+            AgentsCommand::Update(args) => (Operation::Update, args),
+            AgentsCommand::Remove(args) => (Operation::Remove, args),
+        };
+        let root = Store::open(&cli.project)?.root;
+        let list = AgentList::of(&args.agents);
+        let steps = agents::plan(&root, &list.0, op, args.force)?;
+        agents::apply(&steps)?;
+        return print_steps(&steps, cli.json);
     }
     let store = Store::open(&cli.project)?;
     if let Command::Web { port } = cli.command {
@@ -536,9 +639,45 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Show { id } => {
             let e = s.find(&id)?;
             if cli.json {
-                print_json(
-                    &serde_json::json!({"entry":e,"state":s.hypotheses.get(&e.record.id),"related":s.objects.iter().filter(|x|x.record.data.references().contains(&e.record.id.as_str())).collect::<Vec<_>>()}),
-                )?;
+                let related: Vec<&Entry> = s
+                    .objects
+                    .iter()
+                    .filter(|x| x.record.data.references().contains(&e.record.id.as_str()))
+                    .collect();
+                // For a hypothesis, what its review token covers: every record
+                // with its revision, plus in full the runs and evidence, which
+                // `related` does not reach (a link or run names only IDs).
+                let (basis, runs, evidence) = match e.record.data {
+                    Data::Hypothesis { .. } => {
+                        let relevant = s.relevant(&e.record.id);
+                        let covered: Vec<&Entry> = s
+                            .objects
+                            .iter()
+                            .filter(|x| relevant.contains(&x.record.id))
+                            .collect();
+                        let of_kind = |kind: &str| -> Vec<&Entry> {
+                            covered
+                                .iter()
+                                .copied()
+                                .filter(|x| x.record.data.kind() == kind)
+                                .collect()
+                        };
+                        let basis: BTreeMap<&str, &str> = covered
+                            .iter()
+                            .map(|x| (x.record.id.as_str(), x.revision.as_str()))
+                            .collect();
+                        (Some(basis), Some(of_kind("run")), Some(of_kind("evidence")))
+                    }
+                    _ => (None, None, None),
+                };
+                print_json(&serde_json::json!({
+                    "entry": e,
+                    "state": s.hypotheses.get(&e.record.id),
+                    "related": related,
+                    "runs": runs,
+                    "evidence": evidence,
+                    "basis": basis,
+                }))?;
             } else {
                 println!("{}", crate::store::encode(&e.record)?);
                 if let Some(state) = s.hypotheses.get(&e.record.id) {
@@ -701,7 +840,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             }
             return Ok(());
         }
-        Command::Init { .. } | Command::Web { .. } => unreachable!(),
+        Command::Init { .. } | Command::Agents { .. } | Command::Web { .. } => unreachable!(),
     }
     let affected: Vec<String> = changes
         .iter()

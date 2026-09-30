@@ -7,7 +7,7 @@ name = "hyp"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Git-native hypothesis tracking for humans and agents"
+description = "Hypothesis tracking for coding and research agents: plain files in any directory, Git-friendly"
 license = "MIT"
 
 [dependencies]

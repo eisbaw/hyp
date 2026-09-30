@@ -428,8 +428,23 @@ pub fn decode(s: &str) -> Result<Record> {
     Ok(r)
 }
 fn atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_atomic(path, bytes, tempfile::Builder::new())
+}
+/// Like `atomic`, but the file gets mode 0644 less the umask instead of the
+/// temporary file's private 0600: for files other tools read, such as the
+/// agent skills.
+pub(crate) fn atomic_readable(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut builder = tempfile::Builder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(fs::Permissions::from_mode(0o644));
+    }
+    write_atomic(path, bytes, builder)
+}
+fn write_atomic(path: &Path, bytes: &[u8], builder: tempfile::Builder) -> Result<()> {
     let parent = path.parent().context("missing parent")?;
-    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    let mut tmp = builder.tempfile_in(parent)?;
     tmp.write_all(bytes)?;
     tmp.as_file().sync_all()?;
     tmp.persist(path).map_err(|e| e.error)?;
@@ -680,8 +695,12 @@ impl Store {
                     }
                 }
             }
-            if let Data::Hypothesis { .. } = entry.record.data {
-                if !snap.objects.iter().any(|e|!e.record.archived && matches!(&e.record.data,Data::Criterion{hypothesis} if hypothesis==&entry.record.id)) {
+            if let Data::Hypothesis {
+                untestable_reason, ..
+            } = &entry.record.data
+            {
+                // An untestable reason is the stated alternative to a criterion.
+                if untestable_reason.trim().is_empty() && !snap.objects.iter().any(|e|!e.record.archived && matches!(&e.record.data,Data::Criterion{hypothesis} if hypothesis==&entry.record.id)) {
                     snap.diagnostics.push(Diagnostic{path:entry.record.id.clone(),message:"no active falsification criterion".into(),severity:"warning".into()});
                 }
             }

@@ -2,7 +2,7 @@
 
 Checked on x86_64 Linux.
 
-- `cargo test --locked`: **22 integration tests pass** (19 domain/storage workflows, 3 HTTP/SSE tests).
+- `cargo test --locked`: passes (domain/storage workflows, real-binary CLI tests including agent-skill installation in a plain directory, HTTP/SSE tests).
 - `cargo clippy --all-targets -- -D warnings`: passes.
 - `cargo fmt --check`: passes.
 - `nix flake check`: package build and tests, clippy, and formatting pass using the pinned nixpkgs Rust toolchain (1.95.0).
@@ -20,7 +20,7 @@ nix run . -- --project /tmp/hyp-example export --format html --output /tmp/hyp-e
 
 ## Meaningful limits
 
-- Manual editors and Git do not participate in the process-shared lock. Hyp detects stale revisions and ordinary overlapping saves, but cannot guarantee atomicity against arbitrary simultaneous external file writes.
+- Manual editors, sync tools and version control do not participate in the process-shared lock. Hyp detects stale revisions and ordinary overlapping saves, but cannot guarantee atomicity against arbitrary simultaneous external file writes.
 - Records are re-read into memory. There is no persistent database or distributed synchronization protocol.
-- Evidence assessment is a human decision; the tool validates references and required rationale, not the scientific correctness of a conclusion.
-- Existing experiment targets and runs are preserved. All manual edit history still requires Git commits.
+- An assessment is the judgment of whoever records it, agent or human; the tool validates references and required rationale, not the scientific correctness of a conclusion.
+- Existing experiment targets and runs are preserved. hyp keeps no history of manual edits; use any version control, e.g. Git, for that.

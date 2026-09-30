@@ -1,5 +1,5 @@
 {
-  description = "hyp: Git-native hypothesis tracking, CLI and live WebUI";
+  description = "hyp: hypothesis tracking for coding and research agents, with a CLI and live WebUI; plain files, Git-friendly";
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
   outputs = { self, nixpkgs }:
     let
@@ -25,7 +25,7 @@
               mkdir -p "$CARGO_HOME"
             '';
             meta = {
-              description = "Git-native hypothesis tracking for humans and agents";
+              description = "Hypothesis tracking for coding and research agents: plain files in any directory, Git-friendly";
               license = pkgs.lib.licenses.mit;
               mainProgram = "hyp";
               platforms = systems;

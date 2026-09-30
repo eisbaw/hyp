@@ -1,6 +1,8 @@
 # hyp
 
-**A place to change your mind.** A local, Git-native hypothesis notebook with a Rust CLI and a live WebUI. Capture claims, define what would falsify them, plan experiments, preserve observations, and record explicit assessments.
+**A place to change your mind.** A hypothesis notebook for coding and research agents. When an agent suspects a cause, hyp gives it a place to record the claim, state what would falsify it, plan experiments, cite what it observed and record an explicit judgment, instead of declaring victory early. Humans inspect and steer through a live WebUI.
+
+It keeps everything as Markdown files in a plain directory. Git is not needed, but the files are Git-friendly (see [Using hyp with Git](#using-hyp-with-git-optional)).
 
 No account, cloud service, database server, telemetry, CDN or JavaScript build step. One executable serves its embedded HTML/CSS/JavaScript assets. The application and all validation/storage logic are Rust.
 
@@ -34,6 +36,25 @@ cargo build --release --locked
 
 Point the executable at another project with `--project /path/to/project`. It also discovers the nearest ancestor containing `hyp/config.toml`.
 
+## Agent onboarding
+
+hyp ships a skill that teaches coding agents the method (record the hypothesis before acting on it, write the falsification criterion first, cite evidence, assess only with evidence and a rationale) and the commands, exit codes and conflict handling:
+
+```bash
+hyp init --agents claude,codex   # new project: also install the skill
+hyp agents install               # existing project (default: --agents claude,codex)
+hyp agents update                # refresh installed skills after upgrading hyp
+hyp agents remove                # delete what hyp installed
+hyp agents print                 # the skill on stdout, to read or paste elsewhere
+```
+
+| Agent       | Installed as                  | Read by                                                                   |
+| ----------- | ----------------------------- | ------------------------------------------------------------------------- |
+| Claude Code | `.claude/skills/hyp/SKILL.md` | Claude Code started in the project                                        |
+| Codex       | `.agents/skills/hyp/SKILL.md` | Codex started in the project root (or below it, inside a Git repository) |
+
+The skill is embedded in the executable. An installed file carries a marker line, `# hyp-managed: version=… sha256=…`, in its front matter. Installing again changes nothing when the file is current; `update` replaces a file from another hyp version. A skill file you edited, one hyp did not install, one installed by a newer hyp, or one whose directory path goes through a symlink (e.g. a `.claude` managed by a dotfile tool) is left alone and the command fails, writing nothing, unless you pass `--force`. `remove` deletes only files hyp installed, never one without the marker, plus the directories on their path that end up empty (hyp does not record which of them it created). Nothing else, such as `CLAUDE.md` or `AGENTS.md`, is touched.
+
 ## Typical investigation
 
 Commands print the IDs they create. Copy the full ID or use an unambiguous prefix. The `H-…`, `F-…` and `E-…` values below are placeholders for those returned IDs.
@@ -52,7 +73,7 @@ hyp evidence add H-… "Timeout at transfer 8,142" \
   --against --source logs/run-142.txt --locator "lines 81–96" \
   --reason "A failure with cache disabled contradicts the cache explanation."
 hyp run X-… "Run 142" --outcome observed --evidence E-…
-hyp --json show H-…          # review it; note .state.review_token
+hyp --json show H-…          # review .related, .runs, .evidence; note .state.review_token
 hyp assess H-… --reviewed <token> --status weakened --confidence 0.2 \
   --evidence E-… --reason "Check the timing confound before rejecting the hypothesis."
 hyp assess H-… --reviewed <token> --status falsified --criterion F-… \
@@ -81,9 +102,25 @@ hyp delete H-…               # only archived and unreferenced records
 
 `depends-on`, `competes-with`, and `supersedes` are CLI relation values. Serialized files use underscores. Dependencies and supersession cannot form cycles. Competing hypotheses may be linked in either direction; the relation does not imply mutual exclusivity.
 
-Use `-` for a text argument to read stdin. Flags accept literal multiline values. All ordinary commands support `--json`. Exit codes: `0` success, `1` domain/I/O failure, `2` invalid CLI arguments, `3` revision conflict. JSON errors go to stderr. `hyp apply` accepts a JSON array of create/update/archive/delete changes on stdin, with optional `--expected-revision` for a whole-project precondition.
+Use `-` for a text argument to read stdin. Flags accept literal multiline values. All ordinary commands support `--json`. `hyp apply` accepts a JSON array of create/update/archive/delete changes on stdin, with optional `--expected-revision` for a whole-project precondition.
 
-Every change states what it depends on, as read from a snapshot (`hyp --json show ID` gives a record's `entry.revision` and a hypothesis's `state`; `hyp export --format json` gives everything). A change that depended on something that changed is rejected; a change that did not is unaffected by other writers.
+### Machine contract
+
+Agents depend on these; they are kept stable.
+
+| CLI exit code | Meaning                                                                                                                                             |
+| ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `0`           | Success.                                                                                                                                            |
+| `1`           | Any other error: invalid input, an unknown or ambiguous ID, a missing or malformed precondition, project errors, I/O. Retrying unchanged will not help. |
+| `2`           | Invalid command-line arguments.                                                                                                                     |
+| `3`           | Conflict: something the write depended on changed since it was read. Nothing was written. Re-read, review, retry.                                  |
+| `141`         | Killed by SIGPIPE: stdout was closed early (`hyp list \| head`). A write command prints after writing, so its write may already be on disk.           |
+
+Errors go to stderr, with `--json` as `{"error": "…"}`. A conflict's message starts with `conflict:`. The WebUI's HTTP API answers `403` for a missing or invalid request token or an untrusted `Host`/`Origin`, `409` for a conflict, `422` for input the domain rules reject, and another `4xx` for other rejected input (malformed JSON, an oversized body, a wrong content type).
+
+### Preconditions
+
+Every change states what it depends on, as read from a snapshot (`hyp --json show ID` gives a record's `entry.revision`, a hypothesis's `state`, the records that refer to it (`related`), and for a hypothesis everything its review token covers: `runs` of its experiments and all linked or cited `evidence` in full, `basis` (the ID and revision of each record the fingerprint covers) and `state.assessment_ids`; `hyp export --format json` gives everything). A change that depended on something that changed is rejected; a change that did not is unaffected by other writers.
 
 - update, archive, delete: `expected_revision`, the record's revision.
 - create an assessment, experiment or run: an `expected` object next to `record`:
@@ -122,12 +159,12 @@ Predictions and criteria are separate Markdown records, which makes them individ
 Lifecycle is **draft / investigating / paused / closed**. Assessment is **untested / inconclusive / supported / weakened / falsified**. Closing an investigation never declares its hypothesis true.
 
 - Drafts may be incomplete. Investigating requires an active criterion or an explicit `untestable_reason`.
-- Falsification requires a rationale, evidence and a criterion belonging to that hypothesis. The human judges whether the observation actually satisfies it.
+- Falsification requires a rationale, evidence and a criterion belonging to that hypothesis. Whoever records the assessment, agent or human, judges whether the observation actually satisfies it. The agent skill asks agents to cite evidence and give a rationale for every judgment, not only for falsification.
 - Confidence is optional, subjective, and in `[0, 1]`. Evidence counts never calculate it.
 - An assessment fingerprints the hypothesis's relevant records, interpretations and cited observations. Changes show **needs review** without rewriting the judgment.
-- A new assessment supersedes the current assessment heads. Divergent heads after a Git merge require explicit reconciliation; neither silently wins by timestamp.
+- A new assessment supersedes the current assessment heads. Divergent heads after any merge or sync require explicit reconciliation; neither silently wins by timestamp.
 - Experiments freeze complete target content and revisions at creation. Runs freeze the complete experiment plan at execution-record creation. `hyp run` records an execution; it does not execute commands.
-- Historic assessments and runs cannot be edited or deleted through the tool. Git is still needed to retain _all_ manual file-edit history. There is no claim of tamper-proof auditing.
+- Historic assessments and runs cannot be edited or deleted through the tool. To keep a history of all file edits, use any version control, e.g. Git. There is no claim of tamper-proof auditing.
 
 ## WebUI
 
@@ -153,13 +190,25 @@ All authoritative content is under `hyp/`:
 - `config.toml` — project name and schema version.
 - `hypotheses/`, `predictions/`, `criteria/`, `evidence/`, `links/`, `experiments/`, `runs/`, `assessments/`, `gaps/` — one `<full-id>.md` per record.
 - `assets/` — optional SHA-256-addressed attachments (maximum 32 MiB per imported file).
-- `.hyp/` at the project root — ignored write lock and temporary recovery journal.
+- `.hyp/` at the project root — write lock and temporary recovery journal; not project data. It contains a `.gitignore` that ignores it.
 
-Markdown files have YAML front matter and an ordinary notes body. IDs are UUIDs with readable type prefixes. Renaming files independently of IDs is rejected. Unknown schema fields, broken references and invalid states are reported by `hyp check`. `hyp check --strict` also fails on warnings such as a missing falsification criterion.
+Markdown files have YAML front matter and an ordinary notes body. IDs are UUIDs with readable type prefixes. Renaming files independently of IDs is rejected. Unknown schema fields, broken references and invalid states are reported by `hyp check`. `hyp check --strict` also fails on warnings such as a hypothesis with neither a falsification criterion nor an untestable reason.
 
-A process-shared advisory lock serializes tool writes. Each change carries an optimistic precondition on what it depends on (see above), so stale writes are rejected without turning unrelated concurrent writes into conflicts. Atomic file replacements and an fsynced roll-forward journal recover interrupted multi-file operations. Reads through hyp recover pending transactions under the same lock. Manual editors and Git do not honour that lock: ordinary overlapping saves are detected where possible, but arbitrary simultaneous external writes cannot be made transactional. Avoid Git checkout/merge during a tool write. Run `hyp check` after merges.
+A process-shared advisory lock serializes tool writes. Each change carries an optimistic precondition on what it depends on (see above), so stale writes are rejected without turning unrelated concurrent writes into conflicts. Atomic file replacements and an fsynced roll-forward journal recover interrupted multi-file operations. Reads through hyp recover pending transactions under the same lock. Manual editors, sync tools and version control do not honour that lock: ordinary overlapping saves are detected where possible, but arbitrary simultaneous external writes cannot be made transactional. Avoid a checkout, merge or sync during a tool write. Run `hyp check` after one.
 
-Git operations are entirely yours. The app never commits, pushes, fetches or resolves Git conflicts. Commit the complete `hyp/` directory when you want a history checkpoint. Archive is recoverable; deletion is explicit and limited to unreferenced archived records. Unreferenced assets are retained rather than garbage-collected automatically.
+Archive is recoverable; deletion is explicit and limited to unreferenced archived records. Unreferenced assets are retained rather than garbage-collected automatically.
+
+## Using hyp with Git (optional)
+
+hyp never runs `git` and does not need a repository; a plain directory is the normal case. It is built to sit well in one:
+
+- One file per record, named by its ID, so concurrent work touches different files.
+- Deterministic serialization, and a write rewrites only the records it changes, so diffs show real changes.
+- IDs are UUIDs, so records created on different branches or machines do not collide.
+- No generated index or cache files under `hyp/`; everything there is authoritative.
+- `.hyp/` (lock and journal) ignores itself.
+
+Committing, pushing and resolving conflicts are yours. Commit the complete `hyp/` directory when you want a history checkpoint. After a merge, checkout or sync, run `hyp check`: it reports broken references and malformed files, and `hyp list --needs-review` shows hypotheses whose current assessment was based on records that have since changed. Two assessments of the same hypothesis made on different branches both remain current heads after the merge; record a new assessment to reconcile them.
 
 ## Exports
 
@@ -180,6 +229,7 @@ The Cargo workspace currently has one package, with clear library modules rather
 - `store` — Markdown persistence, locking, transactions and recovery.
 - `cli` — clap commands, JSON output and exports.
 - `web` — Axum API, embedded assets, local-request guards and SSE.
+- `agents` — installs the agent skill, whose text is `agents/hyp/SKILL.md` (embedded at build time).
 - `web/` — dependency-free browser interface. No npm runtime dependency.
 
 Development recipes live in the `Justfile` and run inside the flake dev shell, which provides `just`, the Rust toolchain, Node and `jsdom`:
@@ -189,7 +239,7 @@ nix develop -c just          # list recipes
 nix develop -c just e2e      # Rust tests plus the jsdom UI test
 ```
 
-The Rust tests cover semantic workflows, stale writes, concurrent writers, invalid transaction rollback, crash recovery, immutable histories, frozen experiment plans, source-change review tracking, symlinks, attachments, export escaping and HTTP guards.
+The Rust tests cover semantic workflows, stale writes, concurrent writers, invalid transaction rollback, crash recovery, immutable histories, frozen experiment plans, source-change review tracking, symlinks, attachments, export escaping, HTTP guards and agent-skill installation.
 
 `scripts/dom-test.cjs` drives the real UI forms, HTTP server and SSE in `jsdom`, without a rendering engine; it does not verify visual layout. It runs in `just e2e` and as the `e2e-dom` flake check. Its npm dependencies are pinned in `scripts/package-lock.json` and built by the flake; do not `npm install` them into the tree.
 
@@ -199,7 +249,7 @@ An optional browser suite is in `scripts/browser-test.cjs`. It is not yet wired 
 
 This is a local, single-worktree tool. It supports multiple CLI processes and browser tabs, not networked multi-user collaborative editing. It reads the notebook into memory and rescans files; it is intended for small and medium research/debugging notebooks, not millions of evidence records. Full snapshot refreshes favour correctness and simplicity over incremental-index complexity.
 
-No AI-generated judgments, automated experiment execution, Bayesian scoring, MCP server, remote hosting, user accounts or statistical-analysis engine are included.
+hyp itself makes no judgments: agents and humans record them. No automated experiment execution, Bayesian scoring, MCP server, remote hosting, user accounts or statistical-analysis engine are included.
 
 See [VALIDATION.md](VALIDATION.md) for the checks run on this release.
 
