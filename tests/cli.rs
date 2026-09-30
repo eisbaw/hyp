@@ -486,6 +486,92 @@ fn agents_print_writes_the_embedded_skill_without_a_project() {
     assert!(!dir.path().join("hyp").exists());
 }
 
+/// The ```bash blocks of a Markdown section (`## <heading>` up to the next
+/// `## ` heading), concatenated in order.
+fn bash_blocks(markdown: &str, heading: &str) -> String {
+    let section = markdown
+        .split("\n## ")
+        .find(|s| s.strip_prefix(heading).is_some_and(|r| r.starts_with('\n')))
+        .unwrap_or_else(|| panic!("no section ## {heading}"));
+    let (mut script, mut in_bash) = (String::new(), false);
+    for line in section.lines() {
+        match (in_bash, line.trim_end()) {
+            (false, "```bash") => in_bash = true,
+            (true, "```") => in_bash = false,
+            (true, _) => script.push_str(&format!("{line}\n")),
+            _ => {}
+        }
+    }
+    assert!(!in_bash, "unclosed ```bash block in ## {heading}");
+    assert!(!script.is_empty(), "no ```bash block in ## {heading}");
+    script
+}
+
+/// Drift guard for the skill agents load: its Example runs as written against
+/// this binary, in a fresh project, with `hyp` on PATH. There is no
+/// placeholder substitution: the Example's shell variables ($H1, $E1, $TOKEN, ...)
+/// capture the IDs and the review token that earlier commands print. Under
+/// `set -euo pipefail`, a renamed flag or value (exit 2), a changed output
+/// (an empty capture a later command rejects) or a rejected write fails it.
+#[test]
+fn skill_example_runs_as_written_and_ends_assessed_and_closed() {
+    let project = TempDir::new().unwrap();
+    ok(project.path(), &["init"]);
+    let bin = TempDir::new().unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_hyp"), bin.path().join("hyp")).unwrap();
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let path = std::env::join_paths(
+        std::iter::once(bin.path().to_path_buf()).chain(std::env::split_paths(&inherited)),
+    )
+    .unwrap();
+    let script = bash_blocks(SKILL_SOURCE, "Example");
+    let out = Command::new("bash")
+        .args(["-euo", "pipefail", "-c", &script])
+        .current_dir(project.path())
+        .env("PATH", path)
+        .stdin(Stdio::null())
+        .output()
+        .expect("bash is needed to run the skill's Example");
+    assert!(
+        out.status.success(),
+        "the skill's Example failed ({}):\n--- stderr\n{}\n--- stdout\n{}\n--- script\n{script}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout),
+    );
+    let list = |kind: &str| -> Vec<serde_json::Value> {
+        let text = ok(project.path(), &["--json", "list", "--kind", kind]);
+        serde_json::from_str(&text).unwrap()
+    };
+    // H1 closed and supported, its competitor H2 still a draft but weakened;
+    // each assessed once, neither needing review again.
+    let mut hypotheses: Vec<_> = list("hypothesis")
+        .iter()
+        .map(|r| {
+            assert_eq!(r["state"]["needs_review"], false, "{r}");
+            let assessments = r["state"]["assessment_ids"].as_array().unwrap().len();
+            (
+                r["record"]["lifecycle"].as_str().unwrap().to_string(),
+                r["state"]["judgment"].as_str().unwrap().to_string(),
+                assessments,
+            )
+        })
+        .collect();
+    hypotheses.sort();
+    assert_eq!(
+        hypotheses,
+        [
+            ("closed".into(), "supported".into(), 1),
+            ("draft".into(), "weakened".into(), 1)
+        ]
+    );
+    assert_eq!(ok(project.path(), &["list", "--needs-review"]), "");
+    let experiments = list("experiment");
+    assert_eq!(experiments.len(), 1);
+    assert_eq!(experiments[0]["record"]["status"], "completed");
+    ok(project.path(), &["check"]);
+}
+
 /// Installs in a plain directory (no Git); repeating install or update
 /// changes no byte and no modification time.
 #[test]

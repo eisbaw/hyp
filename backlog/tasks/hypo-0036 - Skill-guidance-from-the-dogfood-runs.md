@@ -1,10 +1,11 @@
 ---
 id: HYPO-0036
 title: Skill guidance from the dogfood runs
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - '@claude'
 created_date: '2026-09-30 02:26'
-updated_date: '2026-09-30 16:30'
+updated_date: '2026-09-30 16:54'
 labels:
   - agents
   - docs
@@ -22,10 +23,20 @@ Test-drive 2026-09-30: fresh Claude Code and Codex sessions, given only the inst
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 The skill says: short observation as the title (one line), details and raw output in --body or `hyp evidence attach`
-- [ ] #2 The skill tells agents to search existing hypotheses first and to reuse evidence with `hyp link`
+- [x] #1 The skill says: short observation as the title (one line), details and raw output in --body or `hyp evidence attach`
+- [x] #2 The skill tells agents to search existing hypotheses first and to reuse evidence with `hyp link`
 - [ ] #3 A second dogfood run shows short evidence titles
 <!-- AC:END -->
+
+## Implementation Plan
+
+<!-- SECTION:PLAN:BEGIN -->
+1. Rewrite agents/hyp/SKILL.md against the current CLI help, README contract and decision-0003 (target ~170 lines).
+2. Make the Example runnable as written (IDs captured in shell variables).
+3. Add a drift-guard test in tests/cli.rs that runs the Example against the built binary; prove it fails on a renamed flag.
+4. Update README Agent onboarding and Development notes.
+5. Gate: fmt-check, lint, e2e x2, nix flake check.
+<!-- SECTION:PLAN:END -->
 
 ## Implementation Notes
 
@@ -45,4 +56,15 @@ Carried from human CLI batch 2 (HYPO-0058, 0059, 0063, 0068), 2026-09-30:
 - `hyp edit` refuses assessments and runs before opening the editor; agents should not use `hyp edit` anyway (interactive).
 
 - (batch 2 review fix) `hyp edit` reopens the editor only on a terminal; without one the first error fails with exit 1, the error and a kept-copy path (also in --json {"error"}).
+
+- SKILL.md rewritten (172 lines): new Method step "look before adding" (hyp list/search, reuse evidence with hyp link); short one-line titles with details in --body / evidence attach and the stdin title rule; write output (one full ID per line, --json {"written":[{id,kind,revision}],revision}, .written[i].revision as expected_revision for hyp apply; stderr summaries only on a terminal); hyp list defaults and exit 2 for impossible filters; Assessing rewritten per decision-0003 (plain show token line, 12+ hex prefix, linked-only citations, evidence for all but untested, what the basis covers, exit 3: re-read and compare .basis); hyp check codes, repair note/commands, restore over delete, blocks_writes only for malformed/attachment/invalid; exit codes 0/1/2/3/141; apply points to hyp apply --help; hyp edit left to people at a terminal.
+- Removed stale content: whole-project-on-write, the old closure recipe, separate Finishing section.
+- Example is now a runnable script: IDs captured with H1=$(hyp add ...), evidence ID with `| sed -n 1p` (reads all output, no SIGPIPE), review token from the plain `review token:` line (no jq dependency in the Nix sandbox). Ends with assess supported, gap resolved, lifecycle closed, hyp list --needs-review.
+- New test tests/cli.rs skill_example_runs_as_written_and_ends_assessed_and_closed: extracts the ```bash blocks of ## Example, runs them with bash -euo pipefail in a fresh project with hyp on PATH, then asserts 2 hypotheses, none needs_review, exactly one closed and supported with one assessment, and hyp check passes. Red/green: renaming `hyp set --resolved` to `--is-resolved` made it fail (exit 2 "unexpected argument --resolved"); reverted, green. Runs in nix flake check too (bash and sed are in stdenv).
+- README: Agent onboarding summary updated; Development notes that the Example is a test and must stay runnable.
+- AC #3 (second dogfood run) left for the orchestrator.
+
+- Review fix: the Example no longer reads hyp show twice. It keeps the reviewed output (SHOW=$(hyp show "$H1"); printf it) and takes TOKEN from that same output, so the token covers exactly the state reviewed. Assessing now says to take the token from the output you actually reviewed, never from a second read.
+
+- Review round 2: Example also marks the experiment completed and assesses H2 weakened with its own show and token (citing the contradicting link of E1); Commands shows evidence add on H-|P-|F-; Method says to archive a duplicate or mistaken record (hyp archive, undone by hyp restore); README says the Example commands are tested, prose and Commands block reviewed by hand. Drift test now asserts H1 closed/supported and H2 draft/weakened (one assessment each), none needs review, `hyp list --needs-review` prints nothing, and the experiment is completed. Red check: renaming --experiment-status to --exp-status failed the test; reverted.
 <!-- SECTION:NOTES:END -->

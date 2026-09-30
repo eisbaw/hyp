@@ -38,7 +38,7 @@ Point the executable at another project with `--project /path/to/project`. It al
 
 ## Agent onboarding
 
-hyp ships a skill that teaches coding agents the method (record the hypothesis before acting on it, write the falsification criterion first, cite evidence, assess only with evidence and a rationale) and the commands, exit codes and conflict handling:
+hyp ships a skill that teaches coding agents the method (look for existing hypotheses first, record the hypothesis before acting on it, write the falsification criterion first, cite evidence, assess only with evidence and a rationale) and how to use the tool: short titles with details in the body, capturing the IDs writes print, reviewing and assessing, exit codes, conflicts and `hyp check` repairs. Its Example is a runnable script, and a test runs it against the built binary, so the commands the Example shows cannot fall behind the CLI unnoticed (the prose and the Commands block are reviewed by hand):
 
 ```bash
 hyp init --agents claude,codex   # new project: also install the skill
@@ -242,7 +242,7 @@ The Cargo workspace currently has one package, with clear library modules rather
 - `store` — Markdown persistence, locking, transactions and recovery.
 - `cli` — clap commands, JSON output and exports.
 - `web` — Axum API, embedded assets, local-request guards and SSE.
-- `agents` — installs the agent skill, whose text is `agents/hyp/SKILL.md` (embedded at build time).
+- `agents` — installs the agent skill, whose text is `agents/hyp/SKILL.md` (embedded at build time). The bash blocks of its `## Example` section run as a test (`skill_example_runs_as_written_and_ends_assessed_and_closed` in `tests/cli.rs`): keep them runnable, with IDs captured in shell variables rather than placeholders.
 - `web/` — dependency-free browser interface. No npm runtime dependency.
 
 Development recipes live in the `Justfile` and run inside the flake dev shell, which provides `just`, the Rust toolchain, Node and `jsdom`:
