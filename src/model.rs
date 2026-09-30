@@ -26,6 +26,36 @@ macro_rules! values {
 }
 values!(Lifecycle { Draft => "draft", Investigating => "investigating", Paused => "paused", Closed => "closed" });
 values!(Judgment { Untested => "untested", Inconclusive => "inconclusive", Supported => "supported", Weakened => "weakened", Falsified => "falsified" });
+impl Judgment {
+    /// What an assessment with this judgment needs besides its rationale
+    /// (decision-0003, enforced by `Snapshot::validate_new`).
+    pub fn requirement(self) -> &'static str {
+        match self {
+            Self::Untested => "no evidence needed",
+            Self::Inconclusive | Self::Supported | Self::Weakened => {
+                "at least one evidence ID linked to the hypothesis or its active criteria \
+                 or predictions"
+            }
+            Self::Falsified => "linked evidence and the falsification criterion it meets",
+        }
+    }
+    /// Every judgment's `requirement`, judgments with the same one together:
+    /// "untested: …; inconclusive, supported, weakened: …; falsified: …".
+    pub fn rule() -> String {
+        let mut groups: Vec<(Vec<&str>, &str)> = Vec::new();
+        for j in <Self as clap::ValueEnum>::value_variants() {
+            match groups.iter_mut().find(|(_, r)| *r == j.requirement()) {
+                Some((names, _)) => names.push(j.as_str()),
+                None => groups.push((vec![j.as_str()], j.requirement())),
+            }
+        }
+        groups
+            .iter()
+            .map(|(names, r)| format!("{}: {r}", names.join(", ")))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+}
 values!(Relation { Supports => "supports", Contradicts => "contradicts", Qualifies => "qualifies", DependsOn => "depends-on", CompetesWith => "competes-with", Supersedes => "supersedes" });
 values!(ExperimentStatus { Planned => "planned", Running => "running", Completed => "completed", Cancelled => "cancelled" });
 values!(Outcome { Observed => "observed", Inconclusive => "inconclusive", Failed => "failed" });
@@ -401,6 +431,99 @@ pub struct HypothesisState {
     /// (`hyp assess --reviewed`, `expected.hypotheses`).
     pub review_token: String,
 }
+/// What evidence means for a hypothesis. A link's relation is to the record
+/// it targets; through a criterion it reverses: evidence that supports a
+/// falsification criterion (the refuting observation was made) counts
+/// against the hypothesis. A single link is never `Mixed`; for an
+/// observation's links together see `Stance::combined`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Stance {
+    For,
+    Against,
+    Qualifies,
+    Mixed,
+}
+impl Stance {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::For => "for",
+            Self::Against => "against",
+            Self::Qualifies => "qualifies",
+            Self::Mixed => "mixed",
+        }
+    }
+    /// The stance of an observation with links of these stances: `Mixed`
+    /// when some count for and some against the hypothesis; otherwise the
+    /// direction any of them has (qualifying links do not change it);
+    /// `Qualifies` when all qualify.
+    pub fn combined(stances: impl IntoIterator<Item = Self>) -> Self {
+        let (mut for_h, mut against) = (false, false);
+        for s in stances {
+            match s {
+                Self::For => for_h = true,
+                Self::Against => against = true,
+                Self::Mixed => (for_h, against) = (true, true),
+                Self::Qualifies => {}
+            }
+        }
+        match (for_h, against) {
+            (true, true) => Self::Mixed,
+            (true, false) => Self::For,
+            (false, true) => Self::Against,
+            (false, false) => Self::Qualifies,
+        }
+    }
+    /// The stance of evidence linked by `relation` to a record of kind
+    /// `target` (the hypothesis, one of its criteria or predictions), and
+    /// what that link means in words, `id` being the target. None for a
+    /// relation between hypotheses.
+    pub fn of_link(target: Kind, id: &str, relation: Relation) -> Option<(Self, String)> {
+        let short = id.get(..10).unwrap_or(id);
+        let stance = match (target, relation) {
+            (_, Relation::Qualifies) => Self::Qualifies,
+            (Kind::Criterion, Relation::Supports) => Self::Against,
+            (Kind::Criterion, Relation::Contradicts) => Self::For,
+            (_, Relation::Supports) => Self::For,
+            (_, Relation::Contradicts) => Self::Against,
+            _ => return None,
+        };
+        let meaning = match (target, relation) {
+            (Kind::Criterion, Relation::Supports) => {
+                format!("meets criterion {short} (counts against H)")
+            }
+            (Kind::Criterion, Relation::Contradicts) => {
+                format!("does not meet criterion {short} (counts for H)")
+            }
+            (Kind::Criterion, _) => format!("qualifies criterion {short}"),
+            (Kind::Prediction, Relation::Supports) => format!("matches prediction {short}"),
+            (Kind::Prediction, Relation::Contradicts) => format!("contradicts prediction {short}"),
+            (Kind::Prediction, _) => format!("qualifies prediction {short}"),
+            (_, relation) => format!("{relation} H"),
+        };
+        Some((stance, meaning))
+    }
+}
+/// One evidence link to a hypothesis or its criterion or prediction, read
+/// for the hypothesis. `meaning` is for people ("meets criterion F-… (counts
+/// against H)") and may change; `stance`, `via` and `relation` are the data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Bearing {
+    pub link: String,
+    /// The H-, P- or F- record the link targets.
+    pub via: String,
+    pub relation: Relation,
+    pub stance: Stance,
+    pub meaning: String,
+}
+/// One observation linked to a hypothesis, with every link that makes it
+/// part of the hypothesis's basis; `stance` is `Stance::combined` of theirs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvidenceBearing {
+    pub evidence: String,
+    pub stance: Stance,
+    pub bearings: Vec<Bearing>,
+}
 /// The SHA-256 of a basis as compact JSON with sorted keys.
 pub fn fingerprint_of(basis: &BTreeMap<String, serde_json::Value>) -> String {
     hash(serde_json::to_string(basis).expect("JSON values serialize"))
@@ -420,6 +543,9 @@ pub struct Snapshot {
     pub objects: Vec<Entry>,
     pub diagnostics: Vec<Diagnostic>,
     pub hypotheses: BTreeMap<String, HypothesisState>,
+    /// Hypothesis ID -> `Snapshot::evidence_bearings`, for the WebUI.
+    #[serde(default)]
+    pub bearings: BTreeMap<String, Vec<EvidenceBearing>>,
     pub revision: String,
 }
 pub fn hash(bytes: impl AsRef<[u8]>) -> String {
@@ -544,6 +670,42 @@ impl Snapshot {
             })
             .collect()
     }
+    /// Each observation `linked_evidence` holds, once, in the order of its
+    /// first link, with what each of its `evidence_links` means for
+    /// hypothesis `id` (`Stance::of_link`).
+    pub fn evidence_bearings(&self, id: &str) -> Vec<EvidenceBearing> {
+        let mut out: Vec<EvidenceBearing> = Vec::new();
+        for l in self.evidence_links(id) {
+            let Data::Link { from, to, relation } = &l.record.data else {
+                continue;
+            };
+            let Some(target) = Kind::of_id(to) else {
+                continue;
+            };
+            let Some((stance, meaning)) = Stance::of_link(target, to, *relation) else {
+                continue;
+            };
+            let bearing = Bearing {
+                link: l.record.id.clone(),
+                via: to.clone(),
+                relation: *relation,
+                stance,
+                meaning,
+            };
+            match out.iter_mut().find(|e| e.evidence == *from) {
+                Some(e) => {
+                    e.stance = Stance::combined([e.stance, stance]);
+                    e.bearings.push(bearing);
+                }
+                None => out.push(EvidenceBearing {
+                    evidence: from.clone(),
+                    stance,
+                    bearings: vec![bearing],
+                }),
+            }
+        }
+        out
+    }
     /// What an assessment of hypothesis `id` is based on (decision-0003):
     /// record ID -> the fields of that record that count. Covered: the claim
     /// (title, body, scope, assumptions, archived), its criteria and
@@ -651,11 +813,14 @@ impl Snapshot {
     }
     pub fn derive(&mut self) {
         self.hypotheses.clear();
+        self.bearings.clear();
         for e in &self.objects {
             if !matches!(e.record.data, Data::Hypothesis { .. }) {
                 continue;
             }
             let id = &e.record.id;
+            let bearings = self.evidence_bearings(id);
+            self.bearings.insert(id.clone(), bearings);
             let fingerprint = self.fingerprint(id);
             let heads = self.assessment_heads(id);
             let (judgment, confidence, needs_review) = if heads.len() == 1 {
@@ -1013,16 +1178,23 @@ impl Snapshot {
             hypothesis,
             judgment,
             evidence,
+            criterion,
             ..
         } = &r.data
         else {
             return Ok(());
         };
         let article = article(judgment.as_str());
+        let rule = Judgment::rule();
         ensure!(
             *judgment == Judgment::Untested || !evidence.is_empty(),
-            "{article} {judgment} assessment must cite evidence: every judgment except \
-             untested needs at least one evidence ID linked to {hypothesis}"
+            "{article} {judgment} assessment must cite evidence linked to {hypothesis} \
+             (hyp assess --evidence E-…). The rule: {rule}"
+        );
+        ensure!(
+            *judgment != Judgment::Falsified || criterion.is_some(),
+            "a falsified assessment must name the falsification criterion of {hypothesis} \
+             that its evidence meets (hyp assess --criterion F-…). The rule: {rule}"
         );
         let linked = self.linked_evidence(hypothesis);
         for id in evidence {

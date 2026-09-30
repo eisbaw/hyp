@@ -13,9 +13,12 @@ is no `hyp/` directory in the project root, ask the user before `hyp init`.
 
 ## Method
 
-1. **Look before adding.** `hyp list` and `hyp search "text"` show what is
-   already recorded. Continue an existing hypothesis rather than adding a
-   duplicate, and reuse existing evidence with `hyp link`.
+1. **Start with `hyp status`.** It shows where the investigation stands:
+   per open hypothesis its judgment, whether it needs review, a missing
+   criterion, linked evidence, open gaps and experiments without runs, and
+   anything that blocks writes. `hyp search "text"` finds what is already
+   recorded. Continue an existing hypothesis rather than adding a duplicate,
+   and reuse existing evidence with `hyp link`.
 2. **Record the hypothesis before acting on it.** When you suspect a cause,
    `hyp add` it with a scope before you change code or config because of it.
    Record serious alternatives too and link them with `competes-with`.
@@ -40,9 +43,10 @@ P prediction, E evidence, L link, X experiment, R run, A assessment, G gap).
 Pass the full ID or an unambiguous prefix.
 
 ```bash
+hyp status                     # start here: where each hypothesis stands
 hyp list [--needs-review]      # hypotheses; --kind KIND or --all for others
 hyp search "text"              # any kind, any field
-hyp show H-...                 # summary for reading, with the review token
+hyp show H-...                 # summary for reading; line 1 has the review token
 hyp --json show H-...          # .entry .state .basis .related .evidence .runs
 hyp add "Title" --scope "where it applies" --tags a,b --body "Details"
 hyp falsify-if H-... "Observation that would falsify it"
@@ -62,6 +66,18 @@ hyp check                      # validate every file; see Files
 
 `hyp <command> --help` documents every flag and value. Unknown flags or
 values, and `hyp list` filters the listed kind cannot have, exit 2.
+
+**Evidence on a criterion or prediction counts.** Evidence linked to an
+active criterion or prediction is part of its hypothesis's basis and
+citable in its assessments, like evidence linked to the hypothesis; do not
+add a second link to the hypothesis "just in case". On a criterion the
+relation is to the criterion: `hyp evidence add F-...` (supports) records
+that the refuting observation was made, which counts against the
+hypothesis; `--against` records that it was not. `hyp show H-...` lists
+each observation once, grouped by what it means for the hypothesis
+(`against H`, `for H`, ...), with every link ("meets criterion F-...
+(counts against H)", "matches prediction P-...", "supports H"); with
+`--json`, `.evidence[].stance` and `.evidence[].bearings`.
 
 **Titles are one line and short**: the claim, or the observation in a few
 words ("200/200 passes with per-test temp dirs"). Put details, numbers, raw
@@ -85,20 +101,23 @@ change type with examples.
 ## Assessing
 
 ```bash
-hyp show H-...     # review claim, criteria, evidence, runs; note the token
-hyp assess H-... --reviewed TOKEN --status weakened --confidence 0.3 \
+hyp show H-...     # review claim, criteria, evidence, runs
+# line 1: H-...  hypothesis  review 46d8d8f5c79b   <- the token
+hyp assess H-... --reviewed 46d8d8f5c79b --status weakened --confidence 0.3 \
   --evidence E-...,E-... --reason "Why these observations lead here"
 ```
 
-- `--reviewed` takes the review token of the state you reviewed: the
-  `review token:` line of `hyp show H-...` (`.state.review_token` with
-  `--json`). Its first 12 or more hex digits suffice. Take the token from
-  the output you actually reviewed, never from a second read.
+- `--reviewed` takes the review token of the state you reviewed: the 12
+  hex digits after `review` on the first line of `hyp show H-...`
+  (`.state.review_token` with `--json`; its first 12 or more hex digits
+  suffice). Take the token from the output you actually reviewed, never
+  from a second read.
 - Cite only evidence linked to the hypothesis or its criteria or predictions.
   For other evidence, `hyp link E-... H-...` first, then review again.
 - Every judgment except `untested` needs `--evidence`; `falsified` also
-  needs `--criterion F-...`. `--reason` is always required; `--confidence`
-  is 0.0 to 1.0.
+  needs `--criterion F-...` (`hyp assess --help` lists each judgment's
+  requirements). `--reason` is always required; `--confidence` is 0.0 to
+  1.0.
 - The token covers the basis (`.basis` in `hyp --json show`: the claim,
   scope and assumptions, criteria, predictions, links and linked evidence
   with source and locator, runs, and archiving any of them) and the current
@@ -146,6 +165,7 @@ control. Only `malformed`, `attachment` and `invalid` block writes
 ## Example
 
 ```bash
+hyp status                               # where things stand
 hyp search "login"                       # anything recorded already?
 H1=$(hyp add "Flaky login test is caused by a shared temp dir" \
   --scope "tests/login.rs on CI" --tags ci,flaky)
@@ -166,11 +186,11 @@ hyp link "$E1" "$H2" --relation contradicts \
   --reason "Clock unchanged, yet the failures stopped"
 G1=$(hyp gap "$H1" "Which test leaves files behind?")
 SHOW=$(hyp show "$H1"); printf '%s\n' "$SHOW"   # review it all before judging
-TOKEN=$(printf '%s\n' "$SHOW" | sed -n 's/^review token: *//p')
+TOKEN=$(printf '%s\n' "$SHOW" | sed -n '1s/.*  review //p')   # from line 1
 hyp assess "$H1" --reviewed "$TOKEN" --status supported --confidence 0.7 \
   --evidence "$E1" --reason "Isolation removed all failures in 200 runs"
 SHOW=$(hyp show "$H2"); printf '%s\n' "$SHOW"   # each judgment its own review
-TOKEN=$(printf '%s\n' "$SHOW" | sed -n 's/^review token: *//p')
+TOKEN=$(printf '%s\n' "$SHOW" | sed -n '1s/.*  review //p')   # from line 1
 hyp assess "$H2" --reviewed "$TOKEN" --status weakened --confidence 0.3 \
   --evidence "$E1" --reason "Failures stopped with the clock unchanged"
 hyp set "$G1" --resolved true

@@ -62,6 +62,18 @@ const all = (kind) =>
   );
 const find = (id) => records().find((e) => e.record.id === id);
 const state = (id) => snapshot?.hypotheses[id];
+// What each observation linked to hypothesis `id` means for it, derived by
+// the server (`Snapshot::evidence_bearings`): evidence that supports a
+// criterion meets it and counts against the hypothesis.
+const bearings = (id) => snapshot?.bearings?.[id] || [];
+// A stance drawn with the colours of the relation it amounts to.
+const stanceClass = {
+  for: "supports",
+  against: "contradicts",
+  qualifies: "qualifies",
+  mixed: "review",
+};
+const stanceBadge = (stance) => badge(stance, stanceClass[stance]);
 const related = (id) =>
   all().filter(
     (e) =>
@@ -358,34 +370,37 @@ function detail(id) {
   const owned = all().filter((e) => e.record.hypothesis === id);
   const criteria = owned.filter((e) => e.record.kind === "criterion");
   const predictions = owned.filter((e) => e.record.kind === "prediction");
-  const targetIDs = [
-    id,
-    ...criteria.map((e) => e.record.id),
-    ...predictions.map((e) => e.record.id),
-  ];
-  const links = all("link").filter(
-    (e) =>
-      targetIDs.includes(e.record.to) &&
-      ["supports", "contradicts", "qualifies"].includes(e.record.relation),
-  );
-  const evidenceBlock = (rel) =>
-    links
-      .filter((e) => e.record.relation === rel)
-      .map((l) => {
-        const ev = find(l.record.from);
+  // Each observation once, with every link that brings it in and what that
+  // link means for this hypothesis.
+  const evidenceBlock = (stance) =>
+    bearings(id)
+      .filter((b) => b.stance === stance)
+      .map((b) => {
+        const ev = find(b.evidence);
         return ev
           ? item(
               ev,
-              `<p class="small">${esc(l.record.body)}</p>${badge(rel)} ${button("edit", "Edit interpretation", l.record.id, 'class="mini-button"')}`,
+              b.bearings
+                .map(
+                  (x) =>
+                    `<div class="bearing">${stanceBadge(x.stance)} <strong class="small">${esc(x.meaning)}</strong><p class="small">${esc(find(x.link)?.record.body)}</p>${button("edit", "Edit interpretation", x.link, 'class="mini-button"')}</div>`,
+                )
+                .join(""),
             )
           : "";
       })
       .join("");
+  const moreEvidence = (stance, title) => {
+    const block = evidenceBlock(stance);
+    return block
+      ? `<div data-stance="${stance}"><p class="evidence-heading">${title}</p>${block}</div>`
+      : "";
+  };
   const assessments = records()
     .filter((e) => e.record.kind === "assessment" && e.record.hypothesis === id)
     .sort((a, b) => b.record.created_at.localeCompare(a.record.created_at));
   const current = st?.assessment_ids?.map(find).filter(Boolean) || [];
-  const left = `<div>${r.scope ? `<div class="panel"><span class="eyebrow">SCOPE & CONTEXT</span><p>${esc(r.scope)}</p>${r.body ? `<div class="notes">${esc(r.body)}</div>` : ""}${r.assumptions ? `<p class="small">Assumptions: ${esc(r.assumptions)}</p>` : ""}</div>` : `<div class="panel notes">${esc(r.body || "Add scope, assumptions and notes to make this claim precise.")}</div>`}${section("What would falsify this?", criteria, "criterion", id)}${section("Predictions", predictions, "prediction", id)}<section class="section"><div class="section-head"><h2>Evidence & interpretation</h2>${button("create:evidence", "＋ Record evidence", id)}</div><div class="evidence-columns"><div><p class="evidence-heading">SUPPORTS</p>${evidenceBlock("supports") || '<p class="small">No supporting observations.</p>'}</div><div><p class="evidence-heading negative">CONTRADICTS</p>${evidenceBlock("contradicts") || '<p class="small">No contradicting observations.</p>'}</div></div>${evidenceBlock("qualifies")}</section>${section(
+  const left = `<div>${r.scope ? `<div class="panel"><span class="eyebrow">SCOPE & CONTEXT</span><p>${esc(r.scope)}</p>${r.body ? `<div class="notes">${esc(r.body)}</div>` : ""}${r.assumptions ? `<p class="small">Assumptions: ${esc(r.assumptions)}</p>` : ""}</div>` : `<div class="panel notes">${esc(r.body || "Add scope, assumptions and notes to make this claim precise.")}</div>`}${section("What would falsify this?", criteria, "criterion", id)}${section("Predictions", predictions, "prediction", id)}<section class="section"><div class="section-head"><h2>Evidence & interpretation</h2>${button("create:evidence", "＋ Record evidence", id)}</div><p class="small">Evidence on a criterion or prediction is part of this hypothesis's basis. Evidence that meets a falsification criterion counts against it.</p><div class="evidence-columns"><div data-stance="for"><p class="evidence-heading">FOR THIS HYPOTHESIS</p>${evidenceBlock("for") || '<p class="small">No observations for it.</p>'}</div><div data-stance="against"><p class="evidence-heading negative">AGAINST THIS HYPOTHESIS</p>${evidenceBlock("against") || '<p class="small">No observations against it.</p>'}</div></div>${moreEvidence("qualifies", "QUALIFIES THIS HYPOTHESIS")}${moreEvidence("mixed", "MIXED: ITS LINKS DISAGREE")}</section>${section(
     "Experiments",
     owned.filter((e) => e.record.kind === "experiment"),
     "experiment",
@@ -430,7 +445,7 @@ function matrix() {
     heading(
       "COMPARE EXPLANATIONS",
       "Evidence matrix",
-      "One observation can support one explanation and challenge another. Blank cells mean no interpretation has been recorded.",
+      "One observation can count for one explanation and against another. Evidence that meets a falsification criterion counts against its hypothesis. Blank cells mean no interpretation has been recorded.",
       "04",
     ) +
     (!hs.length || !es.length
@@ -443,22 +458,17 @@ function matrix() {
             (e) =>
               `<tr><td><span class="table-title">${link(e.record)}</span><span class="small">${esc(e.record.source)}</span></td>${hs
                 .map((h) => {
-                  const targets = [
-                    h.record.id,
-                    ...all()
-                      .filter(
-                        (x) =>
-                          x.record.hypothesis === h.record.id &&
-                          ["criterion", "prediction"].includes(x.record.kind),
-                      )
-                      .map((x) => x.record.id),
-                  ];
-                  const ls = all("link").filter(
-                    (l) =>
-                      l.record.from === e.record.id &&
-                      targets.includes(l.record.to),
+                  const b = bearings(h.record.id).find(
+                    (x) => x.evidence === e.record.id,
                   );
-                  return `<td>${ls.map((l) => `<a title="${esc(l.record.body)}" href="#record/${esc(l.record.id)}">${badge(relationName(l.record.relation), l.record.relation)}</a>`).join("") || '<span class="small">—</span>'}</td>`;
+                  return `<td>${
+                    b?.bearings
+                      .map(
+                        (x) =>
+                          `<a data-stance="${esc(x.stance)}" title="${esc(find(x.link)?.record.body)}" href="#record/${esc(x.link)}">${stanceBadge(x.stance)}</a> <span class="small">${esc(x.meaning)}</span>`,
+                      )
+                      .join("<br>") || '<span class="small">—</span>'
+                  }</td>`;
                 })
                 .join("")}</tr>`,
           )

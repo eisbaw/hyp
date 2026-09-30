@@ -182,10 +182,16 @@ pub enum Command {
         body: String,
     },
     /// Link evidence to a claim, or relate two hypotheses.
+    ///
+    /// Evidence linked to an active criterion or prediction counts toward its
+    /// hypothesis like evidence linked to the hypothesis itself: it is part of
+    /// the hypothesis's basis and an assessment of it may cite it.
     Link {
         /// The E- evidence, or the H- hypothesis the relation starts at.
         from: String,
         /// The H-, P- or F- record it bears on, or the other H- hypothesis.
+        /// Evidence that supports a criterion F-… meets it, which counts
+        /// against the hypothesis.
         to: String,
         /// supports, contradicts, qualifies: evidence to a claim;
         /// depends-on, competes-with, supersedes: between hypotheses.
@@ -199,16 +205,19 @@ pub enum Command {
     Assess {
         #[arg(help = HYPOTHESIS)]
         hypothesis: String,
-        /// The review token of the hypothesis state you reviewed: the "review
-        /// token:" line of `hyp show H-…` (.state.review_token with --json);
-        /// its first 12 or more hex digits suffice. If the basis (claim,
-        /// criteria, predictions, links, linked evidence, runs) or the current
-        /// assessments changed since, nothing is written and the command
-        /// exits 3: review the change and assess again.
+        /// The review token of the hypothesis state you reviewed: the 12 hex
+        /// digits after "review" on the first line of `hyp show H-…`
+        /// (.state.review_token with --json, whole or its first 12 or more
+        /// hex digits). If the basis (claim, criteria, predictions, links,
+        /// linked evidence, runs) or the current assessments changed since,
+        /// nothing is written and the command exits 3: review the change and
+        /// assess again.
         #[arg(long, value_name = "TOKEN")]
         reviewed: String,
-        /// The judgment.
-        #[arg(long, value_enum)]
+        /// The judgment; each needs --reason and what its value below says
+        /// (--evidence, --criterion).
+        #[arg(long, value_parser = PossibleValuesParser::new(judgment_values())
+            .map(|s| Judgment::from_str(&s, false).expect("a value from judgment_values")))]
         status: Judgment,
         /// Subjective confidence in the judgment, from 0.0 to 1.0 (not a
         /// percentage).
@@ -253,6 +262,15 @@ pub enum Command {
         #[arg(long)]
         resolved: Option<bool>,
     },
+    /// Where the investigation stands: start here when resuming work.
+    ///
+    /// Per open hypothesis (not archived, not closed), and per closed one
+    /// that needs review: its judgment, whether it needs review, a missing
+    /// criterion or its untestable reason, how much evidence is linked, open
+    /// gaps and experiments without runs. First, what blocks writes. No review
+    /// token: take that from `hyp show H-…`, the output you review before
+    /// assessing.
+    Status,
     /// Show a record; --json gives the complete form.
     ///
     /// Plain output is a summary for people (for a hypothesis with its review
@@ -394,6 +412,13 @@ pub enum Status {
 fn possible<T: ValueEnum + 'static>() -> impl Iterator<Item = PossibleValue> {
     T::value_variants().iter().filter_map(T::to_possible_value)
 }
+/// The judgments, each with its `Judgment::requirement` as help.
+fn judgment_values() -> Vec<PossibleValue> {
+    Judgment::value_variants()
+        .iter()
+        .filter_map(|j| j.to_possible_value().map(|v| v.help(j.requirement())))
+        .collect()
+}
 fn status_values() -> Vec<PossibleValue> {
     possible::<Judgment>()
         .chain(possible::<Lifecycle>())
@@ -483,8 +508,17 @@ pub struct AgentsArgs {
 #[derive(Subcommand)]
 pub enum EvidenceCommand {
     /// Record evidence and link it to the claim it bears on.
+    ///
+    /// Evidence linked to an active criterion or prediction counts toward its
+    /// hypothesis like evidence linked to the hypothesis itself: it is part of
+    /// the hypothesis's basis and an assessment of it may cite it. No second
+    /// link to the hypothesis is needed. `hyp show H-…` lists what each link
+    /// means for the hypothesis.
     Add {
-        /// The H-, P- or F- record it bears on: an ID or unique prefix.
+        /// The H-, P- or F- record it bears on: an ID or unique prefix. On a
+        /// criterion F-…, supporting it (the default) means the observation
+        /// meets the criterion, which counts against the hypothesis; --against
+        /// means it does not meet it.
         hypothesis: String,
         /// The observation. One line; '-' reads stdin: its first line is
         /// the title, the rest is appended to the body.
@@ -824,10 +858,17 @@ pub async fn run(cli: Cli) -> Result<()> {
         } else {
             println!("Initialized {}", store.root.display());
             print_steps(&steps, false)?;
-            println!(
-                "Next: hyp add \"<claim>\", then hyp falsify-if H-… \"<what would refute it>\"; \
-                 hyp agents install teaches coding agents to use hyp"
-            );
+            if *demo {
+                println!(
+                    "Next: hyp status shows where the example investigation stands, \
+                     hyp show H-… one hypothesis, hyp web all of it"
+                );
+            } else {
+                println!(
+                    "Next: hyp add \"<claim>\", then hyp falsify-if H-… \"<what would refute it>\"; \
+                     hyp agents install teaches coding agents to use hyp"
+                );
+            }
         }
         return Ok(());
     }
@@ -1044,8 +1085,9 @@ pub async fn run(cli: Cli) -> Result<()> {
             ensure!(
                 (12..=64).contains(&reviewed.len())
                     && reviewed.bytes().all(|b| b.is_ascii_hexdigit()),
-                "--reviewed must be the review token that `hyp show {h}` prints (its \
-                 \"review token:\" line), or its first 12 or more hex digits"
+                "--reviewed must be the review token that `hyp show {h}` prints after \
+                 \"review\" on its first line, or the first 12 or more hex digits of \
+                 .state.review_token of `hyp --json show {h}`"
             );
             confidence_in_range(confidence)?;
             let state = s
@@ -1145,6 +1187,15 @@ pub async fn run(cli: Cli) -> Result<()> {
                 expected_revision: e.revision.clone(),
             });
         }
+        Command::Status => {
+            let report = crate::status::report(&s);
+            if cli.json {
+                print_json(&report)?;
+            } else {
+                println!("{}", crate::status::plain(&report));
+            }
+            return Ok(());
+        }
         Command::Show { id } => {
             let e = s.find(&id)?;
             if cli.json {
@@ -1155,7 +1206,10 @@ pub async fn run(cli: Cli) -> Result<()> {
                     .collect();
                 // For a hypothesis, what its fingerprint hashes (`basis`), plus
                 // in full the runs and evidence in it, which `related` does not
-                // reach (a link or run names only IDs).
+                // reach (a link or run names only IDs). Each evidence entry
+                // also says what it means for the hypothesis: its `stance`
+                // and the `bearings` of its links (`Snapshot::evidence_bearings`);
+                // evidence only a run cites has none (null, []).
                 let (basis, runs, evidence) = match e.record.data {
                     Data::Hypothesis { .. } => {
                         let basis = s.basis(&e.record.id);
@@ -1167,7 +1221,20 @@ pub async fn run(cli: Cli) -> Result<()> {
                                 })
                                 .collect()
                         };
-                        let (runs, evidence) = (of_kind("run"), of_kind("evidence"));
+                        let bearings = s.evidence_bearings(&e.record.id);
+                        let evidence: Vec<serde_json::Value> = of_kind("evidence")
+                            .into_iter()
+                            .map(|x| {
+                                let b = bearings.iter().find(|b| b.evidence == x.record.id);
+                                let mut entry = serde_json::json!(x);
+                                entry["stance"] = serde_json::json!(b.map(|b| b.stance));
+                                entry["bearings"] = serde_json::json!(
+                                    b.map(|b| b.bearings.as_slice()).unwrap_or_default()
+                                );
+                                entry
+                            })
+                            .collect();
+                        let runs = of_kind("run");
                         (Some(basis), Some(runs), Some(evidence))
                     }
                     _ => (None, None, None),

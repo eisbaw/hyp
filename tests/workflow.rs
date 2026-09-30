@@ -450,7 +450,10 @@ fn falsification_requires_evidence_and_criterion() {
         *criterion = None;
     }
     let err = rejected(&store, Change::create_seen(a, &store.snapshot().unwrap()));
-    assert!(err.contains("criterion and evidence"), "{err}");
+    assert!(
+        err.contains("a falsified assessment must name the falsification criterion"),
+        "{err}"
+    );
 }
 #[test]
 fn dependency_cycles_rejected_but_competing_hypotheses_allowed() {

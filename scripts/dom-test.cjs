@@ -406,6 +406,41 @@ async function main() {
   );
   assert.equal(run.record.plan.revision, x.revision);
   assert.deepEqual(run.record.evidence, [ev.record.id]);
+  // HYPO-0071: evidence that supports a falsification criterion meets it, so
+  // it counts against the hypothesis, in the detail and in the matrix.
+  cli(
+    "evidence",
+    "add",
+    f.record.id,
+    "Output zero on replication",
+    "--source",
+    "capture/run-3.txt",
+  );
+  w.location.hash = "record/" + h.record.id;
+  const column = (stance) =>
+    w.document.querySelector(`[data-stance="${stance}"]`)?.textContent || "";
+  await wait(
+    () => column("against").includes("Output zero on replication"),
+    "criterion-meeting evidence shown against the hypothesis",
+  );
+  assert.ok(
+    column("against").includes(
+      `meets criterion ${f.record.id.slice(0, 10)} (counts against H)`,
+    ),
+    column("against"),
+  );
+  assert.ok(!column("for").includes("Output zero on replication"));
+  w.location.hash = "matrix";
+  await wait(() => h1(w) === "Evidence matrix", "matrix");
+  const row = [...w.document.querySelectorAll("tbody tr")].find((tr) =>
+    tr.textContent.includes("Output zero on replication"),
+  );
+  assert.ok(row, "matrix row");
+  const stances = [...row.querySelectorAll("a[data-stance]")].map(
+    (a) => a.dataset.stance,
+  );
+  assert.deepEqual(stances, ["against"], row.textContent);
+  assert.ok(row.textContent.includes("meets criterion"), row.textContent);
   for (const [view, title] of [
     ["matrix", "Evidence matrix"],
     ["graph", "Relationships"],
@@ -506,7 +541,7 @@ async function main() {
   );
   assert.deepEqual(errors, []);
   console.log(
-    "PASS: DOM forms, real HTTP writes, CLI↔UI SSE updates, editor changes, two tabs, dirty-form preservation, conflicts by status, saves despite unrelated writes, stale assessment rejected, evidence required and linked-only, criteria, evidence interpretations, falsification assessment, experiment and run, all views, malformed-file recovery, saves and CLI repair despite a dangling link, unavailable-project cause and offline export.",
+    "PASS: DOM forms, real HTTP writes, CLI↔UI SSE updates, editor changes, two tabs, dirty-form preservation, conflicts by status, saves despite unrelated writes, stale assessment rejected, evidence required and linked-only, criteria, evidence interpretations, criterion-meeting evidence counted against, falsification assessment, experiment and run, all views, malformed-file recovery, saves and CLI repair despite a dangling link, unavailable-project cause and offline export.",
   );
 }
 main()

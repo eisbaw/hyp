@@ -78,13 +78,14 @@ hyp assess H-… --reviewed <token> --status weakened --confidence 0.2 \
   --evidence E-… --reason "Check the timing confound before rejecting the hypothesis."
 hyp assess H-… --reviewed <token> --status falsified --criterion F-… \
   --evidence E-… --reason "Controlled replication satisfies the rejection criterion."
-hyp show H-…                 # a summary with its review token; --json for everything
+hyp show H-…                 # a summary; line 1 ends with its review token; --json for everything
+hyp status                   # where each open hypothesis stands; start here when resuming
 hyp list --needs-review      # hypotheses by default; --kind KIND or --all for others
 hyp search "cache"
 hyp check
 ```
 
-Use `hyp evidence add --qualifies` for an observation that limits the claim. Without either `--against` or `--qualifies`, it creates a supporting interpretation. Evidence can be reused:
+Use `hyp evidence add --qualifies` for an observation that limits the claim. Without either `--against` or `--qualifies`, it creates a supporting interpretation. Evidence linked to an active criterion or prediction counts toward its hypothesis like evidence linked to the hypothesis itself: it is in the hypothesis's basis and its assessments may cite it. A link's relation is to its target, so evidence that *supports* a falsification criterion meets it and counts *against* the hypothesis; `--against` on a criterion records that it was not met. `hyp show H-…`, `hyp --json show H-…` (`.evidence[].stance`: `for`, `against`, `qualifies` or `mixed`, and `.evidence[].bearings`, one per link with `via`, `relation`, `stance` and a `meaning` for people) and the WebUI present each observation once, by what it means for the hypothesis: "meets criterion F-… (counts against H)", "does not meet criterion F-… (counts for H)", "matches prediction P-…", "supports H". An observation is `mixed` only when some of its links count for the hypothesis and some against; qualifying links do not change the direction of the others, and it is `qualifies` only when all its links qualify. Evidence can be reused:
 
 ```bash
 hyp link E-… H-… --relation supports --reason "Why this observation matters"
@@ -105,6 +106,8 @@ hyp delete H-…               # only archived and unreferenced records
 Use `-` for a text argument to read stdin. Flags accept literal multiline values. A title is one line: with `-`, the first line of stdin is the title and the rest is appended to the body (after a blank line if the body is not empty); a given title with a newline is an error, and `hyp check` reports a stored one. All ordinary commands support `--json`. `hyp apply` accepts a JSON array of create/update/archive/delete changes on stdin, with optional `--expected-revision` for a whole-project precondition; `hyp apply --help` shows each change with examples. Only one argument of a command can be `-` (stdin is read once); more is an error (exit `1`).
 
 For people at a terminal: when stderr is a terminal, a write command also prints a one-line summary there (`created evidence E-… (+ link L-…: E-… supports H-…)`), and a `-` argument read from a terminal prints how to end the input (Ctrl-D). A write that changes nothing (`hyp set H-…` without flags, restoring a record that is not archived, saving `hyp edit` unchanged) prints `no changes` to stderr, whether or not it is a terminal (not with `--json`), and exits `0`. When `hyp edit` rejects the edited record and stdin and stderr are terminals, the editor reopens with the error as `# hyp:` comment lines under the opening `---`; line numbers in it count lines of that file. Saving it unchanged, or emptying it, aborts (exit `1`) with the last error and names a copy of the text. Without a terminal (a scripted editor) the first error fails the command the same way, without reopening.
+
+`hyp status` answers where the investigation stands in one read: a project line (how many open hypotheses, how many need review, whether writes are blocked and by which files, other `hyp check` findings; with none open, that `hyp list` shows the conclusions), then two lines per open hypothesis (not archived, not closed) and per closed one that needs review, those needing review first: its judgment and lifecycle, its criteria (or `no criterion`, or its untestable reason), how much evidence is linked, open gaps and experiments without runs. `hyp --json status` gives the same as `{"hypotheses": [...], "not_shown": {"closed", "archived", "needs_review"}, "writes_blocked", "blocking": [diagnostics], "errors", "warnings", "revision"}`. It prints no review token: take that from the `hyp show` output you reviewed.
 
 `hyp list` lists hypotheses, each with its judgment, lifecycle and a `needs-review` marker; `--kind KIND` lists another kind and `--all` every kind. A `--status` or `--needs-review` the listed kind cannot have (`--status planned` without `--kind experiment`) is an argument error (exit `2`), not an empty list.
 
@@ -144,7 +147,7 @@ A statement that no longer holds (the record changed or was deleted) is a confli
 
 An assessment may cite only evidence with an active link to its hypothesis, or to one of its active criteria or predictions (`hyp link E-… H-… --relation supports --reason "…"`). Citing other evidence, or a judgment other than `untested` without evidence, is an ordinary error. In an `apply` batch, the assessment's basis may grow only by records the batch creates: to bring in evidence that already existed, link it in an earlier write, re-read, then assess.
 
-The CLI commands state preconditions from their own read, so they protect only the moment between that read and the write. `hyp assess` is the exception: it requires `--reviewed` with the review token of the state you reviewed: the `review token:` line of `hyp show H-…`, or `.state.review_token` of `hyp --json show H-…` or `hyp --json list`. Its first 12 or more hex digits suffice. If the hypothesis's basis or its current assessments changed since, it writes nothing and exits `3`; `hyp show H-…` then lists the basis to compare with what you reviewed. A malformed token, or a `--confidence` outside 0.0 to 1.0, exits `1`. `hyp apply` takes only the full token. To protect a longer window for other records, use `hyp apply`. The WebUI states everything as of the moment a form was opened.
+The CLI commands state preconditions from their own read, so they protect only the moment between that read and the write. `hyp assess` is the exception: it requires `--reviewed` with the review token of the state you reviewed: the 12 hex digits after `review` on the first line of `hyp show H-…`, or `.state.review_token` of `hyp --json show H-…` or `hyp --json list` (its first 12 or more hex digits suffice). If the hypothesis's basis or its current assessments changed since, it writes nothing and exits `3`; `hyp show H-…` then lists the basis to compare with what you reviewed. A malformed token, or a `--confidence` outside 0.0 to 1.0, exits `1`. `hyp apply` takes only the full token. To protect a longer window for other records, use `hyp apply`. The WebUI states everything as of the moment a form was opened.
 
 ## The model
 
@@ -165,7 +168,7 @@ Predictions and criteria are separate Markdown records, which makes them individ
 Lifecycle is **draft / investigating / paused / closed**. Assessment is **untested / inconclusive / supported / weakened / falsified**. Closing an investigation never declares its hypothesis true.
 
 - Drafts may be incomplete. Investigating requires an active criterion or an explicit `untestable_reason`.
-- Every assessment needs a rationale. Every judgment except untested must cite evidence linked to the hypothesis, and falsification also a criterion belonging to it. Whoever records the assessment, agent or human, judges whether the observation actually satisfies it.
+- Every assessment needs a rationale. Every judgment except untested must cite evidence linked to the hypothesis (or its active criteria or predictions), and falsification also a criterion belonging to it; `hyp assess --help` lists each judgment's requirements. Whoever records the assessment, agent or human, judges whether the observation actually satisfies it.
 - Confidence is optional, subjective, and in `[0, 1]`. Evidence counts never calculate it.
 - An assessment records the hypothesis's fingerprint: the SHA-256 of its `basis` (`hyp --json show`) as compact JSON with sorted keys. The basis holds content only: the claim (title, body, scope, assumptions, archived); its criteria and predictions (title, body, conditions, archived); links touching the hypothesis or those (ends, relation, reason, archived), so another hypothesis counts only through its link; the evidence with an active link to the hypothesis or an active criterion or prediction; and runs of its experiments (title, body, outcome, cited evidence) with the evidence they cite. Evidence counts with its provenance (title, body, source, locator, attachment hashes, archived). A change to it shows **needs review** without rewriting the judgment. Lifecycle, tags, the untestable reason, experiments, gaps and timestamps are not part of it, so closing a hypothesis does not flag it; archiving it does.
 - A new assessment supersedes the current assessment heads. Divergent heads after any merge or sync require explicit reconciliation; neither silently wins by timestamp.
@@ -177,10 +180,10 @@ Lifecycle is **draft / investigating / paused / closed**. Assessment is **untest
 Run `hyp web [--port 7432]`. The server binds to IPv4 loopback only. Browse manually to the printed URL; it does not automatically launch a browser.
 
 - Hypothesis overview: search, assessment/tag filters, needs-review and archived records.
-- Hypothesis detail: falsification criteria, predictions, positive/negative/qualifying evidence, experiments, gaps and assessment history.
+- Hypothesis detail: falsification criteria, predictions, evidence by what it means for the hypothesis (for, against, qualifying; evidence that meets a falsification criterion counts against), each observation once with all its links, experiments, gaps and assessment history.
 - Experiment queue and immutable runs.
 - Reusable evidence and interpretations.
-- Evidence matrix to compare alternative hypotheses.
+- Evidence matrix to compare alternative hypotheses, each cell by what the observation means for that hypothesis.
 - Focused relationship graph with navigable nodes.
 - Create/edit/archive/restore/delete forms, plus advanced JSON editing for mutable records.
 - Incoming changes preserve dirty forms; conflicting saves are rejected and the draft remains available to copy/reconcile.
@@ -241,6 +244,7 @@ The Cargo workspace currently has one package, with clear library modules rather
 - `model` — types, constraints, relationships and derived assessment state.
 - `store` — Markdown persistence, locking, transactions and recovery.
 - `cli` — clap commands, JSON output and exports.
+- `show`, `status` — the plain text of `hyp show`, and `hyp status` (its report and text).
 - `web` — Axum API, embedded assets, local-request guards and SSE.
 - `agents` — installs the agent skill, whose text is `agents/hyp/SKILL.md` (embedded at build time). The bash blocks of its `## Example` section run as a test (`skill_example_runs_as_written_and_ends_assessed_and_closed` in `tests/cli.rs`): keep them runnable, with IDs captured in shell variables rather than placeholders.
 - `web/` — dependency-free browser interface. No npm runtime dependency.

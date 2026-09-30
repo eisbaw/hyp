@@ -1366,7 +1366,10 @@ fn plain_show_summarises_a_hypothesis_for_people() {
     let h = cache["record"]["id"].as_str().unwrap();
     let text = ok(p, &["show", h]);
     let token = cache["state"]["review_token"].as_str().unwrap();
-    assert!(text.contains(&format!("review token: {token}")), "{text}");
+    assert!(
+        text.starts_with(&format!("{h}  hypothesis  review {}\n", &token[..12])),
+        "{text}"
+    );
     for part in [
         "judgment: weakened · confidence 0.2",
         "Timeout reproduced at transfer 8,142",
@@ -2057,8 +2060,8 @@ fn assess_accepts_a_review_token_prefix_of_12_or_more_hex_digits() {
             serde_json::from_str(&ok(p, &["--json", "show", &h])).unwrap();
         shown["state"]["review_token"].as_str().unwrap().to_string()
     };
-    // Plain show prints the full token for people to copy.
-    assert!(ok(p, &["show", &h]).contains(&format!("review token: {}", token())));
+    // Plain show prints the first 12 hex digits for people to copy.
+    assert!(ok(p, &["show", &h]).contains(&format!("review {}", &token()[..12])));
     let assess = |reviewed: &str| {
         run(
             p,
@@ -2145,7 +2148,10 @@ fn a_percent_looking_confidence_gets_a_hint() {
     assert!(stderr_of(&out).contains("a number from 0.0 to 1.0"));
     let help = ok(p, &["assess", "--help"]);
     assert!(help.contains("from 0.0 to 1.0"), "{help}");
-    assert!(help.contains("review token:"), "{help}");
+    assert!(
+        help.contains("after \"review\" on the first line"),
+        "{help}"
+    );
 }
 
 #[test]
@@ -2556,4 +2562,558 @@ fn edit_with_a_copying_editor_stops_instead_of_reopening_forever() {
         message.contains("cannot change the kind of a record") && message.contains("kept in"),
         "{message}"
     );
+}
+
+/// The ID of the hypothesis whose title contains `needle`.
+fn hypothesis_titled(p: &Path, needle: &str) -> String {
+    let rows: serde_json::Value = serde_json::from_str(&ok(p, &["--json", "list"])).unwrap();
+    rows.as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["record"]["title"].as_str().unwrap().contains(needle))
+        .unwrap_or_else(|| panic!("no hypothesis titled *{needle}*"))["record"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+/// The first line a write printed: the ID of the record it created.
+fn first_line(out: String) -> String {
+    out.lines().next().unwrap().to_string()
+}
+/// The groups of plain show's Evidence section, by heading (`against H`,
+/// `for H`, ...), each with the lines under it.
+fn evidence_groups(text: &str) -> std::collections::BTreeMap<String, String> {
+    let section = text
+        .split("\n\n")
+        .find(|s| s.starts_with("Evidence"))
+        .unwrap_or_else(|| panic!("no Evidence section in\n{text}"));
+    let mut groups = std::collections::BTreeMap::new();
+    let mut current = String::new();
+    for line in section.lines().skip(1) {
+        if line.starts_with("  ") && !line.starts_with("   ") {
+            current = line.trim().to_string();
+            groups.insert(current.clone(), String::new());
+        } else {
+            let group: &mut String = groups.get_mut(&current).expect("a group heading first");
+            group.push_str(line);
+            group.push('\n');
+        }
+    }
+    groups
+}
+fn shown_evidence(p: &Path, h: &str, e: &str) -> serde_json::Value {
+    let shown: serde_json::Value = serde_json::from_str(&ok(p, &["--json", "show", h])).unwrap();
+    let matching: Vec<_> = shown["evidence"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|x| x["record"]["id"] == e)
+        .cloned()
+        .collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "{e} once in .evidence: {}",
+        shown["evidence"]
+    );
+    matching[0].clone()
+}
+
+/// HYPO-0071: evidence linked to a criterion with `supports` means the
+/// falsifying observation was made, so it counts against the hypothesis.
+/// Plain show, and `.evidence[].stance` and `.bearings` of --json show, say
+/// what each link means for the hypothesis (HYPO-0073: the path is visible).
+#[test]
+fn show_presents_evidence_by_what_it_means_for_the_hypothesis() {
+    let project = demo();
+    let p = project.path();
+    let h = hypothesis_titled(p, "cache");
+    let (f, pr) = (first(p, "criterion"), first(p, "prediction"));
+    let demo_evidence = first(p, "evidence");
+    let add = |target: &str, title: &str, extra: &[&str]| {
+        let mut args = vec!["evidence", "add", target, title, "--source", "run.log"];
+        args.extend(extra);
+        first_line(ok(p, &args))
+    };
+    let meets = add(&f, "Timeout again with D-cache off", &[]);
+    let misses = add(&f, "No timeout in 10,000 with D-cache off", &["--against"]);
+    let matches = add(&pr, "Clean + invalidate: 0 failures", &[]);
+    let text = ok(p, &["show", &h]);
+    let groups = evidence_groups(&text);
+    let against = &groups["against H"];
+    assert!(against.contains("Timeout again with D-cache off"), "{text}");
+    assert!(
+        against.contains(&format!("meets criterion {} (counts against H)", &f[..10])),
+        "{text}"
+    );
+    // The demo's direct contradiction of H.
+    assert!(against.contains("contradicts H · link L-"), "{text}");
+    let for_h = &groups["for H"];
+    assert!(for_h.contains("No timeout in 10,000"), "{text}");
+    assert!(for_h.contains(&format!("does not meet criterion {}", &f[..10])));
+    assert!(for_h.contains(&format!("matches prediction {}", &pr[..10])));
+    assert!(!for_h.contains("Timeout again"), "{text}");
+    assert!(
+        !groups.contains_key("supports"),
+        "grouped by stance, not link relation:\n{text}"
+    );
+
+    let expect = |e: &str, stance: &str, via: &str, relation: &str, meaning: &str| {
+        let entry = shown_evidence(p, &h, e);
+        assert_eq!(entry["stance"], stance, "{entry}");
+        let bearings = entry["bearings"].as_array().unwrap();
+        assert_eq!(bearings.len(), 1, "{entry}");
+        let b = &bearings[0];
+        assert_eq!(b["via"], via, "{entry}");
+        assert_eq!(b["relation"], relation, "{entry}");
+        assert_eq!(b["stance"], stance, "{entry}");
+        assert_eq!(b["meaning"], meaning, "{entry}");
+        assert!(b["link"].as_str().unwrap().starts_with("L-"), "{entry}");
+    };
+    let meets_f = format!("meets criterion {} (counts against H)", &f[..10]);
+    expect(&meets, "against", &f, "supports", &meets_f);
+    let misses_f = format!("does not meet criterion {} (counts for H)", &f[..10]);
+    expect(&misses, "for", &f, "contradicts", &misses_f);
+    let matches_p = format!("matches prediction {}", &pr[..10]);
+    expect(&matches, "for", &pr, "supports", &matches_p);
+    expect(
+        &demo_evidence,
+        "against",
+        &h,
+        "contradicts",
+        "contradicts H",
+    );
+}
+
+/// HYPO-0072: one observation linked both to a prediction and to the
+/// hypothesis is one record: shown once, with both links under it.
+#[test]
+fn show_lists_each_observation_once_with_all_its_links() {
+    let project = demo();
+    let p = project.path();
+    let h = hypothesis_titled(p, "cache");
+    let pr = first(p, "prediction");
+    let out = ok(
+        p,
+        &[
+            "evidence",
+            "add",
+            &pr,
+            "Clean + invalidate: 0 failures",
+            "--source",
+            "run.log",
+            "--body",
+            "Unique observation body 7f3a",
+        ],
+    );
+    let (e, via_prediction) = (
+        first_line(out.clone()),
+        out.lines().nth(1).unwrap().to_string(),
+    );
+    let direct = ok(
+        p,
+        &[
+            "link",
+            &e,
+            &h,
+            "--relation",
+            "supports",
+            "--reason",
+            "Direct",
+        ],
+    )
+    .trim()
+    .to_string();
+    let text = ok(p, &["show", &h]);
+    assert_eq!(
+        text.matches("Unique observation body 7f3a").count(),
+        1,
+        "{text}"
+    );
+    assert_eq!(text.matches(&e).count(), 1, "{text}");
+    let at = |needle: &str| {
+        text.find(needle)
+            .unwrap_or_else(|| panic!("{needle} in\n{text}"))
+    };
+    assert!(
+        at(&e) < at(&via_prediction) && at(&e) < at(&direct),
+        "{text}"
+    );
+    let entry = shown_evidence(p, &h, &e);
+    let links: Vec<&str> = entry["bearings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["link"].as_str().unwrap())
+        .collect();
+    assert_eq!(links.len(), 2, "{entry}");
+    assert!(links.contains(&via_prediction.as_str()) && links.contains(&direct.as_str()));
+}
+
+/// HYPO-0074: plain show's first line carries the 12-hex review token next
+/// to the hypothesis ID, and assess accepts it; --json keeps the full token.
+#[test]
+fn show_header_prints_the_short_review_token_that_assess_accepts() {
+    let project = demo();
+    let p = project.path();
+    let h = hypothesis_titled(p, "cache");
+    let e = first(p, "evidence");
+    let shown: serde_json::Value = serde_json::from_str(&ok(p, &["--json", "show", &h])).unwrap();
+    let token = shown["state"]["review_token"].as_str().unwrap();
+    assert_eq!(token.len(), 64);
+    let text = ok(p, &["show", &h]);
+    let header = text.lines().next().unwrap();
+    assert_eq!(header, format!("{h}  hypothesis  review {}", &token[..12]));
+    assert!(!text.contains(token), "one token to copy, not two:\n{text}");
+    let short = header.rsplit(' ').next().unwrap();
+    let out = run(
+        p,
+        &[
+            "assess",
+            &h,
+            "--reviewed",
+            short,
+            "--status",
+            "weakened",
+            "--evidence",
+            &e,
+            "--reason",
+            "Reviewed",
+        ],
+    );
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    // Records other than hypotheses have no review token.
+    assert!(
+        !ok(p, &["show", &e])
+            .lines()
+            .next()
+            .unwrap()
+            .contains("review")
+    );
+}
+
+/// HYPO-0075: assess --help says what each judgment needs, and the error for
+/// a missing requirement names the rule.
+#[test]
+fn assess_help_lists_each_judgment_with_what_it_requires() {
+    let project = demo();
+    let p = project.path();
+    let out = hyp(p)
+        .args(["assess", "--help"])
+        .env_remove("COLUMNS")
+        .output()
+        .unwrap();
+    let help = stdout_of(&out);
+    let line = |judgment: &str| -> String {
+        help.lines()
+            .find(|l| l.trim_start().starts_with(&format!("- {judgment}:")))
+            .unwrap_or_else(|| panic!("no line for {judgment} in\n{help}"))
+            .to_string()
+    };
+    assert!(line("untested").contains("no evidence"), "{help}");
+    for judgment in ["inconclusive", "supported", "weakened"] {
+        assert!(line(judgment).contains("linked"), "{help}");
+    }
+    assert!(line("falsified").contains("criterion"), "{help}");
+    let h = hypothesis_titled(p, "cache");
+    let e = first(p, "evidence");
+    let token = serde_json::from_str::<serde_json::Value>(&ok(p, &["--json", "show", &h])).unwrap()
+        ["state"]["review_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let out = run(
+        p,
+        &[
+            "assess",
+            &h,
+            "--reviewed",
+            &token,
+            "--status",
+            "falsified",
+            "--evidence",
+            &e,
+            "--reason",
+            "Criterion met",
+        ],
+    );
+    let stderr = stderr_of(&out);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    for part in ["falsified", "--criterion", "untested: no evidence"] {
+        assert!(stderr.contains(part), "{part:?} in {stderr}");
+    }
+}
+
+/// HYPO-0079: `hyp status` answers where the investigation stands, per
+/// open hypothesis and for the project.
+#[test]
+fn status_shows_where_each_active_hypothesis_stands() {
+    let project = demo();
+    let p = project.path();
+    let (cache, bus) = (hypothesis_titled(p, "cache"), hypothesis_titled(p, "bus"));
+    let gap = first(p, "gap");
+    let text = ok(p, &["status"]);
+    let block = |h: &str| -> String {
+        let lines: Vec<&str> = text.lines().collect();
+        let i = lines
+            .iter()
+            .position(|l| l.starts_with(&h[..10]))
+            .unwrap_or_else(|| panic!("{h} in\n{text}"));
+        format!("{}\n{}", lines[i], lines[i + 1])
+    };
+    let c = block(&cache);
+    for part in [
+        "weakened",
+        "DMA timeout is caused by cache coherency",
+        "criteria 1",
+        "linked evidence 1",
+        &format!("open gaps 1: {}", &gap[..10]),
+        "experiments without runs 0",
+    ] {
+        assert!(c.contains(part), "{part:?} in\n{c}");
+    }
+    assert!(!c.contains("needs review"), "{c}");
+    let b = block(&bus);
+    for part in [
+        "untested",
+        "no criterion",
+        "linked evidence 1",
+        "open gaps 0",
+    ] {
+        assert!(b.contains(part), "{part:?} in\n{b}");
+    }
+    assert!(
+        text.lines().next().unwrap().contains("writes not blocked"),
+        "{text}"
+    );
+    // Not a place to take a review token from: no run of 12 hex digits.
+    assert!(
+        !text
+            .split(|c: char| !c.is_ascii_hexdigit())
+            .any(|w| w.len() >= 12),
+        "{text}"
+    );
+
+    let x = ok(
+        p,
+        &["experiment", "add", &bus, "Load the bus with USB traffic"],
+    )
+    .trim()
+    .to_string();
+    ok(
+        p,
+        &[
+            "set",
+            &cache,
+            "--title",
+            "DMA timeout is caused by stale cache lines",
+        ],
+    );
+    ok(p, &["set", &gap, "--resolved", "true"]);
+    let json: serde_json::Value = serde_json::from_str(&ok(p, &["--json", "status"])).unwrap();
+    let rows = json["hypotheses"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["id"], cache, "needs review first: {json}");
+    assert_eq!(rows[0]["needs_review"], true);
+    assert_eq!(rows[0]["judgment"], "weakened");
+    assert_eq!(rows[0]["criteria"], 1);
+    assert_eq!(rows[0]["missing_criterion"], false);
+    assert_eq!(rows[0]["linked_evidence"], 1);
+    assert_eq!(rows[0]["open_gaps"], serde_json::json!([]));
+    assert_eq!(rows[1]["id"], bus);
+    assert_eq!(rows[1]["missing_criterion"], true);
+    assert_eq!(rows[1]["experiments_without_runs"], serde_json::json!([x]));
+    assert_eq!(json["writes_blocked"], false);
+    assert_eq!(json["blocking"], serde_json::json!([]));
+    assert_eq!(json["warnings"], 1, "the bus hypothesis has no criterion");
+    assert!(json["hypotheses"][0].get("review_token").is_none());
+
+    // Closed and archived hypotheses are counted, not listed.
+    ok(p, &["set", &bus, "--lifecycle", "closed"]);
+    let text = ok(p, &["status"]);
+    assert!(!text.contains(&bus[..10]), "{text}");
+    assert!(text.lines().next().unwrap().contains("1 closed"), "{text}");
+    assert!(text.contains("needs review"), "{text}");
+}
+
+/// A project an agent cannot write to says so first, with the files to fix.
+#[test]
+fn status_reports_diagnostics_that_block_writes() {
+    let project = demo();
+    let p = project.path();
+    let h = hypothesis_titled(p, "bus");
+    let path = format!("hyp/hypotheses/{h}.md");
+    std::fs::write(p.join(&path), "broken").unwrap();
+    let out = run(p, &["status"]);
+    assert!(out.status.success(), "a read: {}", stderr_of(&out));
+    let text = stdout_of(&out);
+    assert!(
+        text.lines().next().unwrap().contains("writes blocked"),
+        "{text}"
+    );
+    assert!(
+        text.lines()
+            .any(|l| l.contains("blocks writes") && l.contains(&path)),
+        "{text}"
+    );
+    let json: serde_json::Value = serde_json::from_str(&ok(p, &["--json", "status"])).unwrap();
+    assert_eq!(json["writes_blocked"], true);
+    let blocking = json["blocking"].as_array().unwrap();
+    assert_eq!(blocking.len(), 1, "{json}");
+    assert_eq!(blocking[0]["path"], path);
+    assert_eq!(blocking[0]["code"], "malformed");
+}
+
+/// About four lines per hypothesis at most: ten fit in ~40 lines.
+#[test]
+fn status_of_ten_hypotheses_fits_in_forty_lines() {
+    let dir = TempDir::new().unwrap();
+    let p = dir.path();
+    ok(p, &["init"]);
+    for i in 0..10 {
+        let h = ok(p, &["add", &format!("Cause number {i}")])
+            .trim()
+            .to_string();
+        ok(p, &["falsify-if", &h, "It reproduces without it"]);
+        ok(p, &["gap", &h, "Open question"]);
+        ok(p, &["gap", &h, "Another open question"]);
+        ok(p, &["experiment", "add", &h, "Try it"]);
+        ok(p, &["evidence", "add", &h, "Seen once", "--source", "log"]);
+    }
+    let text = ok(p, &["status"]);
+    assert!(
+        text.lines().count() <= 40,
+        "{} lines:\n{text}",
+        text.lines().count()
+    );
+}
+
+/// HYPO-0073: agents added a second link to the hypothesis "just in case";
+/// the help and the skill say that evidence on a criterion or prediction
+/// already counts.
+#[test]
+fn help_and_skill_say_evidence_on_a_criterion_or_prediction_counts() {
+    let dir = TempDir::new().unwrap();
+    let words = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    for args in [["evidence", "add", "--help"], ["link", "--help", ""]] {
+        let args: Vec<&str> = args.into_iter().filter(|a| !a.is_empty()).collect();
+        let help = words(&ok(dir.path(), &args));
+        assert!(
+            help.contains(
+                "Evidence linked to an active criterion or prediction counts toward its hypothesis"
+            ) && help.contains("part of the hypothesis's basis"),
+            "{args:?}: {help}"
+        );
+        assert!(
+            help.contains("counts against the hypothesis"),
+            "{args:?}: {help}"
+        );
+    }
+    let skill = words(SKILL_SOURCE);
+    assert!(
+        skill.contains("Evidence linked to an active criterion or prediction is part of its hypothesis's basis and citable"),
+        "{skill}"
+    );
+}
+
+/// An observation is `mixed` only when its links point both ways; a
+/// qualifying link does not change the direction of the others, and it is
+/// `qualifies` only when every link qualifies.
+#[test]
+fn qualifying_links_do_not_make_an_observation_mixed() {
+    let project = demo();
+    let p = project.path();
+    let h = hypothesis_titled(p, "cache");
+    let (f, pr) = (first(p, "criterion"), first(p, "prediction"));
+    let add = |target: &str, title: &str, extra: &[&str]| {
+        let mut args = vec!["evidence", "add", target, title, "--source", "run.log"];
+        args.extend(extra);
+        first_line(ok(p, &args))
+    };
+    let link = |e: &str, to: &str, relation: &str| {
+        ok(p, &["link", e, to, "--relation", relation, "--reason", "r"]);
+    };
+    let for_q = add(&pr, "Matches, with a caveat", &[]);
+    link(&for_q, &h, "qualifies");
+    let against_q = add(&f, "Meets the criterion, with a caveat", &[]);
+    link(&against_q, &h, "qualifies");
+    let only_q = add(&h, "Only a caveat", &["--qualifies"]);
+    link(&only_q, &pr, "qualifies");
+    let mixed = add(&pr, "Matches the prediction", &[]);
+    link(&mixed, &f, "supports");
+    for (e, stance) in [
+        (&for_q, "for"),
+        (&against_q, "against"),
+        (&only_q, "qualifies"),
+        (&mixed, "mixed"),
+    ] {
+        assert_eq!(shown_evidence(p, &h, e)["stance"], stance, "{e}");
+    }
+    let groups = evidence_groups(&ok(p, &["show", &h]));
+    assert!(
+        groups["for H"].contains("Matches, with a caveat"),
+        "{groups:#?}"
+    );
+    assert!(groups["against H"].contains("Meets the criterion, with a caveat"));
+    assert!(groups["qualifies H"].contains("Only a caveat"));
+    assert!(groups["mixed: its links disagree"].contains("Matches the prediction"));
+}
+
+/// A closed hypothesis whose basis changed after its assessment still needs
+/// review: `hyp status` lists it, as `hyp list --needs-review` does.
+#[test]
+fn status_lists_a_closed_hypothesis_that_needs_review() {
+    let project = demo();
+    let p = project.path();
+    let (cache, bus) = (hypothesis_titled(p, "cache"), hypothesis_titled(p, "bus"));
+    let pr = first(p, "prediction");
+    ok(p, &["set", &cache, "--lifecycle", "closed"]);
+    ok(p, &["set", &bus, "--lifecycle", "closed"]);
+    let text = ok(p, &["status"]);
+    assert!(text.starts_with("0 open hypotheses"), "{text}");
+    assert!(
+        text.contains("hyp list"),
+        "a finished investigation: {text}"
+    );
+    ok(
+        p,
+        &[
+            "evidence",
+            "add",
+            &pr,
+            "Late observation",
+            "--source",
+            "log",
+        ],
+    );
+    assert!(ok(p, &["list", "--needs-review"]).contains(&cache));
+    let text = ok(p, &["status"]);
+    let line = text
+        .lines()
+        .find(|l| l.starts_with(&cache[..10]))
+        .unwrap_or_else(|| panic!("{cache} listed:\n{text}"));
+    assert!(
+        line.contains("needs review") && line.contains("closed"),
+        "{line}"
+    );
+    assert!(!text.contains(&bus[..10]), "{text}");
+    let json: serde_json::Value = serde_json::from_str(&ok(p, &["--json", "status"])).unwrap();
+    assert_eq!(json["hypotheses"][0]["id"], cache);
+    assert_eq!(json["hypotheses"].as_array().unwrap().len(), 1);
+    assert_eq!(json["not_shown"]["closed"], 1, "{json}");
+    assert_eq!(json["not_shown"]["needs_review"], 0, "{json}");
+    // An archived hypothesis is not listed, even needing review; counted.
+    ok(p, &["archive", &cache]);
+    let json: serde_json::Value = serde_json::from_str(&ok(p, &["--json", "status"])).unwrap();
+    assert_eq!(json["hypotheses"], serde_json::json!([]));
+    assert_eq!(json["not_shown"]["archived"], 1, "{json}");
+    assert_eq!(json["not_shown"]["needs_review"], 1, "{json}");
+}
+
+#[test]
+fn init_demo_does_not_suggest_starting_from_an_empty_project() {
+    let dir = TempDir::new().unwrap();
+    let out = ok(dir.path(), &["init", "--demo"]);
+    assert!(!out.contains("hyp add"), "{out}");
+    assert!(out.contains("hyp status"), "{out}");
 }

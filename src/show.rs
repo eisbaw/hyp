@@ -26,8 +26,15 @@ fn text(out: &mut Vec<String>, indent: &str, text: &str) {
         out.push(format!("{indent}{line}").trim_end().to_string());
     }
 }
-fn header(out: &mut Vec<String>, r: &Record) {
-    out.push(format!("{}  {}", r.id, r.data.kind()));
+/// The first line: ID and kind, for a hypothesis also the first 12 hex
+/// digits of its review token, what `hyp assess --reviewed` takes; then the
+/// title.
+fn header(out: &mut Vec<String>, r: &Record, state: Option<&HypothesisState>) {
+    let mut first = format!("{}  {}", r.id, r.data.kind());
+    if let Some(state) = state {
+        first.push_str(&format!("  review {}", &state.review_token[..12]));
+    }
+    out.push(first);
     field(out, "", "title", &r.title);
 }
 fn footer(out: &mut Vec<String>, r: &Record) {
@@ -90,15 +97,16 @@ fn section(out: &mut Vec<String>, name: &str, lines: Vec<String>) {
 }
 
 /// The plain `hyp show` text of `e`. A hypothesis gets its derived state,
-/// the review token for `hyp assess --reviewed`, and its criteria and
-/// predictions (archived ones marked), linked evidence with its observation,
+/// the review token for `hyp assess --reviewed` (`header`), and its criteria
+/// and predictions (archived ones marked), linked evidence with its
+/// observation and what each link means for the hypothesis (`evidence`),
 /// experiments with their runs, gaps, links to other hypotheses and current
 /// assessments. Other records get their fields and the records that refer to
 /// them. Empty fields and other archived records are left out.
 pub fn plain(s: &Snapshot, e: &Entry) -> String {
     let r = &e.record;
     let mut out = Vec::new();
-    header(&mut out, r);
+    header(&mut out, r, s.hypotheses.get(&r.id));
     match (&r.data, s.hypotheses.get(&r.id)) {
         (
             Data::Hypothesis {
@@ -121,7 +129,6 @@ pub fn plain(s: &Snapshot, e: &Entry) -> String {
                 judgment.push_str(" · needs review");
             }
             field(&mut out, "", "judgment", &judgment);
-            field(&mut out, "", "review token", &state.review_token);
             footer(&mut out, r);
             hypothesis(&mut out, s, &r.id, &state.assessment_ids);
         }
@@ -196,73 +203,7 @@ fn hypothesis(out: &mut Vec<String>, s: &Snapshot, h: &str, current: &[String]) 
     }
     section(out, "Predictions", predictions);
 
-    // What an assessment may cite (`Snapshot::evidence_links`), by relation.
-    let links = s.evidence_links(h);
-    let mut evidence = Vec::new();
-    for relation in [
-        Relation::Supports,
-        Relation::Contradicts,
-        Relation::Qualifies,
-    ] {
-        let mut group = Vec::new();
-        for l in &links {
-            let Data::Link {
-                from,
-                to,
-                relation: rel,
-            } = &l.record.data
-            else {
-                continue;
-            };
-            let Some(ev) = s.get(from).filter(|_| *rel == relation) else {
-                continue;
-            };
-            let Data::Evidence {
-                source,
-                locator,
-                observed_at,
-                attachments,
-            } = &ev.record.data
-            else {
-                continue;
-            };
-            group.push(format!(
-                "    {}  {}{}",
-                ev.record.id,
-                ev.record.title,
-                archived(ev)
-            ));
-            text(&mut group, "      ", &ev.record.body);
-            let mut provenance = vec![format!("source: {source}")];
-            if !locator.trim().is_empty() {
-                provenance.push(format!("locator: {locator}"));
-            }
-            if !observed_at.is_empty() {
-                provenance.push(format!("observed {}", when(observed_at)));
-            }
-            if !attachments.is_empty() {
-                provenance.push(format!("{} attachment(s)", attachments.len()));
-            }
-            group.push(format!("      {}", provenance.join(" · ")));
-            let mut via = format!("link {}", l.record.id);
-            if to != h {
-                via.push_str(&format!(" to {to} ({})", title_of(s, to)));
-            }
-            // `hyp evidence add` without --reason repeats the title.
-            let reason = if l.record.body == ev.record.title {
-                ""
-            } else {
-                &l.record.body
-            };
-            group.push(format!("      {via}"));
-            field(&mut group, "      ", "reason", reason);
-        }
-        if !group.is_empty() {
-            evidence.push(format!("  {relation}"));
-            evidence.extend(group);
-        }
-    }
-    section(out, "Evidence", evidence);
+    section(out, "Evidence", evidence(s, h));
 
     let mut experiments = Vec::new();
     for x in rows(|d| matches!(d, Data::Experiment { .. })) {
@@ -351,4 +292,73 @@ fn hypothesis(out: &mut Vec<String>, s: &Snapshot, h: &str, current: &[String]) 
         "Current assessment"
     };
     section(out, heading, assessments);
+}
+/// What an assessment may cite (`Snapshot::evidence_bearings`): each
+/// observation once, grouped by what it means for hypothesis `h` ("against
+/// H", "for H", "qualifies H", "mixed: its links disagree"), with its
+/// provenance and every link that brings it in, each with its meaning.
+fn evidence(s: &Snapshot, h: &str) -> Vec<String> {
+    let bearings = s.evidence_bearings(h);
+    let mut out = Vec::new();
+    for (stance, heading) in [
+        (Stance::Against, "against H"),
+        (Stance::For, "for H"),
+        (Stance::Qualifies, "qualifies H"),
+        (Stance::Mixed, "mixed: its links disagree"),
+    ] {
+        let mut group = Vec::new();
+        for b in bearings.iter().filter(|b| b.stance == stance) {
+            let Some(ev) = s.get(&b.evidence) else {
+                continue;
+            };
+            let Data::Evidence {
+                source,
+                locator,
+                observed_at,
+                attachments,
+            } = &ev.record.data
+            else {
+                continue;
+            };
+            group.push(format!(
+                "    {}  {}{}",
+                ev.record.id,
+                ev.record.title,
+                archived(ev)
+            ));
+            text(&mut group, "      ", &ev.record.body);
+            let mut provenance = vec![format!("source: {source}")];
+            if !locator.trim().is_empty() {
+                provenance.push(format!("locator: {locator}"));
+            }
+            if !observed_at.is_empty() {
+                provenance.push(format!("observed {}", when(observed_at)));
+            }
+            if !attachments.is_empty() {
+                provenance.push(format!("{} attachment(s)", attachments.len()));
+            }
+            group.push(format!("      {}", provenance.join(" · ")));
+            for link in &b.bearings {
+                group.push(format!("      {} · link {}", link.meaning, link.link));
+                if link.via != h {
+                    if let Some(via) = s.get(&link.via) {
+                        let kind = via.record.data.kind();
+                        field(&mut group, "        ", kind, &via.record.title);
+                    }
+                }
+                // `hyp evidence add` without --reason repeats the title.
+                let reason = s
+                    .get(&link.link)
+                    .map(|l| l.record.body.as_str())
+                    .filter(|body| *body != ev.record.title)
+                    .unwrap_or_default();
+                field(&mut group, "        ", "reason", reason);
+            }
+        }
+        if !group.is_empty() {
+            out.push(format!("  {heading}"));
+            out.extend(group);
+        }
+    }
+    out
 }

@@ -544,6 +544,9 @@ input[type="checkbox"] {
   color: #668165;
   margin: 0 0 12px;
 }
+.bearing {
+  margin-top: 8px;
+}
 .evidence-heading.negative {
   color: #aa6a52;
 }
