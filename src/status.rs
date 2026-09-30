@@ -49,12 +49,21 @@ pub struct NotShown {
     pub archived: usize,
     pub needs_review: usize,
 }
+/// An observation no live hypothesis accounts for (`Snapshot::unexplained`).
+#[derive(Debug, Serialize)]
+pub struct Observation {
+    pub id: String,
+    pub title: String,
+}
 #[derive(Debug, Serialize)]
 pub struct Report {
     /// Open hypotheses and closed ones needing review; those needing review
     /// first, otherwise in project order.
     pub hypotheses: Vec<Row>,
     pub not_shown: NotShown,
+    /// Every unexplained observation, in project order; the plain text
+    /// lists the first `SHOWN_OBSERVATIONS`.
+    pub unexplained_observations: Vec<Observation>,
     pub writes_blocked: bool,
     /// The diagnostics that block every write (`Code::blocks_writes`).
     pub blocking: Vec<Diagnostic>,
@@ -178,6 +187,14 @@ pub fn report(s: &Snapshot) -> Report {
             archived,
             needs_review: hidden_review,
         },
+        unexplained_observations: s
+            .unexplained()
+            .into_iter()
+            .map(|e| Observation {
+                id: e.record.id.clone(),
+                title: e.record.title.clone(),
+            })
+            .collect(),
         writes_blocked: !blocking.is_empty(),
         blocking,
         errors: count("error"),
@@ -215,9 +232,12 @@ fn resolved(gaps: &[GapRow]) -> String {
 fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
+/// How many unexplained observations the plain text lists; `--json` has all.
+const SHOWN_OBSERVATIONS: usize = 5;
 
 /// The plain text: a header line for the project, one line per diagnostic
-/// that blocks writes, then two lines per hypothesis.
+/// that blocks writes, two lines per hypothesis, then the first
+/// `SHOWN_OBSERVATIONS` unexplained observations.
 pub fn plain(report: &Report) -> String {
     let open = report
         .hypotheses
@@ -243,8 +263,17 @@ pub fn plain(report: &Report) -> String {
     if needs_review > 0 {
         header.push(format!("{needs_review} archived needs review"));
     }
-    // Not finished while an archived hypothesis still needs review.
-    if report.hypotheses.is_empty() && closed > 0 && needs_review == 0 {
+    let unexplained = &report.unexplained_observations;
+    if !unexplained.is_empty() {
+        header.push(plural(
+            unexplained.len(),
+            "unexplained observation",
+            "unexplained observations",
+        ));
+    }
+    // Not finished while an archived hypothesis still needs review or an
+    // observation is unexplained.
+    if report.hypotheses.is_empty() && closed > 0 && needs_review == 0 && unexplained.is_empty() {
         header.push("investigation finished: hyp list shows the conclusions".into());
     }
     header.push(if report.writes_blocked {
@@ -307,6 +336,22 @@ pub fn plain(report: &Report) -> String {
             counted("experiments without runs", &r.experiments_without_runs)
         ));
         out.push(line);
+    }
+    if !unexplained.is_empty() {
+        out.push(
+            "unexplained observations (no live hypothesis accounts for them; hyp add \"…\" \
+             --explains E-…, or hyp link E-… H-…):"
+                .into(),
+        );
+        for o in unexplained.iter().take(SHOWN_OBSERVATIONS) {
+            out.push(format!("  {}  {}", short(&o.id), o.title));
+        }
+        if unexplained.len() > SHOWN_OBSERVATIONS {
+            out.push(format!(
+                "  ({} more; hyp --json status lists all)",
+                unexplained.len() - SHOWN_OBSERVATIONS
+            ));
+        }
     }
     out.join("\n")
 }

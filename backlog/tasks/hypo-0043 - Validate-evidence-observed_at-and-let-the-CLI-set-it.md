@@ -4,7 +4,7 @@ title: Validate evidence observed_at (and let the CLI set it)
 status: To Do
 assignee: []
 created_date: '2026-09-30 11:27'
-updated_date: '2026-09-30 12:37'
+updated_date: '2026-09-30 21:25'
 labels:
   - validation
   - cli
@@ -31,4 +31,6 @@ Browser test-drive 2026-09-30. The WebUI evidence form saves any text as observe
 
 <!-- SECTION:NOTES:BEGIN -->
 Interactive terminal test-drive 2026-09-30 (xterm+tmux, first-time user, release build of fda0faa). Confirmed as a paper cut in the exact scenario tested: evidence about 'the night of 2026-09-12' is stamped with the recording time.
+
+HYPO-0091 added hyp observe --observed-at with a clap value parser (cli.rs parse_observed_at: RFC 3339 or YYYY-MM-DD, stored as given, exit 2 otherwise). Reuse it for hyp evidence add --observed-at (AC #2); stored records are still not validated (AC #1).
 <!-- SECTION:NOTES:END -->

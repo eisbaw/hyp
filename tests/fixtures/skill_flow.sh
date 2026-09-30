@@ -3,15 +3,18 @@
 # PATH, in a fresh project. It uses shell variables to carry printed IDs from
 # one command to the next; agents read and type them instead (see
 # agents/hyp/SKILL.md, Example). Keep its commands and flags in step with the
-# skill's Example and Commands.
+# skill's Example, Commands and Start from an observation.
 hyp status                               # where things stand
 hyp search "login"                       # anything recorded already?
+E0=$(hyp observe "Login test fails 23/200 on CI" --source "CI job 4402" \
+  --locator "test login" --observed-at 2026-09-12)   # observed first
 H1=$(hyp add "Flaky login test is caused by a shared temp dir" \
-  --scope "tests/login.rs on CI" --tags ci,flaky)
+  --scope "tests/login.rs on CI" --tags ci,flaky --explains "$E0" \
+  | sed -n 1p)                           # the H- line; its L- line follows
 F1=$(hyp falsify-if "$H1" "Test still fails with per-test temp dirs")
 hyp set "$H1" --lifecycle investigating
-H2=$(hyp add "Flaky login test is caused by clock skew" --scope "CI")
-hyp link "$H1" "$H2" --relation competes-with --reason "Both explain it"
+H2=$(hyp add "Flaky login test is caused by clock skew" --scope "CI" \
+  --explains "$E0" --competes-with "$H1" | sed -n 1p)
 G1=$(hyp gap "$H1" "Does isolation alone stop the failures?")
 X1=$(hyp experiment add "$H1" "Rerun with per-test temp dirs" --targets "$F1" \
   --body "cargo test login -- --test-threads=8, 200 iterations")
@@ -35,3 +38,4 @@ hyp assess "$H2" --reviewed "$TOKEN" --status weakened --confidence 0.3 \
 hyp set "$G1" --resolved true --by "$E1"
 hyp set "$H1" --lifecycle closed         # the assessment still holds
 hyp list --needs-review                  # empty: nothing to review again
+hyp status                               # no unexplained observation left

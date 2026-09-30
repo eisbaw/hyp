@@ -116,6 +116,9 @@ pub enum Command {
         command: AgentsCommand,
     },
     /// Capture a hypothesis: a claim that could turn out wrong.
+    ///
+    /// Prints the hypothesis's ID, then those of the links it creates:
+    /// first one per --explains, then one per --competes-with.
     Add {
         /// The claim. One line; '-' reads stdin: its first line is the
         /// title, the rest is appended to the body.
@@ -129,6 +132,46 @@ pub enum Command {
         /// Comma-separated tags (also --tag).
         #[arg(long, alias = "tag", value_delimiter = ',')]
         tags: Vec<String>,
+        /// Observations the claim would explain (`hyp observe` prints their
+        /// E- IDs): each gets a supports link to the new hypothesis, which
+        /// makes it part of the hypothesis's basis. Comma-separated or
+        /// repeated.
+        #[arg(long, value_delimiter = ',', value_name = "EVIDENCE")]
+        explains: Vec<String>,
+        /// Why the claim would explain the observations, the reason of each
+        /// --explains link (default: "Proposed as an explanation of this
+        /// observation"; '-' reads stdin).
+        #[arg(long, requires = "explains")]
+        reason: Option<String>,
+        /// Rival hypotheses: each gets a competes-with link from the new
+        /// one. Comma-separated or repeated.
+        #[arg(long, value_delimiter = ',', value_name = "HYPOTHESIS")]
+        competes_with: Vec<String>,
+    },
+    /// Record an observation before any hypothesis explains it.
+    ///
+    /// Creates evidence without links and prints its E- ID. `hyp status`
+    /// lists it as unexplained until a live hypothesis (not archived, not
+    /// falsified) accounts for it: it counts for or qualifies that
+    /// hypothesis through an active link. Add each candidate explanation with
+    /// `hyp add "<claim>" --explains E-…`, or link it with `hyp link`.
+    Observe {
+        /// The observation. One line; '-' reads stdin: its first line is
+        /// the title, the rest is appended to the body.
+        title: String,
+        /// Where it comes from: a file, URL, command or log.
+        #[arg(long)]
+        source: String,
+        /// Where in the source: a line, timestamp or page.
+        #[arg(long, default_value = "", hide_default_value = true)]
+        locator: String,
+        /// The observation in detail ('-' reads stdin).
+        #[arg(long, default_value = "", hide_default_value = true)]
+        body: String,
+        /// When it was observed: an RFC 3339 timestamp or a date
+        /// (YYYY-MM-DD). Default: now.
+        #[arg(long, value_name = "WHEN", value_parser = parse_observed_at)]
+        observed_at: Option<String>,
     },
     /// Add a prediction: what the hypothesis says you will observe.
     Predict {
@@ -274,9 +317,12 @@ pub enum Command {
     /// Per open hypothesis (not archived, not closed), and per closed one
     /// that needs review: its judgment, whether it needs review, a missing
     /// criterion or its untestable reason, how much evidence is linked, open
-    /// gaps and experiments without runs. First, what blocks writes. No review
-    /// token: take that from `hyp show H-…`, the output you review before
-    /// assessing.
+    /// gaps and experiments without runs. First, what blocks writes; last,
+    /// unexplained observations: an observation is unexplained until a live
+    /// hypothesis (not archived, not falsified) accounts for it, i.e. it
+    /// counts for or qualifies that hypothesis through an active link. No
+    /// review token: take that from `hyp show H-…`, the output you review
+    /// before assessing.
     Status,
     /// Show a record; --json gives the complete form.
     ///
@@ -602,6 +648,18 @@ pub enum ExperimentCommand {
         body: String,
     },
 }
+/// A `--observed-at` value: an RFC 3339 timestamp or a date (YYYY-MM-DD),
+/// kept as given. A clap value parser, so anything else is an argument
+/// error (exit 2).
+fn parse_observed_at(value: &str) -> Result<String, String> {
+    let valid = chrono::DateTime::parse_from_rfc3339(value).is_ok()
+        || chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok();
+    if valid {
+        Ok(value.to_string())
+    } else {
+        Err("expected an RFC 3339 timestamp (2026-09-12T14:03:00Z) or a date (2026-09-12)".into())
+    }
+}
 /// A `--confidence` value: any number here, so that one out of range gets
 /// `confidence_in_range`'s hint.
 fn parse_confidence(value: &str) -> Result<f64, String> {
@@ -628,8 +686,18 @@ fn confidence_in_range(confidence: Option<f64>) -> Result<()> {
 fn stdin_arguments(command: &Command) -> Vec<&'static str> {
     const TITLE: &str = "TITLE";
     let texts: Vec<(&str, Option<&String>)> = match command {
-        Command::Add { title, body, .. }
-        | Command::Run { title, body, .. }
+        Command::Add {
+            title,
+            body,
+            reason,
+            ..
+        } => vec![
+            (TITLE, Some(title)),
+            ("--body", Some(body)),
+            ("--reason", reason.as_ref()),
+        ],
+        Command::Run { title, body, .. }
+        | Command::Observe { title, body, .. }
         | Command::Experiment {
             command: ExperimentCommand::Add { title, body, .. },
         } => vec![(TITLE, Some(title)), ("--body", Some(body))],
@@ -846,6 +914,29 @@ fn find_kind(s: &Snapshot, arg: &str, id: &str, kinds: &[Kind]) -> Result<String
 fn find_all(s: &Snapshot, arg: &str, ids: &[String], kinds: &[Kind]) -> Result<Vec<String>> {
     ids.iter().map(|id| find_kind(s, arg, id, kinds)).collect()
 }
+/// `ids` without repeats, in first-seen order: an ID given twice, in full
+/// or by two prefixes, gets one link.
+fn distinct(ids: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    ids.into_iter()
+        .filter(|id| seen.insert(id.clone()))
+        .collect()
+}
+/// The reason of `hyp add --competes-with`'s link to `rival`: the
+/// observations among `explains` that `rival` explains too, by full ID.
+fn rival_reason(s: &Snapshot, rival: &str, explains: &[String]) -> String {
+    let linked = s.linked_evidence(rival);
+    let shared: Vec<&str> = explains
+        .iter()
+        .filter(|e| linked.contains(e.as_str()))
+        .map(String::as_str)
+        .collect();
+    if shared.is_empty() {
+        "Competing explanation".into()
+    } else {
+        format!("Competing explanations of {}", shared.join(", "))
+    }
+}
 /// A create with its preconditions stated from `s`, the snapshot the command read.
 fn create(s: &Snapshot, r: Record) -> Change {
     Change::create_seen(r, s)
@@ -900,8 +991,9 @@ pub async fn run(cli: Cli) -> Result<()> {
                 );
             } else {
                 println!(
-                    "Next: hyp add \"<claim>\", then hyp falsify-if H-… \"<what would refute it>\"; \
-                     hyp agents install teaches coding agents to use hyp"
+                    "Next: hyp add \"<claim>\", then hyp falsify-if H-… \"<what would refute it>\" \
+                     (or first hyp observe \"<what you saw>\" --source …, then hyp add \"<claim>\" \
+                     --explains E-…); hyp agents install teaches coding agents to use hyp"
                 );
             }
         }
@@ -935,8 +1027,18 @@ pub async fn run(cli: Cli) -> Result<()> {
             body,
             scope,
             tags,
+            explains,
+            reason,
+            competes_with,
         } => {
-            let mut r = titled(
+            let explains = distinct(find_all(&s, "--explains", &explains, &[Kind::Evidence])?);
+            let rivals = distinct(find_all(
+                &s,
+                "--competes-with",
+                &competes_with,
+                &[Kind::Hypothesis],
+            )?);
+            let mut h = titled(
                 title,
                 body,
                 Data::Hypothesis {
@@ -946,9 +1048,58 @@ pub async fn run(cli: Cli) -> Result<()> {
                     untestable_reason: String::new(),
                 },
             )?;
-            r.tags = tags;
-            changes.push(create(&s, r));
+            h.tags = tags;
+            let reason = match reason {
+                Some(reason) => input("--reason", reason)?,
+                None => "Proposed as an explanation of this observation".into(),
+            };
+            let mut links = Vec::new();
+            for e in &explains {
+                let mut l = Record::new(
+                    format!("{} explains {}", short(&h.id), short(e)),
+                    Data::Link {
+                        from: e.clone(),
+                        to: h.id.clone(),
+                        relation: Relation::Supports,
+                    },
+                );
+                l.body.clone_from(&reason);
+                links.push(l);
+            }
+            for rival in &rivals {
+                let mut l = Record::new(
+                    format!("{} competes with {}", short(&h.id), short(rival)),
+                    Data::Link {
+                        from: h.id.clone(),
+                        to: rival.clone(),
+                        relation: Relation::CompetesWith,
+                    },
+                );
+                l.body = rival_reason(&s, rival, &explains);
+                links.push(l);
+            }
+            changes.push(create(&s, h));
+            changes.extend(links.into_iter().map(|l| create(&s, l)));
         }
+        Command::Observe {
+            title,
+            source,
+            locator,
+            body,
+            observed_at,
+        } => changes.push(create(
+            &s,
+            titled(
+                title,
+                body,
+                Data::Evidence {
+                    source,
+                    locator,
+                    observed_at: observed_at.unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
+                    attachments: vec![],
+                },
+            )?,
+        )),
         Command::Predict {
             hypothesis: h,
             title,
@@ -1304,6 +1455,30 @@ pub async fn run(cli: Cli) -> Result<()> {
                     }
                     _ => (None, None, None),
                 };
+                // For evidence, each hypothesis it bears on with its
+                // `stance` and `bearings` (`Snapshot::bears_on`), and whether
+                // no live hypothesis accounts for it (`Snapshot::unexplained`).
+                let (bears_on, unexplained) = match e.record.data {
+                    Data::Evidence { .. } => {
+                        let bears_on: Vec<serde_json::Value> = s
+                            .bears_on(&e.record.id)
+                            .into_iter()
+                            .map(|(h, b)| {
+                                serde_json::json!({
+                                    "hypothesis": h.record.id,
+                                    "archived": h.record.archived,
+                                    "judgment": s.hypotheses.get(&h.record.id).map(|x| x.judgment),
+                                    "stance": b.stance,
+                                    "bearings": b.bearings,
+                                })
+                            })
+                            .collect();
+                        let unexplained =
+                            s.unexplained().iter().any(|x| x.record.id == e.record.id);
+                        (Some(bears_on), Some(unexplained))
+                    }
+                    _ => (None, None),
+                };
                 print_json(&serde_json::json!({
                     "entry": e,
                     "state": s.hypotheses.get(&e.record.id),
@@ -1311,6 +1486,8 @@ pub async fn run(cli: Cli) -> Result<()> {
                     "runs": runs,
                     "evidence": evidence,
                     "basis": basis,
+                    "bears_on": bears_on,
+                    "unexplained": unexplained,
                 }))?;
             } else {
                 println!("{}", crate::show::plain(&s, e));

@@ -102,7 +102,8 @@ fn section(out: &mut Vec<String>, name: &str, lines: Vec<String>) {
 /// observation and what each link means for the hypothesis (`evidence`),
 /// experiments with their runs, gaps, links to other hypotheses and current
 /// assessments. Other records get their fields and the records that refer to
-/// them. Empty fields and other archived records are left out.
+/// them; evidence first the hypotheses it bears on and how (`bears_on`).
+/// Empty fields and other archived records are left out.
 pub fn plain(s: &Snapshot, e: &Entry) -> String {
     let r = &e.record;
     let mut out = Vec::new();
@@ -156,7 +157,13 @@ pub fn plain(s: &Snapshot, e: &Entry) -> String {
                 }
             }
             footer(&mut out, r);
+            // Evidence: its links to claims are listed under "Bears on".
+            let shown = match data {
+                Data::Evidence { .. } => bears_on(&mut out, s, e),
+                _ => vec![],
+            };
             let refs = active(s, |d| d.references().contains(&r.id.as_str()))
+                .filter(|x| !shown.contains(&x.record.id.as_str()))
                 .map(|x| {
                     format!(
                         "  {}  {:11} {}",
@@ -346,22 +353,7 @@ fn evidence(s: &Snapshot, h: &str) -> Vec<String> {
                 provenance.push(format!("{} attachment(s)", attachments.len()));
             }
             group.push(format!("      {}", provenance.join(" · ")));
-            for link in &b.bearings {
-                group.push(format!("      {} · link {}", link.meaning, link.link));
-                if link.via != h {
-                    if let Some(via) = s.get(&link.via) {
-                        let kind = via.record.data.kind();
-                        field(&mut group, "        ", kind, &via.record.title);
-                    }
-                }
-                // `hyp evidence add` without --reason repeats the title.
-                let reason = s
-                    .get(&link.link)
-                    .map(|l| l.record.body.as_str())
-                    .filter(|body| *body != ev.record.title)
-                    .unwrap_or_default();
-                field(&mut group, "        ", "reason", reason);
-            }
+            bearing_lines(&mut group, "      ", s, h, ev, b);
         }
         if !group.is_empty() {
             out.push(format!("  {heading}"));
@@ -369,4 +361,66 @@ fn evidence(s: &Snapshot, h: &str) -> Vec<String> {
         }
     }
     out
+}
+/// Each link of `b` (observation `ev` read for hypothesis `h`): its meaning
+/// and ID, the criterion or prediction it goes through, and its reason.
+fn bearing_lines(
+    out: &mut Vec<String>,
+    indent: &str,
+    s: &Snapshot,
+    h: &str,
+    ev: &Entry,
+    b: &EvidenceBearing,
+) {
+    let deeper = format!("{indent}  ");
+    for link in &b.bearings {
+        out.push(format!("{indent}{} · link {}", link.meaning, link.link));
+        if link.via != h {
+            if let Some(via) = s.get(&link.via) {
+                field(out, &deeper, via.record.data.kind(), &via.record.title);
+            }
+        }
+        // `hyp evidence add` without --reason repeats the title.
+        let reason = s
+            .get(&link.link)
+            .map(|l| l.record.body.as_str())
+            .filter(|body| *body != ev.record.title)
+            .unwrap_or_default();
+        field(out, &deeper, "reason", reason);
+    }
+}
+/// The "Bears on" section of evidence `ev`: each hypothesis it bears on
+/// (`Snapshot::bears_on`) with its stance, the hypothesis's judgment and
+/// lifecycle, and its links; and whether no live hypothesis accounts for it
+/// (`Snapshot::unexplained`). Returns the IDs of the
+/// links it listed.
+fn bears_on<'a>(out: &mut Vec<String>, s: &'a Snapshot, ev: &Entry) -> Vec<&'a str> {
+    let id = ev.record.id.as_str();
+    let mut lines = Vec::new();
+    let mut links = Vec::new();
+    for (h, b) in s.bears_on(id) {
+        let mut how = b.stance.as_str().to_string();
+        if let Some(state) = s.hypotheses.get(&h.record.id) {
+            how.push_str(&format!(" · {}", state.judgment));
+        }
+        if let Data::Hypothesis { lifecycle, .. } = &h.record.data {
+            how.push_str(&format!(" · {lifecycle}"));
+        }
+        lines.push(format!(
+            "  {}  {how}  {}{}",
+            h.record.id,
+            h.record.title,
+            archived(h)
+        ));
+        bearing_lines(&mut lines, "    ", s, &h.record.id, ev, b);
+        links.extend(b.bearings.iter().map(|l| l.link.as_str()));
+    }
+    if s.unexplained().iter().any(|e| e.record.id == id) {
+        lines.push(format!(
+            "  unexplained: no live hypothesis accounts for it (hyp add \"…\" --explains {})",
+            id.get(..10).unwrap_or(id)
+        ));
+    }
+    section(out, "Bears on", lines);
+    links
 }

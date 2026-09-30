@@ -786,6 +786,55 @@ impl Snapshot {
         }
         out
     }
+    /// The hypotheses (archived ones included) that evidence `id` bears on,
+    /// in project order, each with what the evidence means for it
+    /// (`evidence_bearings`). Reads the derived `bearings` (`derive`).
+    pub fn bears_on(&self, id: &str) -> Vec<(&Entry, &EvidenceBearing)> {
+        self.objects
+            .iter()
+            .filter_map(|h| {
+                let list = self.bearings.get(&h.record.id)?;
+                list.iter().find(|b| b.evidence == id).map(|b| (h, b))
+            })
+            .collect()
+    }
+    /// Whether hypothesis `id` is live: not archived, and its current
+    /// judgment is not falsified. Reads the derived `hypotheses`.
+    pub fn is_live(&self, id: &str) -> bool {
+        self.get(id).is_some_and(|e| !e.record.archived)
+            && self
+                .hypotheses
+                .get(id)
+                .is_some_and(|state| state.judgment != Judgment::Falsified)
+    }
+    /// The observations no live hypothesis accounts for (HYPO-0091):
+    /// evidence, not archived, without a bearing of stance `For` or
+    /// `Qualifies` (`Stance::of_link`: an active link to the hypothesis or
+    /// to an active criterion or prediction of it) on a hypothesis that
+    /// `is_live`. So an observation is unexplained again once every
+    /// explanation of it is falsified or archived, and one that only counts
+    /// against live hypotheses, or only falsified one, is unexplained too;
+    /// so is evidence only a run or a gap names. In project order. Reads
+    /// the derived `bearings` and `hypotheses` (`derive`).
+    pub fn unexplained(&self) -> Vec<&Entry> {
+        let accounts = |b: &Bearing| matches!(b.stance, Stance::For | Stance::Qualifies);
+        let explained: BTreeSet<&str> = self
+            .bearings
+            .iter()
+            .filter(|(h, _)| self.is_live(h))
+            .flat_map(|(_, list)| list.iter())
+            .filter(|e| e.bearings.iter().any(accounts))
+            .map(|e| e.evidence.as_str())
+            .collect();
+        self.objects
+            .iter()
+            .filter(|e| {
+                !e.record.archived
+                    && matches!(e.record.data, Data::Evidence { .. })
+                    && !explained.contains(e.record.id.as_str())
+            })
+            .collect()
+    }
     /// What an assessment of hypothesis `id` is based on (decision-0003):
     /// record ID -> the fields of that record that count. Covered: the claim
     /// (title, body, scope, assumptions, archived), its criteria and

@@ -6,6 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-09-30 21:54'
+updated_date: '2026-09-30 22:09'
 labels:
   - agents
   - ux
@@ -24,3 +25,9 @@ From the HYPO-0091 reviews. (1) Explanations of the same observation are only li
 - [ ] #1 Decide and implement rival linking help for --explains
 - [ ] #2 observed_at rejects future dates beyond a small tolerance
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+From the HYPO-0091 confirmation: (6) evidence recorded against a criterion (it meets it, so it counts against the hypothesis) is listed as an unexplained observation from the moment it is recorded, until a live hypothesis accounts for it. Kept deliberately (no live explanation exists yet), but it can crowd the list during an investigation; revisit if users find it noisy. (7) Evidence that does not meet a criterion counts For and so explains the observation (the README calls it mild corroboration): confirm deliberately. (8) JSON bears_on lacks lifecycle while plain show prints it.
+<!-- SECTION:NOTES:END -->

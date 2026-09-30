@@ -550,13 +550,16 @@ fn skill_flow_runs_against_this_binary_and_ends_assessed_and_closed() {
     assert_eq!(experiments.len(), 1);
     assert_eq!(experiments[0]["record"]["status"], "completed");
     let gaps = list("gap");
+    let answer = list("evidence")
+        .into_iter()
+        .find(|e| e["record"]["title"] == "200/200 passes with per-test temp dirs")
+        .expect("the evidence that answered the gap");
     assert_eq!(
         gaps[0]["record"]["resolved_by"],
-        list("evidence")[0]["record"]["id"]
-            .as_str()
-            .map(|e| serde_json::json!([e]))
-            .unwrap()
+        serde_json::json!([answer["record"]["id"]])
     );
+    // The observation the flow started from is explained by both.
+    assert_eq!(unexplained(project.path()), []);
     ok(project.path(), &["check"]);
 }
 /// The skill teaches commands an agent sandbox accepts: no shell expansion
@@ -3957,4 +3960,616 @@ fn the_schema_table_matches_this_version_and_the_readme() {
             "README schema table lacks | {schema} | {version} |"
         );
     }
+}
+
+/// The review token on line 1 of plain `hyp show h`, as an agent reads it.
+fn shown_token(p: &Path, h: &str) -> String {
+    let text = ok(p, &["show", h]);
+    let line = text.lines().next().unwrap();
+    line.split("  review ")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no review token in {line:?}"))
+        .to_string()
+}
+/// `hyp --json status`'s unexplained observations, as (ID, title) pairs.
+fn unexplained(p: &Path) -> Vec<(String, String)> {
+    let json: serde_json::Value = serde_json::from_str(&ok(p, &["--json", "status"])).unwrap();
+    json["unexplained_observations"]
+        .as_array()
+        .unwrap_or_else(|| panic!("unexplained_observations in {json}"))
+        .iter()
+        .map(|o| {
+            let keys: Vec<&String> = o.as_object().unwrap().keys().collect();
+            assert_eq!(keys, ["id", "title"], "{o}");
+            (
+                o["id"].as_str().unwrap().to_string(),
+                o["title"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+fn lines_of(out: &str) -> Vec<String> {
+    out.lines().map(str::to_string).collect()
+}
+
+/// HYPO-0091: observation-first work, end to end. An observation comes
+/// first; two competing hypotheses explain it in one command each; each
+/// gets a criterion; one is falsified by evidence that meets its criterion,
+/// the other supported; nothing is left unexplained or needing review.
+#[test]
+fn an_observation_explained_by_two_rivals_ends_with_one_falsified_one_supported() {
+    let dir = TempDir::new().unwrap();
+    let p = dir.path();
+    ok(p, &["init"]);
+    // 1. The observation, with no hypothesis yet.
+    let observed = "Login test fails 23/200 on CI";
+    let e0 = ok(
+        p,
+        &[
+            "observe",
+            observed,
+            "--source",
+            "CI job 4402",
+            "--locator",
+            "test login",
+            "--observed-at",
+            "2026-09-12",
+        ],
+    );
+    let [e0] = lines_of(&e0).try_into().expect("observe prints one ID");
+    assert!(e0.starts_with("E-") && e0.len() == 38, "{e0}");
+    assert_eq!(record_of(p, &e0)["observed_at"], "2026-09-12");
+    assert_eq!(unexplained(p), [(e0.clone(), observed.to_string())]);
+    let text = ok(p, &["status"]);
+    assert!(
+        text.lines()
+            .next()
+            .unwrap()
+            .contains("1 unexplained observation"),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("  {}  {observed}", &e0[..10])),
+        "{text}"
+    );
+    assert!(ok(p, &["show", &e0]).contains("no live hypothesis accounts for it"));
+
+    // 2. Two competing explanations, each linked to the observation.
+    let out = lines_of(&ok(
+        p,
+        &["add", "A shared temp dir causes it", "--explains", &e0],
+    ));
+    let [h1, l1] = out.try_into().expect("the hypothesis, then its link");
+    let out = lines_of(&ok(
+        p,
+        &[
+            "add",
+            "Clock skew causes it",
+            "--explains",
+            &e0[..10],
+            "--competes-with",
+            &h1[..10],
+            "--reason",
+            "Timestamps jump between the failing steps",
+        ],
+    ));
+    let [h2, l2, l3] = out.try_into().expect("the hypothesis, then its links");
+    for (link, from, to, relation, reason) in [
+        (
+            &l1,
+            &e0,
+            &h1,
+            "supports",
+            "Proposed as an explanation of this observation",
+        ),
+        (
+            &l2,
+            &e0,
+            &h2,
+            "supports",
+            "Timestamps jump between the failing steps",
+        ),
+        (
+            &l3,
+            &h2,
+            &h1,
+            "competes_with",
+            &format!("Competing explanations of {e0}"),
+        ),
+    ] {
+        let r = record_of(p, link);
+        assert_eq!(
+            (&r["from"], &r["to"], &r["relation"], &r["body"]),
+            (
+                &serde_json::json!(from),
+                &serde_json::json!(to),
+                &serde_json::json!(relation),
+                &serde_json::json!(reason)
+            ),
+            "{r}"
+        );
+    }
+    assert_eq!(unexplained(p), []);
+    let shown: serde_json::Value = serde_json::from_str(&ok(p, &["--json", "show", &e0])).unwrap();
+    assert_eq!(shown["unexplained"], false);
+    let bears: Vec<(&str, &str)> = shown["bears_on"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| {
+            (
+                b["hypothesis"].as_str().unwrap(),
+                b["stance"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    let mut expected = [(h1.as_str(), "for"), (h2.as_str(), "for")];
+    let mut got = bears.clone();
+    got.sort();
+    expected.sort();
+    assert_eq!(got, expected, "{shown}");
+    let text = ok(p, &["show", &e0]);
+    let section = text
+        .split("\n\n")
+        .find(|s| s.starts_with("Bears on"))
+        .unwrap_or_else(|| panic!("no Bears on section in\n{text}"));
+    for (h, title) in [
+        (&h1, "A shared temp dir causes it"),
+        (&h2, "Clock skew causes it"),
+    ] {
+        assert!(
+            section.contains(&format!("  {h}  for · untested · draft  {title}")),
+            "{section}"
+        );
+    }
+    assert!(
+        section.contains(&format!("supports H · link {l2}")),
+        "{section}"
+    );
+    assert!(
+        !text.contains("Referenced by"),
+        "links are under Bears on:\n{text}"
+    );
+
+    // 3. A falsification criterion for each.
+    let f1 = first_line(ok(
+        p,
+        &["falsify-if", &h1, "Still fails with per-test temp dirs"],
+    ));
+    let f2 = first_line(ok(
+        p,
+        &["falsify-if", &h2, "Still fails with the clock pinned"],
+    ));
+
+    // 4 and 5. Evidence that meets the first criterion falsifies the first.
+    let e1 = first_line(ok(
+        p,
+        &[
+            "evidence",
+            "add",
+            &f1,
+            "21/200 fail with per-test temp dirs",
+            "--source",
+            "CI job 4410",
+        ],
+    ));
+    let token = shown_token(p, &h1);
+    ok(
+        p,
+        &[
+            "assess",
+            &h1,
+            "--reviewed",
+            &token,
+            "--status",
+            "falsified",
+            "--criterion",
+            &f1,
+            "--evidence",
+            &e1,
+            "--reason",
+            "Isolating temp dirs did not stop the failures",
+        ],
+    );
+
+    // The observation still has a live explanation; the one that falsified
+    // H1 bears on no live hypothesis yet.
+    assert_eq!(
+        unexplained(p),
+        [(
+            e1.clone(),
+            "21/200 fail with per-test temp dirs".to_string()
+        )]
+    );
+
+    // 6. Evidence that does not meet the second criterion supports it. The
+    // falsifying observation bears on the survivor too: linked to it, it is
+    // explained; otherwise it would stay unexplained (it only falsified H1).
+    ok(
+        p,
+        &[
+            "link",
+            &e1,
+            &h2,
+            "--relation",
+            "supports",
+            "--reason",
+            "The failures persist without a shared temp dir, as clock skew allows",
+        ],
+    );
+    assert_eq!(unexplained(p), []);
+    let e2 = first_line(ok(
+        p,
+        &[
+            "evidence",
+            "add",
+            &f2,
+            "0/200 fail with the clock pinned",
+            "--against",
+            "--source",
+            "CI job 4411",
+        ],
+    ));
+    let token = shown_token(p, &h2);
+    ok(
+        p,
+        &[
+            "assess",
+            &h2,
+            "--reviewed",
+            &token,
+            "--status",
+            "supported",
+            "--confidence",
+            "0.7",
+            "--evidence",
+            &format!("{e0},{e2}"),
+            "--reason",
+            "Pinning the clock removed the failures the observation reports",
+        ],
+    );
+
+    // 7. Nothing unexplained, nothing needing review.
+    assert_eq!(unexplained(p), []);
+    let json: serde_json::Value = serde_json::from_str(&ok(p, &["--json", "status"])).unwrap();
+    let judgments: Vec<(&str, &str, bool)> = json["hypotheses"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            (
+                r["id"].as_str().unwrap(),
+                r["judgment"].as_str().unwrap(),
+                r["needs_review"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    let mut expected = [
+        (h1.as_str(), "falsified", false),
+        (h2.as_str(), "supported", false),
+    ];
+    let mut got = judgments.clone();
+    got.sort();
+    expected.sort();
+    assert_eq!(got, expected, "{json}");
+    let text = ok(p, &["status"]);
+    assert!(!text.contains("unexplained"), "{text}");
+    assert!(!text.contains("needs review"), "{text}");
+    assert_eq!(ok(p, &["list", "--needs-review"]), "");
+    ok(p, &["check"]);
+}
+
+/// `hyp observe` follows the write contract: the ID alone on stdout, the
+/// `--json` written shape, a summary for a person at a terminal. A bad
+/// `--observed-at` is an argument error.
+#[test]
+fn observe_prints_what_it_wrote_and_checks_when_it_was_observed() {
+    let dir = TempDir::new().unwrap();
+    let p = dir.path();
+    ok(p, &["init"]);
+    let out = ok(
+        p,
+        &[
+            "--json",
+            "observe",
+            "Fan at 100%",
+            "--source",
+            "dmesg",
+            "--body",
+            "Since boot",
+        ],
+    );
+    let (written, revision) = written(&out);
+    assert_eq!(written.len(), 1);
+    assert_eq!(written[0].kind, "evidence");
+    assert_eq!(written[0].revision, Some(revision_of(p, &written[0].id)));
+    assert!(!revision.is_empty());
+    let r = record_of(p, &written[0].id);
+    assert_eq!(
+        (&r["source"], &r["body"]),
+        (&"dmesg".into(), &"Since boot".into())
+    );
+    let stamped = r["observed_at"].as_str().unwrap();
+    assert!(
+        chrono_like(stamped),
+        "defaults to the time of recording: {stamped}"
+    );
+    for good in [
+        "2026-09-12",
+        "2026-09-12T14:03:00Z",
+        "2026-09-12T14:03:00+02:00",
+    ] {
+        let id = first_line(ok(
+            p,
+            &["observe", "Seen", "--source", "log", "--observed-at", good],
+        ));
+        assert_eq!(record_of(p, &id)["observed_at"], good);
+    }
+    for bad in ["yesterday", "2026-13-01", "12/09/2026", ""] {
+        let out = run(
+            p,
+            &["observe", "Seen", "--source", "log", "--observed-at", bad],
+        );
+        assert_eq!(out.status.code(), Some(2), "{bad:?}: {}", stderr_of(&out));
+        assert!(stderr_of(&out).contains("RFC 3339"), "{}", stderr_of(&out));
+    }
+    let (out, tty) = on_terminal(hyp_args(p, &["observe", "Seen", "--source", "log"]), None);
+    assert!(out.status.success());
+    assert!(tty.contains("created evidence E-"), "{tty}");
+    assert_eq!(unexplained(p).len(), 5);
+}
+/// An RFC 3339 timestamp, as `hyp observe` stamps one by default.
+fn chrono_like(s: &str) -> bool {
+    s.len() >= 20 && s.as_bytes()[4] == b'-' && s.as_bytes()[10] == b'T'
+}
+
+/// `--explains` takes evidence and `--competes-with` hypotheses, by ID or
+/// prefix; anything else fails before writing, with the ID error kinds of
+/// every other argument. A repeated ID gets one link.
+#[test]
+fn add_explains_takes_only_evidence_and_links_each_once() {
+    let project = demo();
+    let p = project.path();
+    let (h, e) = (first(p, "hypothesis"), first(p, "evidence"));
+    let before = ok(p, &["--json", "list", "--all"]);
+    let out = run(p, &["--json", "add", "X", "--explains", &h]);
+    assert_eq!(out.status.code(), Some(1));
+    let err = json_error(&out);
+    assert_eq!(err["kind"], "invalid_input", "{err}");
+    assert!(
+        err["error"].as_str().unwrap().contains(&format!(
+            "argument --explains: expected evidence, got hypothesis {h}"
+        )),
+        "{err}"
+    );
+    let out = run(p, &["--json", "add", "X", "--explains", "E-0000"]);
+    let err = json_error(&out);
+    assert_eq!(
+        (&err["kind"], &err["ids"]),
+        (&"not_found".into(), &serde_json::json!(["E-0000"])),
+        "{err}"
+    );
+    let out = run(p, &["--json", "add", "X", "--competes-with", &e]);
+    assert_eq!(json_error(&out)["kind"], "invalid_input");
+    // --reason explains the --explains links: alone it is an argument error.
+    assert_eq!(
+        run(p, &["add", "X", "--reason", "Why"]).status.code(),
+        Some(2)
+    );
+    assert_eq!(
+        ok(p, &["--json", "list", "--all"]),
+        before,
+        "nothing written"
+    );
+
+    let out = lines_of(&ok(
+        p,
+        &[
+            "add",
+            "X",
+            "--explains",
+            &format!("{e},{}", &e[..10]),
+            "--explains",
+            &e,
+        ],
+    ));
+    assert_eq!(out.len(), 2, "one hypothesis, one link: {out:?}");
+    let shown: serde_json::Value = serde_json::from_str(&ok(p, &["--json", "show", &e])).unwrap();
+    let hypotheses: Vec<&str> = shown["bears_on"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["hypothesis"].as_str().unwrap())
+        .collect();
+    assert!(hypotheses.contains(&out[0].as_str()), "{shown}");
+}
+
+/// Only an active link to an active claim explains an observation: archiving
+/// the link, or the only hypothesis it explains, makes it unexplained again,
+/// and an archived observation is never listed. Plain status lists five.
+#[test]
+fn status_lists_unexplained_observations_and_caps_the_plain_list() {
+    let dir = TempDir::new().unwrap();
+    let p = dir.path();
+    ok(p, &["init"]);
+    let observe = |title: &str| first_line(ok(p, &["observe", title, "--source", "log"]));
+    let e = observe("Explained");
+    let out = lines_of(&ok(p, &["add", "Cause", "--explains", &e]));
+    let [h, l] = out.try_into().unwrap();
+    assert_eq!(unexplained(p), []);
+    ok(p, &["archive", &l]);
+    assert_eq!(unexplained(p), [(e.clone(), "Explained".to_string())]);
+    ok(p, &["restore", &l]);
+    ok(p, &["archive", &h]);
+    assert_eq!(unexplained(p), [(e.clone(), "Explained".to_string())]);
+    let text = ok(p, &["show", &e]);
+    assert!(text.contains("[archived]"), "{text}");
+    let shown: serde_json::Value = serde_json::from_str(&ok(p, &["--json", "show", &e])).unwrap();
+    assert_eq!(
+        (&shown["bears_on"][0]["archived"], &shown["unexplained"]),
+        (&true.into(), &true.into()),
+        "{shown}"
+    );
+    assert!(
+        text.contains("no live hypothesis accounts for it"),
+        "{text}"
+    );
+    ok(p, &["archive", &e]);
+    assert_eq!(unexplained(p), []);
+
+    let ids: Vec<String> = (0..7).map(|i| observe(&format!("Seen {i}"))).collect();
+    let listed = unexplained(p);
+    assert_eq!(listed.len(), 7);
+    for id in &ids {
+        assert!(listed.iter().any(|(x, _)| x == id), "{id} in {listed:?}");
+    }
+    let text = ok(p, &["status"]);
+    assert!(
+        text.lines()
+            .next()
+            .unwrap()
+            .contains("7 unexplained observations"),
+        "{text}"
+    );
+    let shown = text.lines().filter(|l| l.starts_with("  E-")).count();
+    assert_eq!(shown, 5, "{text}");
+    assert!(
+        text.contains("(2 more; hyp --json status lists all)"),
+        "{text}"
+    );
+}
+
+/// HYPO-0091 review: an observation is explained only while a live
+/// hypothesis (not archived, not falsified) accounts for it, i.e. it counts
+/// for or qualifies that hypothesis through some active link. One that only
+/// counts against live hypotheses, or whose explanations are all falsified,
+/// is unexplained again.
+#[test]
+fn only_a_live_hypothesis_it_counts_for_or_qualifies_explains_an_observation() {
+    let dir = TempDir::new().unwrap();
+    let p = dir.path();
+    ok(p, &["init"]);
+    let observe = |title: &str| first_line(ok(p, &["observe", title, "--source", "log"]));
+    let sorted = |mut ids: Vec<&String>| -> Vec<String> {
+        ids.sort();
+        ids.into_iter().cloned().collect()
+    };
+    let unexplained_ids = || -> Vec<String> {
+        let mut ids: Vec<String> = unexplained(p).into_iter().map(|(id, _)| id).collect();
+        ids.sort();
+        ids
+    };
+    // Supported by a live hypothesis: explained.
+    let seen = observe("Fan at 100% under no load");
+    let h = first_line(ok(p, &["add", "Dust clogs the fan", "--explains", &seen]));
+    assert_eq!(unexplained_ids(), Vec::<String>::new());
+    // Qualifying a live hypothesis also accounts for it.
+    let partial = observe("Fan loud only after an hour");
+    ok(
+        p,
+        &[
+            "link",
+            &partial,
+            &h,
+            "--relation",
+            "qualifies",
+            "--reason",
+            "Dust builds up slowly",
+        ],
+    );
+    assert_eq!(unexplained_ids(), Vec::<String>::new());
+    // Only against a live hypothesis: unexplained.
+    let against = observe("Fan loud right after cleaning");
+    ok(
+        p,
+        &[
+            "link",
+            &against,
+            &h,
+            "--relation",
+            "contradicts",
+            "--reason",
+            "No dust left",
+        ],
+    );
+    assert_eq!(unexplained_ids(), std::slice::from_ref(&against));
+    // Its explanation falsified: unexplained again, and so is the evidence
+    // that falsified it, which bears on no live hypothesis.
+    let f = first_line(ok(p, &["falsify-if", &h, "Loud with a new, clean fan"]));
+    let met = first_line(ok(
+        p,
+        &[
+            "evidence",
+            "add",
+            &f,
+            "New fan just as loud",
+            "--source",
+            "bench",
+        ],
+    ));
+    let token = shown_token(p, &h);
+    ok(
+        p,
+        &[
+            "assess",
+            &h,
+            "--reviewed",
+            &token,
+            "--status",
+            "falsified",
+            "--criterion",
+            &f,
+            "--evidence",
+            &met,
+            "--reason",
+            "A clean fan is as loud",
+        ],
+    );
+    assert_eq!(
+        unexplained_ids(),
+        sorted(vec![&seen, &partial, &against, &met])
+    );
+    let text = ok(p, &["show", &seen]);
+    assert!(
+        text.contains("no live hypothesis accounts for it"),
+        "{text}"
+    );
+    // A live rival that they support or qualify explains them again.
+    let rival = first_line(ok(
+        p,
+        &[
+            "add",
+            "The fan curve is misconfigured",
+            "--explains",
+            &format!("{seen},{met}"),
+        ],
+    ));
+    assert_eq!(unexplained_ids(), sorted(vec![&partial, &against]));
+    let shown: serde_json::Value =
+        serde_json::from_str(&ok(p, &["--json", "show", &seen])).unwrap();
+    let judgments: std::collections::BTreeMap<&str, &str> = shown["bears_on"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| {
+            (
+                b["hypothesis"].as_str().unwrap(),
+                b["judgment"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        judgments,
+        [(h.as_str(), "falsified"), (rival.as_str(), "untested")]
+            .into_iter()
+            .collect(),
+        "{shown}"
+    );
+    let text = ok(p, &["show", &seen]);
+    assert!(
+        text.contains(&format!(
+            "  {h}  for · falsified · draft  Dust clogs the fan"
+        )),
+        "{text}"
+    );
 }
