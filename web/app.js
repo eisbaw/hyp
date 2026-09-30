@@ -10,6 +10,8 @@ const esc = (v) =>
   );
 const short = (id) => String(id).slice(0, 10).toUpperCase();
 const human = (s) => String(s ?? "").replaceAll("_", " ");
+// A relation as `hyp link --relation` spells it: competes_with -> competes-with.
+const relationName = (s) => String(s ?? "").replaceAll("_", "-");
 const readOnly = !!window.HYP_EXPORT;
 let snapshot = null,
   token = "",
@@ -298,7 +300,7 @@ function bindFilters() {
 function card({ record: r }) {
   const st = state(r.id);
   const rel = related(r.id);
-  return `<article class="card"><div class="card-top"><span class="id">${esc(short(r.id))}</span>${badge(r.kind)}${st ? badge(st.judgment) : ""}${st?.needs_review ? badge("needs review", "review") : ""}${r.archived ? badge("archived") : ""}<span class="badges">${(r.tags || []).map((t) => `<span class="tag">${esc(t)}</span>`).join("")}</span></div><h3>${link(r)}</h3><p class="summary">${esc((r.scope || r.body || r.source || r.conditions || "").slice(0, 210))}</p><div class="card-bottom"><span>${r.kind === "hypothesis" ? `${rel.filter((e) => e.record.kind === "link").length} evidence / relation links &nbsp; · &nbsp; ${rel.filter((e) => e.record.kind === "experiment").length} experiments` : esc(r.source || r.status || r.outcome || r.judgment || human(r.relation || r.kind))}</span><span>${r.lifecycle ? esc(r.lifecycle) + " &nbsp; · &nbsp; " : ""}${esc((r.updated_at || "").slice(0, 10))} <a class="arrow" aria-label="Open ${esc(r.title)}" href="#record/${esc(r.id)}">↗</a></span></div></article>`;
+  return `<article class="card"><div class="card-top"><span class="id">${esc(short(r.id))}</span>${badge(r.kind)}${st ? badge(st.judgment) : ""}${st?.needs_review ? badge("needs review", "review") : ""}${r.archived ? badge("archived") : ""}<span class="badges">${(r.tags || []).map((t) => `<span class="tag">${esc(t)}</span>`).join("")}</span></div><h3>${link(r)}</h3><p class="summary">${esc((r.scope || r.body || r.source || r.conditions || "").slice(0, 210))}</p><div class="card-bottom"><span>${r.kind === "hypothesis" ? `${rel.filter((e) => e.record.kind === "link").length} evidence / relation links &nbsp; · &nbsp; ${rel.filter((e) => e.record.kind === "experiment").length} experiments` : esc(r.source || r.status || r.outcome || r.judgment || (r.relation ? relationName(r.relation) : human(r.kind)))}</span><span>${r.lifecycle ? esc(r.lifecycle) + " &nbsp; · &nbsp; " : ""}${esc((r.updated_at || "").slice(0, 10))} <a class="arrow" aria-label="Open ${esc(r.title)}" href="#record/${esc(r.id)}">↗</a></span></div></article>`;
 }
 function item(e, extra = "") {
   const r = e.record;
@@ -405,7 +407,7 @@ function detail(id) {
       .map((e) =>
         item(
           e,
-          `<p>${esc(human(e.record.relation))} ${find(e.record.to) ? link(find(e.record.to).record) : esc(e.record.to)}</p>`,
+          `<p>${esc(relationName(e.record.relation))} ${find(e.record.to) ? link(find(e.record.to).record) : esc(e.record.to)}</p>`,
         ),
       )
       .join("") || '<p class="small">No hypothesis relationships.</p>'
@@ -456,7 +458,7 @@ function matrix() {
                       l.record.from === e.record.id &&
                       targets.includes(l.record.to),
                   );
-                  return `<td>${ls.map((l) => `<a title="${esc(l.record.body)}" href="#record/${esc(l.record.id)}">${badge(l.record.relation)}</a>`).join("") || '<span class="small">—</span>'}</td>`;
+                  return `<td>${ls.map((l) => `<a title="${esc(l.record.body)}" href="#record/${esc(l.record.id)}">${badge(relationName(l.record.relation), l.record.relation)}</a>`).join("") || '<span class="small">—</span>'}</td>`;
                 })
                 .join("")}</tr>`,
           )
@@ -534,7 +536,7 @@ function graph() {
           : l.relation === "qualifies"
             ? "#a697b8"
             : "#91a58c";
-      return `<path d="M${x1} ${y1} C${(x1 + x2) / 2} ${y1},${(x1 + x2) / 2} ${y2},${x2} ${y2}" stroke="${color}" stroke-width="1.5" fill="none"><title>${esc(human(l.relation))}</title></path>`;
+      return `<path d="M${x1} ${y1} C${(x1 + x2) / 2} ${y1},${(x1 + x2) / 2} ${y2},${x2} ${y2}" stroke="${color}" stroke-width="1.5" fill="none"><title>${esc(relationName(l.relation))}</title></path>`;
     })
     .join("");
   const svg = nodes
@@ -674,7 +676,12 @@ function formFields(kind, owner, r = {}) {
       .map((e) => [e.record.id, short(e.record.id) + " · " + e.record.title]);
     f +=
       select("from", "From", opts, r.from || owner) +
-      select("relation", "Relation", relations, r.relation || "supports") +
+      select(
+        "relation",
+        "Relation",
+        relations.map((r) => [r, relationName(r)]),
+        r.relation || "supports",
+      ) +
       select("to", "To", opts, r.to || "");
   }
   if (kind === "experiment") {

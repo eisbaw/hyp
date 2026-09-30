@@ -21,8 +21,16 @@ use std::{
     about = "Hypothesis tracking for coding and research agents: plain files in any directory, Git-friendly"
 )]
 pub struct Cli {
-    #[arg(long, global = true, default_value = ".")]
+    /// The project directory; hyp searches upward from here (default: .).
+    #[arg(
+        long,
+        global = true,
+        value_name = "DIR",
+        default_value = ".",
+        hide_default_value = true
+    )]
     pub project: PathBuf,
+    /// Machine-readable output; errors as {"error": "..."} on stderr.
     #[arg(long, global = true)]
     pub json: bool,
     #[command(subcommand)]
@@ -81,10 +89,16 @@ impl Cli {
 fn listed_kind(kind: Option<Kind>, all: bool) -> Option<Kind> {
     (!all).then_some(kind.unwrap_or(Kind::Hypothesis))
 }
+/// Help for a TITLE argument that `titled` reads.
+const TITLE: &str = "One line; '-' reads stdin: its first line is the title, \
+                     the rest is appended to the body";
+/// Help for a hypothesis ID argument.
+const HYPOTHESIS: &str = "The hypothesis: an H- ID or unique prefix of one";
 #[derive(Subcommand)]
 pub enum Command {
-    /// Create a project, optionally populated with a firmware debugging example.
+    /// Create a project here, optionally with an example notebook.
     Init {
+        /// Populate it with a firmware debugging example (synthetic data).
         #[arg(long)]
         demo: bool,
         /// Also install the hyp skill for these coding agents (see `hyp agents`):
@@ -92,65 +106,98 @@ pub enum Command {
         #[arg(long, value_name = "LIST", value_parser = parse_init_agents)]
         agents: Option<AgentList>,
     },
-    /// Teach coding agents to use hyp: print the hyp skill, or install it
-    /// as a project skill for Claude Code (.claude/skills/hyp/SKILL.md) and
-    /// Codex (.agents/skills/hyp/SKILL.md).
+    /// Print or install the hyp skill for coding agents.
+    ///
+    /// Installs it as a project skill for Claude Code
+    /// (.claude/skills/hyp/SKILL.md) and Codex (.agents/skills/hyp/SKILL.md).
     Agents {
         #[command(subcommand)]
         command: AgentsCommand,
     },
-    /// Capture a hypothesis. Use '-' as text to read stdin.
+    /// Capture a hypothesis: a claim that could turn out wrong.
     Add {
+        /// The claim. One line; '-' reads stdin: its first line is the
+        /// title, the rest is appended to the body.
         title: String,
-        #[arg(long, default_value = "")]
+        /// Details and context ('-' reads stdin).
+        #[arg(long, default_value = "", hide_default_value = true)]
         body: String,
-        #[arg(long, default_value = "")]
+        /// Where the claim is meant to hold: system, version, conditions.
+        #[arg(long, default_value = "", hide_default_value = true)]
         scope: String,
-        #[arg(long, value_delimiter = ',')]
+        /// Comma-separated tags (also --tag).
+        #[arg(long, alias = "tag", value_delimiter = ',')]
         tags: Vec<String>,
     },
+    /// Add a prediction: what the hypothesis says you will observe.
     Predict {
+        #[arg(help = HYPOTHESIS)]
         hypothesis: String,
+        /// The expected observation. One line; '-' reads stdin: its first
+        /// line is the title, the rest is appended to the body.
         title: String,
-        #[arg(long, default_value = "")]
+        /// When the prediction applies.
+        #[arg(long, default_value = "", hide_default_value = true)]
         conditions: String,
     },
+    /// Add a falsification criterion: what would refute the hypothesis.
     FalsifyIf {
+        #[arg(help = HYPOTHESIS)]
         hypothesis: String,
+        /// The refuting observation. One line; '-' reads stdin: its first
+        /// line is the title, the rest is appended to the body.
         title: String,
     },
+    /// Note a gap: an open question about a hypothesis.
     Gap {
+        #[arg(help = HYPOTHESIS)]
         hypothesis: String,
+        #[arg(help = TITLE)]
         title: String,
     },
+    /// Record evidence and link it to a claim, or attach files to it.
     Evidence {
         #[command(subcommand)]
         command: EvidenceCommand,
     },
+    /// Plan an experiment that tests a hypothesis.
     Experiment {
         #[command(subcommand)]
         command: ExperimentCommand,
     },
+    /// Record a run of an experiment and its outcome.
     Run {
+        /// The experiment: an X- ID or unique prefix of one.
         experiment: String,
+        #[arg(help = TITLE)]
         title: String,
+        /// How the run went.
         #[arg(long, value_enum, default_value = "observed")]
         outcome: Outcome,
+        /// Comma-separated E- IDs of the evidence it produced.
         #[arg(long, value_delimiter = ',')]
         evidence: Vec<String>,
-        #[arg(long, default_value = "")]
+        /// What was done and seen ('-' reads stdin).
+        #[arg(long, default_value = "", hide_default_value = true)]
         body: String,
     },
+    /// Link evidence to a claim, or relate two hypotheses.
     Link {
+        /// The E- evidence, or the H- hypothesis the relation starts at.
         from: String,
+        /// The H-, P- or F- record it bears on, or the other H- hypothesis.
         to: String,
+        /// supports, contradicts, qualifies: evidence to a claim;
+        /// depends-on, competes-with, supersedes: between hypotheses.
         #[arg(long, value_enum)]
         relation: Relation,
+        /// Why the link holds ('-' reads stdin).
         #[arg(long)]
         reason: String,
     },
     /// Record a judgment of a hypothesis, based on the state you reviewed.
     Assess {
+        #[arg(help = HYPOTHESIS)]
         hypothesis: String,
         /// The review token of the hypothesis state you reviewed:
         /// .state.review_token of `hyp --json show H-…` (or `hyp --json list`).
@@ -159,40 +206,57 @@ pub enum Command {
         /// is written and the command exits 3: review the change and assess again.
         #[arg(long, value_name = "TOKEN")]
         reviewed: String,
+        /// The judgment.
         #[arg(long, value_enum)]
         status: Judgment,
+        /// Subjective confidence in the judgment, 0.0 to 1.0.
         #[arg(long)]
         confidence: Option<f64>,
         /// Evidence already linked to the hypothesis or its criteria or
         /// predictions (`hyp link` first). Required unless --status untested.
         #[arg(long, value_delimiter = ',')]
         evidence: Vec<String>,
+        /// The F- criterion the evidence meets (required for falsified).
         #[arg(long)]
         criterion: Option<String>,
+        /// The rationale ('-' reads stdin).
         #[arg(long)]
         reason: String,
     },
-    /// Change lifecycle, experiment status, title, notes or tags.
+    /// Change a record's title, body, tags, lifecycle or status.
     Set {
+        /// The record: an ID or unique prefix.
         id: String,
+        /// The new title. One line; '-' reads stdin: its first line is the
+        /// title, the rest is appended to the body.
         #[arg(long)]
         title: Option<String>,
+        /// The new body, replacing the old one ('-' reads stdin).
         #[arg(long)]
         body: Option<String>,
+        /// A hypothesis's lifecycle; investigating needs an active criterion
+        /// or --untestable-reason.
         #[arg(long, value_enum)]
         lifecycle: Option<Lifecycle>,
+        /// Why a hypothesis cannot be tested (instead of a criterion).
         #[arg(long)]
         untestable_reason: Option<String>,
+        /// An experiment's status.
         #[arg(long, value_enum)]
         experiment_status: Option<ExperimentStatus>,
-        #[arg(long, value_delimiter = ',')]
+        /// Comma-separated tags, replacing the old ones (also --tag).
+        #[arg(long, alias = "tag", value_delimiter = ',')]
         tags: Option<Vec<String>>,
+        /// Whether a gap is resolved.
         #[arg(long)]
         resolved: Option<bool>,
     },
-    /// Show a record. Plain output is a summary for people (for a
-    /// hypothesis with its review token); --json is the complete form.
+    /// Show a record; --json gives the complete form.
+    ///
+    /// Plain output is a summary for people (for a hypothesis with its review
+    /// token); --json is the complete form.
     Show {
+        /// The record: an ID or unique prefix.
         id: String,
     },
     /// List hypotheses (by default), or records of another kind.
@@ -207,55 +271,116 @@ pub enum Command {
         /// (experiments: add --kind experiment).
         #[arg(long, value_parser = PossibleValuesParser::new(status_values()).map(|s| Status::parse(&s)))]
         status: Option<Status>,
-        #[arg(long)]
+        /// Only records with this tag (also --tags).
+        #[arg(long, alias = "tags")]
         tag: Option<String>,
+        /// Only hypotheses whose basis changed since their assessment.
         #[arg(long)]
         needs_review: bool,
+        /// Include archived records.
         #[arg(long)]
         archived: bool,
     },
+    /// List records containing a text, in any field.
     Search {
+        /// The text, matched case-insensitively.
         query: String,
     },
+    /// Edit a record's file in $VISUAL or $EDITOR.
     Edit {
+        /// The record: an ID or unique prefix.
         id: String,
     },
+    /// Archive a record: hide it from lists and the graph.
     Archive {
+        /// The record: an ID or unique prefix.
         id: String,
     },
+    /// Restore an archived record.
     Restore {
+        /// The record: an ID or unique prefix.
         id: String,
     },
-    /// Permanently delete an archived, unreferenced object.
+    /// Permanently delete an archived, unreferenced record.
     Delete {
+        /// The record: an ID or unique prefix.
         id: String,
     },
-    /// Apply a JSON array of create/update/archive/delete changes from stdin.
-    /// Each states what it depends on: `expected_revision`, or for creating an
-    /// assessment, experiment or run an `expected` object (see the README).
+    /// Apply a batch of changes, a JSON array on stdin.
+    ///
+    /// All or nothing. Each change states what it depends on: its
+    /// `expected_revision`, or for creating an assessment, experiment or run
+    /// an `expected` object.
+    #[command(after_long_help = APPLY_HELP)]
     Apply {
-        #[arg(long)]
+        /// Apply only if the project is still at this revision (the
+        /// "revision" a --json write printed).
+        #[arg(long, value_name = "REVISION")]
         expected_revision: Option<String>,
     },
+    /// Validate every record; report problems and repairs.
     Check {
+        /// Fail on warnings too, not only on errors.
         #[arg(long)]
         strict: bool,
     },
+    /// Serve the local web UI on 127.0.0.1.
     Web {
+        /// The port to listen on.
         #[arg(long, default_value_t = 7432)]
         port: u16,
     },
+    /// Print a Mermaid flowchart of the records and their links.
     Graph {
-        #[arg(long)]
+        /// Only this record and the records it refers to or that refer to it.
+        #[arg(long, value_name = "ID")]
         focus: Option<String>,
     },
+    /// Export the whole project as Markdown, JSON or HTML.
     Export {
+        /// The output format.
         #[arg(long,default_value="markdown",value_parser=["markdown","json","html"])]
         format: String,
+        /// Write to this file instead of stdout.
         #[arg(long)]
         output: Option<PathBuf>,
     },
 }
+/// The long help of `hyp apply`: enough to write a batch without the README.
+const APPLY_HELP: &str = r#"Changes:
+  {"op": "create",  "record": RECORD}
+  {"op": "update",  "record": RECORD, "expected_revision": REV}
+  {"op": "archive", "id": ID, "archived": true, "expected_revision": REV}
+  {"op": "delete",  "id": ID, "expected_revision": REV}
+
+RECORD is a record as `hyp --json show ID` prints it (.entry.record): "kind",
+"title", optional "body" and "tags", and the fields of its kind. An update
+gives the whole record as read, changed. A create may set "id" to a new full
+<letter>-<UUID> ID, so later changes in the batch can refer to it. REV is
+.entry.revision of `hyp --json show ID`, or a revision a --json write printed.
+"archived": false restores. Use full IDs, not prefixes.
+
+Create a hypothesis, archive a prediction:
+  [{"op": "create", "record": {"kind": "hypothesis", "lifecycle": "draft",
+     "title": "The cache causes the timeouts"}},
+   {"op": "archive", "id": "P-…", "archived": true, "expected_revision": "…"}]
+
+Creating an assessment, experiment or run states in "expected" what it was
+based on; if that changed since, nothing is written and hyp exits 3. An
+assessment states its hypothesis's .state.review_token (`hyp --json show H-…`)
+and cites only evidence linked to the hypothesis or its criteria or
+predictions; every judgment except untested cites some, and falsified also a
+"criterion": "F-…":
+  [{"op": "create",
+    "record": {"kind": "assessment", "title": "Weakened", "body": "Why …",
+               "hypothesis": "H-…", "judgment": "weakened",
+               "confidence": 0.3, "evidence": ["E-…"]},
+    "expected": {"hypotheses": {"H-…": {"review_token": "…"}}}}]
+
+An experiment ("hypothesis", "status", "targets": [{"id": "H-…"}, {"id":
+"P-…"}], its hypothesis among them) states the revision of every target, a run
+("experiment", "outcome", "evidence") those of its experiment and evidence:
+  "expected": {"revisions": {"H-…": "…", "P-…": "…"}}"#;
 /// A `hyp list --status` value: judgments and lifecycles apply to
 /// hypotheses, experiment statuses to experiments.
 #[derive(Clone, Copy)]
@@ -339,6 +464,7 @@ pub enum AgentsCommand {
 }
 #[derive(clap::Args)]
 pub struct AgentsArgs {
+    /// Comma-separated coding agents.
     #[arg(
         long,
         value_enum,
@@ -354,35 +480,54 @@ pub struct AgentsArgs {
 }
 #[derive(Subcommand)]
 pub enum EvidenceCommand {
+    /// Record evidence and link it to the claim it bears on.
     Add {
+        /// The H-, P- or F- record it bears on: an ID or unique prefix.
         hypothesis: String,
+        /// The observation. One line; '-' reads stdin: its first line is
+        /// the title, the rest is appended to the body.
         title: String,
+        /// Where it comes from: a file, URL, command or log.
         #[arg(long)]
         source: String,
-        #[arg(long, default_value = "")]
+        /// Where in the source: a line, timestamp or page.
+        #[arg(long, default_value = "", hide_default_value = true)]
         locator: String,
+        /// It contradicts the claim (default: supports).
         #[arg(long)]
         against: bool,
+        /// It qualifies the claim: neither supports nor contradicts it.
         #[arg(long, conflicts_with = "against")]
         qualifies: bool,
-        #[arg(long, default_value = "")]
+        /// Why it bears on the claim (default: the title; '-' reads stdin).
+        #[arg(long, default_value = "", hide_default_value = true)]
         reason: String,
-        #[arg(long, default_value = "")]
+        /// The observation in detail ('-' reads stdin).
+        #[arg(long, default_value = "", hide_default_value = true)]
         body: String,
     },
+    /// Copy a file into the project and attach it to evidence.
     Attach {
+        /// The evidence: an E- ID or unique prefix.
         id: String,
+        /// The file (at most 32 MiB).
         path: PathBuf,
     },
 }
 #[derive(Subcommand)]
 pub enum ExperimentCommand {
+    /// Plan an experiment; its targets are frozen as they are now.
     Add {
+        #[arg(help = HYPOTHESIS)]
         hypothesis: String,
+        /// What the experiment does. One line; '-' reads stdin: its first
+        /// line is the title, the rest is appended to the body.
         title: String,
+        /// Comma-separated F-/P- IDs it tests (the hypothesis always is a target).
         #[arg(long, value_delimiter = ',')]
         targets: Vec<String>,
-        #[arg(long, default_value = "")]
+        /// The procedure ('-' reads stdin).
+        #[arg(long, default_value = "", hide_default_value = true)]
         body: String,
     },
 }
@@ -415,23 +560,72 @@ fn print_written(written: &[Written], after: &Snapshot, json: bool) -> Result<()
 fn print_committed(c: &Committed, json: bool) -> Result<()> {
     print_written(&c.written, &c.snapshot, json)
 }
-fn ids(s: &Snapshot, ids: &[String]) -> Result<Vec<String>> {
-    ids.iter()
-        .map(|id| s.find(id).map(|e| e.record.id.clone()))
-        .collect()
+/// A TITLE argument: the text, or with '-' the first line of stdin and the
+/// lines after it, which go to the body. A given text is kept as it is: a
+/// newline in it fails validation.
+fn title_input(title: String) -> Result<(String, String)> {
+    if title != "-" {
+        return Ok((title, String::new()));
+    }
+    let text = input(title)?;
+    let text = text.trim_start();
+    let (first, rest) = text.split_once('\n').unwrap_or((text, ""));
+    Ok((
+        first.trim_end().to_string(),
+        rest.trim_start_matches(['\n', '\r']).to_string(),
+    ))
+}
+/// `body`, then `more` after a blank line.
+fn joined(body: String, more: String) -> String {
+    match (body.is_empty(), more.is_empty()) {
+        (_, true) => body,
+        (true, false) => more,
+        (false, false) => format!("{body}\n\n{more}"),
+    }
+}
+/// A new record from a TITLE argument and a --body argument (or "").
+fn titled(title: String, body: String, data: Data) -> Result<Record> {
+    let (title, more) = title_input(title)?;
+    let mut r = Record::new(title, data);
+    r.body = joined(input(body)?, more);
+    Ok(r)
+}
+/// The full ID of the record that argument `arg` (`<NAME>` or `--flag`)
+/// names, which must be of one of `kinds`.
+fn find_kind(s: &Snapshot, arg: &str, id: &str, kinds: &[Kind]) -> Result<String> {
+    let e = s.find(id).with_context(|| format!("argument {arg}"))?;
+    let kind = e.record.data.kind_value();
+    if !kinds.contains(&kind) {
+        let names: Vec<&str> = kinds.iter().map(|k| k.as_str()).collect();
+        let expected = match names.split_last() {
+            Some((last, [])) => last.to_string(),
+            Some((last, init)) => format!("{} or {last}", init.join(", ")),
+            None => unreachable!("no kinds given"),
+        };
+        // "evidence" is a mass noun: "expected evidence", not "an evidence".
+        let a = match kinds[0] {
+            Kind::Evidence => String::new(),
+            k => format!("{} ", article(k.as_str())),
+        };
+        anyhow::bail!(
+            "argument {arg}: expected {a}{expected}, got {kind} {}",
+            e.record.id
+        );
+    }
+    Ok(e.record.id.clone())
+}
+fn find_all(s: &Snapshot, arg: &str, ids: &[String], kinds: &[Kind]) -> Result<Vec<String>> {
+    ids.iter().map(|id| find_kind(s, arg, id, kinds)).collect()
 }
 /// A create with its preconditions stated from `s`, the snapshot the command read.
 fn create(s: &Snapshot, r: Record) -> Change {
     Change::create_seen(r, s)
 }
 fn hypothesis(s: &Snapshot, id: &str) -> Result<String> {
-    let e = s.find(id)?;
-    ensure!(
-        matches!(e.record.data, Data::Hypothesis { .. }),
-        "expected a hypothesis"
-    );
-    Ok(e.record.id.clone())
+    find_kind(s, "<HYPOTHESIS>", id, &[Kind::Hypothesis])
 }
+/// What evidence bears on, and what an experiment tests.
+const CLAIM: [Kind; 3] = [Kind::Hypothesis, Kind::Prediction, Kind::Criterion];
 fn print_steps(steps: &[agents::Step], json: bool) -> Result<()> {
     if json {
         return print_json(&steps);
@@ -464,6 +658,10 @@ pub async fn run(cli: Cli) -> Result<()> {
         } else {
             println!("Initialized {}", store.root.display());
             print_steps(&steps, false)?;
+            println!(
+                "Next: hyp add \"<claim>\", then hyp falsify-if H-… \"<what would refute it>\"; \
+                 hyp agents install teaches coding agents to use hyp"
+            );
         }
         return Ok(());
     }
@@ -496,16 +694,16 @@ pub async fn run(cli: Cli) -> Result<()> {
             scope,
             tags,
         } => {
-            let mut r = Record::new(
-                input(title)?,
+            let mut r = titled(
+                title,
+                body,
                 Data::Hypothesis {
                     scope,
                     assumptions: String::new(),
                     lifecycle: Lifecycle::Draft,
                     untestable_reason: String::new(),
                 },
-            );
-            r.body = input(body)?;
+            )?;
             r.tags = tags;
             changes.push(create(&s, r));
         }
@@ -515,38 +713,41 @@ pub async fn run(cli: Cli) -> Result<()> {
             conditions,
         } => changes.push(create(
             &s,
-            Record::new(
-                input(title)?,
+            titled(
+                title,
+                String::new(),
                 Data::Prediction {
                     hypothesis: hypothesis(&s, &h)?,
                     conditions,
                 },
-            ),
+            )?,
         )),
         Command::FalsifyIf {
             hypothesis: h,
             title,
         } => changes.push(create(
             &s,
-            Record::new(
-                input(title)?,
+            titled(
+                title,
+                String::new(),
                 Data::Criterion {
                     hypothesis: hypothesis(&s, &h)?,
                 },
-            ),
+            )?,
         )),
         Command::Gap {
             hypothesis: h,
             title,
         } => changes.push(create(
             &s,
-            Record::new(
-                input(title)?,
+            titled(
+                title,
+                String::new(),
                 Data::Gap {
                     hypothesis: hypothesis(&s, &h)?,
                     resolved: false,
                 },
-            ),
+            )?,
         )),
         Command::Evidence { command } => match command {
             EvidenceCommand::Add {
@@ -559,17 +760,17 @@ pub async fn run(cli: Cli) -> Result<()> {
                 reason,
                 body,
             } => {
-                let target = s.find(&h)?.record.id.clone();
-                let mut r = Record::new(
-                    input(title)?,
+                let target = find_kind(&s, "<HYPOTHESIS>", &h, &CLAIM)?;
+                let r = titled(
+                    title,
+                    body,
                     Data::Evidence {
                         source,
                         locator,
                         observed_at: chrono::Utc::now().to_rfc3339(),
                         attachments: vec![],
                     },
-                );
-                r.body = input(body)?;
+                )?;
                 let mut l = Record::new(
                     format!("Evidence for {}", &target[..10]),
                     Data::Link {
@@ -604,18 +805,20 @@ pub async fn run(cli: Cli) -> Result<()> {
                     body,
                 },
         } => {
-            let mut r = Record::new(
-                input(title)?,
+            let hypothesis = hypothesis(&s, &h)?;
+            let targets = find_all(&s, "--targets", &targets, &CLAIM)?
+                .iter()
+                .map(|id| s.find(id).map(Entry::frozen))
+                .collect::<Result<_>>()?;
+            let r = titled(
+                title,
+                body,
                 Data::Experiment {
-                    hypothesis: hypothesis(&s, &h)?,
-                    targets: targets
-                        .iter()
-                        .map(|id| s.find(id).map(Entry::frozen))
-                        .collect::<Result<_>>()?,
+                    hypothesis,
+                    targets,
                     status: ExperimentStatus::Planned,
                 },
-            );
-            r.body = input(body)?;
+            )?;
             changes.push(create(&s, r));
         }
         Command::Run {
@@ -625,17 +828,22 @@ pub async fn run(cli: Cli) -> Result<()> {
             evidence,
             body,
         } => {
-            let e = s.find(&experiment)?;
-            let mut r = Record::new(
-                input(title)?,
+            let e = s.find(&find_kind(
+                &s,
+                "<EXPERIMENT>",
+                &experiment,
+                &[Kind::Experiment],
+            )?)?;
+            let r = titled(
+                title,
+                body,
                 Data::Run {
                     experiment: e.record.id.clone(),
                     plan: e.frozen(),
                     outcome,
-                    evidence: ids(&s, &evidence)?,
+                    evidence: find_all(&s, "--evidence", &evidence, &[Kind::Evidence])?,
                 },
-            );
-            r.body = input(body)?;
+            )?;
             changes.push(create(&s, r));
         }
         Command::Link {
@@ -647,8 +855,8 @@ pub async fn run(cli: Cli) -> Result<()> {
             let mut r = Record::new(
                 format!("{from} {relation} {to}"),
                 Data::Link {
-                    from: s.find(&from)?.record.id.clone(),
-                    to: s.find(&to)?.record.id.clone(),
+                    from: find_kind(&s, "<FROM>", &from, &[Kind::Evidence, Kind::Hypothesis])?,
+                    to: find_kind(&s, "<TO>", &to, &CLAIM)?,
                     relation,
                 },
             );
@@ -689,9 +897,9 @@ pub async fn run(cli: Cli) -> Result<()> {
                     hypothesis: h.clone(),
                     judgment: status,
                     confidence,
-                    evidence: ids(&s, &evidence)?,
+                    evidence: find_all(&s, "--evidence", &evidence, &[Kind::Evidence])?,
                     criterion: criterion
-                        .map(|c| s.find(&c).map(|e| e.record.id.clone()))
+                        .map(|c| find_kind(&s, "--criterion", &c, &[Kind::Criterion]))
                         .transpose()?,
                     based_on: String::new(),
                     supersedes: vec![],
@@ -712,11 +920,13 @@ pub async fn run(cli: Cli) -> Result<()> {
         } => {
             let e = s.find(&id)?;
             let mut r = e.record.clone();
-            if let Some(t) = title {
-                r.title = input(t)?;
-            }
             if let Some(b) = body {
                 r.body = input(b)?;
+            }
+            if let Some(t) = title {
+                let (title, more) = title_input(t)?;
+                r.title = title;
+                r.body = joined(std::mem::take(&mut r.body), more);
             }
             if let Some(t) = tags {
                 r.tags = t;
@@ -904,7 +1114,10 @@ pub async fn run(cli: Cli) -> Result<()> {
                         }
                     }
                 }
-                println!("Checked {} objects", s.objects.len());
+                match s.objects.len() {
+                    1 => println!("Checked 1 object"),
+                    n => println!("Checked {n} objects"),
+                }
             }
             ensure!(
                 !s.diagnostics
@@ -1062,9 +1275,14 @@ pub fn markdown(s: &Snapshot) -> String {
                 state.judgment, state.needs_review
             ));
         }
+        let mut data = serde_yaml::to_value(&e.record.data).unwrap_or_default();
+        // As `hyp link --relation` spells it, not as stored.
+        if let Data::Link { relation, .. } = &e.record.data {
+            data["relation"] = relation.as_str().into();
+        }
         out.push_str(&format!(
             "```yaml\n{}```\n\n",
-            serde_yaml::to_string(&e.record.data).unwrap_or_default()
+            serde_yaml::to_string(&data).unwrap_or_default()
         ));
     }
     out

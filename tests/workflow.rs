@@ -685,18 +685,22 @@ fn archived_references_still_prevent_deletion() {
             None,
         )
         .unwrap();
+    let err = store
+        .commit(
+            vec![Change::Delete {
+                id: e.id.clone(),
+                expected_revision: s.find(&e.id).unwrap().revision.clone(),
+            }],
+            None,
+        )
+        .unwrap_err()
+        .to_string();
     assert!(
-        store
-            .commit(
-                vec![Change::Delete {
-                    id: e.id.clone(),
-                    expected_revision: s.find(&e.id).unwrap().revision.clone()
-                }],
-                None
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("referenced")
+        err.contains(&format!(
+            "cannot delete {}: these records refer to it",
+            e.id
+        )) && err.contains(&l.id),
+        "{err}"
     );
 }
 #[test]

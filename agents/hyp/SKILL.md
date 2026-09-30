@@ -141,8 +141,8 @@ record may still be arriving from a sync or merge: prefer restoring it over
 deleting what references it, because a delete cannot be undone without
 version control. A malformed or invalid file must be restored or fixed by
 hand. For batches, `hyp apply` takes a JSON
-array of changes on stdin; each states what it depends on (see
-`hyp apply --help` and the hyp README).
+array of changes on stdin; each states what it depends on. `hyp apply --help`
+shows the change formats with examples, including an assessment.
 
 ## Example
 

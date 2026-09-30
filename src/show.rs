@@ -78,11 +78,6 @@ fn active<'a>(
 fn archived(e: &Entry) -> &'static str {
     if e.record.archived { " [archived]" } else { "" }
 }
-/// A relation as `hyp link --relation` spells it (`competes-with`).
-fn cli_name(relation: Relation) -> String {
-    clap::ValueEnum::to_possible_value(&relation)
-        .map_or_else(|| relation.to_string(), |v| v.get_name().to_string())
-}
 fn title_of<'a>(s: &'a Snapshot, id: &str) -> &'a str {
     s.get(id).map_or("", |e| e.record.title.as_str())
 }
@@ -131,9 +126,13 @@ pub fn plain(s: &Snapshot, e: &Entry) -> String {
             hypothesis(&mut out, s, &r.id, &state.assessment_ids);
         }
         (data, _) => {
-            if let serde_json::Value::Object(fields) =
+            if let serde_json::Value::Object(mut fields) =
                 serde_json::to_value(data).unwrap_or_default()
             {
+                // As `hyp link --relation` spells it, not as stored.
+                if let Data::Link { relation, .. } = data {
+                    fields.insert("relation".into(), relation.as_str().into());
+                }
                 for (name, v) in &fields {
                     if name == "kind" {
                         continue;
@@ -252,7 +251,7 @@ fn hypothesis(out: &mut Vec<String>, s: &Snapshot, h: &str, current: &[String]) 
             field(&mut group, "      ", "reason", reason);
         }
         if !group.is_empty() {
-            evidence.push(format!("  {}", cli_name(relation)));
+            evidence.push(format!("  {relation}"));
             evidence.extend(group);
         }
     }
@@ -300,7 +299,6 @@ fn hypothesis(out: &mut Vec<String>, s: &Snapshot, h: &str, current: &[String]) 
         let Data::Link { from, to, relation } = &l.record.data else {
             continue;
         };
-        let relation = cli_name(*relation);
         let line = if from == h && s.hypotheses.contains_key(to) {
             format!("  {relation} {to}  {}", title_of(s, to))
         } else if to == h && s.hypotheses.contains_key(from) {

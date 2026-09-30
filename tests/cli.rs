@@ -1386,7 +1386,7 @@ fn merged_dependency_cycle_is_repaired_with_the_suggested_archive() {
     for id in [&ours, &theirs] {
         assert!(
             stdout.contains(&format!(
-                "error hyp/links/{id}.md: depends_on cycle detected\n  \
+                "error hyp/links/{id}.md: depends-on cycle detected\n  \
                  note: Archiving any one link of the cycle breaks it.\n  \
                  repair: hyp archive {id}\n"
             )),
@@ -1408,7 +1408,7 @@ fn merged_dependency_cycle_is_repaired_with_the_suggested_archive() {
     fails(
         p,
         &["link", &b, &a, "--relation", "depends-on", "--reason", "r"],
-        "depends_on cycle detected",
+        "depends-on cycle detected",
     );
     fails(
         p,
@@ -1615,7 +1615,7 @@ fn replacing_a_known_violation_with_another_is_rejected() {
     let out = apply(p, false, &[], &update.to_string());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "{stderr}");
-    assert!(stderr.contains("depends_on cycle detected"), "{stderr}");
+    assert!(stderr.contains("depends-on cycle detected"), "{stderr}");
     assert_eq!(codes(&diagnostics_of(p, &path)), ["dangling_reference"]);
 }
 
@@ -1650,5 +1650,293 @@ fn a_stored_short_reference_is_invalid_regardless_of_other_records() {
         p,
         &["add", "Other"],
         "1 error blocks writes (1 more does not); run hyp check",
+    );
+}
+
+/// Runs hyp with `input` on stdin.
+fn with_stdin(project: &Path, args: &[&str], input: &str) -> Output {
+    use std::io::Write;
+    let mut child = hyp(project)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+fn record(p: &Path, id: &str) -> serde_json::Value {
+    let shown: serde_json::Value = serde_json::from_str(&ok(p, &["--json", "show", id])).unwrap();
+    shown["entry"]["record"].clone()
+}
+
+#[test]
+fn a_title_is_one_line_and_stdin_lines_after_it_go_to_the_body() {
+    let dir = TempDir::new().unwrap();
+    let p = dir.path();
+    ok(p, &["init"]);
+    let out = with_stdin(
+        p,
+        &["add", "-", "--body", "Given body"],
+        "Cron starts two backups\nsecond line\nthird line\n",
+    );
+    assert!(out.status.success(), "{out:?}");
+    let h = String::from_utf8(out.stdout).unwrap().trim().to_string();
+    let r = record(p, &h);
+    assert_eq!(r["title"], "Cron starts two backups");
+    assert_eq!(r["body"], "Given body\n\nsecond line\nthird line");
+    // Without a body the rest is the body; the list stays one row per record.
+    let out = with_stdin(p, &["predict", &h, "-"], "Two runs in the log\nat 02:00\n");
+    assert!(out.status.success(), "{out:?}");
+    let prediction = String::from_utf8(out.stdout).unwrap().trim().to_string();
+    let r = record(p, &prediction);
+    assert_eq!(
+        (&r["title"], &r["body"]),
+        (&"Two runs in the log".into(), &"at 02:00".into())
+    );
+    assert_eq!(ok(p, &["list", "--all"]).lines().count(), 2);
+    // A given title with a newline is rejected, not stored.
+    fails(p, &["add", "a\nb"], "title must be a single line");
+    // A hand-edited file with one is reported by check.
+    let file = p.join(format!("hyp/hypotheses/{h}.md"));
+    let raw = std::fs::read_to_string(&file).unwrap();
+    std::fs::write(
+        &file,
+        raw.replace("title: Cron starts two backups", "title: \"Cron\\nstarts\""),
+    )
+    .unwrap();
+    let d = diagnostics_of(p, &format!("hyp/hypotheses/{h}.md"));
+    assert_eq!(codes(&d), ["invalid"], "{d:?}");
+    assert_eq!(
+        d[0]["message"],
+        "title must be a single line; put the rest in the body"
+    );
+    assert_eq!(d[0]["blocks_writes"], true);
+    let note = d[0]["repair"]["note"].as_str().unwrap();
+    assert!(
+        note.contains("Edit the file by hand") && note.contains("hyp check"),
+        "{note}"
+    );
+}
+
+#[test]
+fn id_errors_explain_no_match_list_candidates_and_name_the_wrong_kind() {
+    let project = demo();
+    let p = project.path();
+    // No kind letter: the hint explains them.
+    fails(p, &["show", "bd43"], "no record with ID (prefix) \"bd43\"");
+    fails(p, &["show", "bd43"], "H- hypothesis, P- prediction");
+    let out = run(p, &["show", "H-zz"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("no record with ID (prefix) \"H-zz\""),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("kind letter"), "{stderr}");
+    // Ambiguous: every candidate with its kind and title.
+    let out = run(p, &["show", "H-"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr.contains("matches 2 records"), "{stderr}");
+    let rows: serde_json::Value = serde_json::from_str(&ok(p, &["--json", "list"])).unwrap();
+    for row in rows.as_array().unwrap() {
+        let line = format!(
+            "{}  hypothesis  {}",
+            row["record"]["id"].as_str().unwrap(),
+            row["record"]["title"].as_str().unwrap()
+        );
+        assert!(stderr.contains(&line), "{line:?} in {stderr}");
+    }
+    // Wrong kind: the argument, what it expects and what it got.
+    let e = first(p, "evidence");
+    fails(
+        p,
+        &["predict", &e[..8], "x"],
+        &format!("argument <HYPOTHESIS>: expected a hypothesis, got evidence {e}"),
+    );
+    fails(
+        p,
+        &[
+            "run",
+            &first(p, "experiment"),
+            "r",
+            "--evidence",
+            &first(p, "gap"),
+        ],
+        "argument --evidence: expected evidence, got gap G-",
+    );
+}
+
+#[test]
+fn deleting_a_referenced_record_lists_what_refers_to_it() {
+    let project = demo();
+    let p = project.path();
+    let rows: serde_json::Value = serde_json::from_str(&ok(p, &["--json", "list"])).unwrap();
+    let bus = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["record"]["title"].as_str().unwrap().contains("bus"))
+        .unwrap()["record"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let links: serde_json::Value =
+        serde_json::from_str(&ok(p, &["--json", "list", "--kind", "link"])).unwrap();
+    let referrers: Vec<String> = links
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|l| l["record"]["to"] == bus.as_str())
+        .map(|l| {
+            format!(
+                "{}  link        {}",
+                l["record"]["id"].as_str().unwrap(),
+                l["record"]["title"].as_str().unwrap()
+            )
+        })
+        .collect();
+    assert_eq!(referrers.len(), 2);
+    for archived in [false, true] {
+        let out = run(p, &["delete", &bus]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{stderr}");
+        assert!(stderr.contains(&format!("cannot delete {bus}: these records refer to it")));
+        for line in &referrers {
+            assert!(stderr.contains(line), "{line:?} in {stderr}");
+        }
+        let archive = format!("hyp archive {bus}");
+        assert_eq!(stderr.contains(&archive), !archived, "{stderr}");
+        assert_eq!(stderr.contains("it is already out of lists"), archived);
+        ok(p, &["archive", &bus]);
+    }
+    // Unreferenced but not archived: the archive command to run first.
+    let h = ok(p, &["add", "Unreferenced"]).trim().to_string();
+    fails(
+        p,
+        &["delete", &h],
+        &format!("archive {h} before deleting it: hyp archive {h}"),
+    );
+}
+
+#[test]
+fn plain_output_spells_relations_as_the_cli_takes_them() {
+    let project = demo();
+    let p = project.path();
+    let competes: serde_json::Value =
+        serde_json::from_str(&ok(p, &["--json", "list", "--kind", "link"])).unwrap();
+    let competes = competes
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["record"]["relation"] == "competes_with")
+        .unwrap()["record"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let hs: serde_json::Value = serde_json::from_str(&ok(p, &["--json", "list"])).unwrap();
+    let (a, b) = (
+        hs[0]["record"]["id"].as_str().unwrap(),
+        hs[1]["record"]["id"].as_str().unwrap(),
+    );
+    ok(
+        p,
+        &[
+            "link",
+            &a[..8],
+            &b[..8],
+            "--relation",
+            "depends-on",
+            "--reason",
+            "r",
+        ],
+    );
+    for (args, spelled) in [
+        (vec!["show", competes.as_str()], "relation: competes-with"),
+        (vec!["graph"], "-->|competes-with|"),
+        (vec!["export"], "relation: competes-with"),
+        (vec!["list", "--all"], " depends-on "),
+    ] {
+        let text = ok(p, &args);
+        assert!(text.contains(spelled), "{spelled:?} in {args:?}:\n{text}");
+        assert!(
+            !text.contains("competes_with") && !text.contains("depends_on"),
+            "{args:?}:\n{text}"
+        );
+    }
+    // JSON and files keep the serialized form.
+    assert_eq!(record(p, &competes)["relation"], "competes_with");
+}
+
+/// Agents read --help: every subcommand says in one line what it does, and
+/// every argument what it takes.
+#[test]
+fn every_subcommand_and_argument_has_help() {
+    use clap::CommandFactory;
+    fn walk(command: &clap::Command, path: &str, missing: &mut Vec<String>) {
+        for arg in command.get_arguments() {
+            let id = arg.get_id().as_str();
+            if !matches!(id, "help" | "version") && arg.get_help().is_none() {
+                missing.push(format!("{path} {id}"));
+            }
+        }
+        for sub in command.get_subcommands() {
+            let path = format!("{path} {}", sub.get_name());
+            if sub.get_name() == "help" {
+                continue;
+            }
+            let about = sub.get_about().map(ToString::to_string).unwrap_or_default();
+            if about.is_empty() || about.contains('\n') || about.len() > 70 {
+                missing.push(format!("{path}: about {about:?}"));
+            }
+            walk(sub, &path, missing);
+        }
+    }
+    let mut missing = vec![];
+    walk(&hyp::cli::Cli::command(), "hyp", &mut missing);
+    assert!(missing.is_empty(), "{missing:#?}");
+}
+
+#[test]
+fn apply_help_shows_every_change_and_an_assessment_statement() {
+    let dir = TempDir::new().unwrap();
+    // Hermetic: help must not depend on the caller's terminal width.
+    let out = hyp(dir.path())
+        .args(["apply", "--help"])
+        .env_remove("COLUMNS")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let help = String::from_utf8(out.stdout).unwrap();
+    for part in [
+        r#"{"op": "create""#,
+        r#"{"op": "update""#,
+        r#"{"op": "archive""#,
+        r#""kind": "assessment""#,
+        r#""expected": {"hypotheses": {"H-…": {"review_token": "…"}}}"#,
+    ] {
+        assert!(help.contains(part), "{part:?} in\n{help}");
+    }
+}
+
+#[test]
+fn check_counts_in_the_singular_and_init_says_what_to_do_next() {
+    let dir = TempDir::new().unwrap();
+    let p = dir.path();
+    let init = ok(p, &["init"]);
+    assert!(
+        init.lines().any(|l| l.starts_with("Next: hyp add")),
+        "{init}"
+    );
+    ok(p, &["add", "Only"]);
+    assert!(
+        ok(p, &["check"]).ends_with("Checked 1 object\n"),
+        "singular"
     );
 }

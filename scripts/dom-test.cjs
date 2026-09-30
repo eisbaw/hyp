@@ -416,6 +416,10 @@ async function main() {
     w.location.hash = view;
     await wait(() => h1(w) === title, "view " + view);
   }
+  // Relations as `hyp link --relation` spells them (the demo's competes_with link).
+  const allText = w.document.querySelector("main").textContent;
+  assert.ok(allText.includes("competes-with"), "competes-with in All records");
+  assert.ok(!/competes.with/.test(allText.replaceAll("competes-with", "")));
   const original = fs.readFileSync(filename, "utf8");
   fs.writeFileSync(filename, "broken");
   await wait(

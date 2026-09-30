@@ -857,18 +857,32 @@ impl Store {
                 } => {
                     let old = stated(&after, &id, &expected_revision)?.clone();
                     named.push((old.record.id.clone(), old.record.data.kind_value()));
-                    ensure!(old.record.archived, "archive before deleting");
+                    let id = &old.record.id;
                     ensure!(
                         !matches!(old.record.data, Data::Assessment { .. } | Data::Run { .. }),
                         "historical records cannot be deleted"
                     );
+                    let referrers: Vec<&Entry> = after
+                        .objects
+                        .iter()
+                        .filter(|e| e.record.data.references().contains(&id.as_str()))
+                        .collect();
+                    if !referrers.is_empty() {
+                        let keep = if old.record.archived {
+                            "or keep it: archived, it is already out of lists and the graph"
+                                .to_string()
+                        } else {
+                            format!("or archive it instead of deleting it: hyp archive {id}")
+                        };
+                        bail!(
+                            "cannot delete {id}: these records refer to it:\n{}\n\
+                             Delete them first (archive, then delete; assessments and runs cannot be deleted), {keep}",
+                            listing(&referrers)
+                        );
+                    }
                     ensure!(
-                        !after.objects.iter().any(|e| e
-                            .record
-                            .data
-                            .references()
-                            .contains(&old.record.id.as_str())),
-                        "object is referenced; archive it instead"
+                        old.record.archived,
+                        "archive {id} before deleting it: hyp archive {id}"
                     );
                     writes.insert(Self::relative(&old.record), None);
                     after.objects.retain(|e| e.record.id != old.record.id);

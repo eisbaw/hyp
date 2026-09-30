@@ -3,6 +3,10 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
+/// An enum of fixed values. `as_str` (and `Display`) is the spelling people
+/// read and type, the clap value name; files and JSON use serde's
+/// snake_case, which differs only for multi-word values (a relation's
+/// `competes-with` is stored as `competes_with`).
 macro_rules! values {
     ($name:ident { $($variant:ident => $text:literal),+ $(,)? }) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
@@ -22,7 +26,7 @@ macro_rules! values {
 }
 values!(Lifecycle { Draft => "draft", Investigating => "investigating", Paused => "paused", Closed => "closed" });
 values!(Judgment { Untested => "untested", Inconclusive => "inconclusive", Supported => "supported", Weakened => "weakened", Falsified => "falsified" });
-values!(Relation { Supports => "supports", Contradicts => "contradicts", Qualifies => "qualifies", DependsOn => "depends_on", CompetesWith => "competes_with", Supersedes => "supersedes" });
+values!(Relation { Supports => "supports", Contradicts => "contradicts", Qualifies => "qualifies", DependsOn => "depends-on", CompetesWith => "competes-with", Supersedes => "supersedes" });
 values!(ExperimentStatus { Planned => "planned", Running => "running", Completed => "completed", Cancelled => "cancelled" });
 values!(Outcome { Observed => "observed", Inconclusive => "inconclusive", Failed => "failed" });
 values!(Kind { Hypothesis => "hypothesis", Prediction => "prediction", Criterion => "criterion", Evidence => "evidence", Link => "link", Experiment => "experiment", Run => "run", Assessment => "assessment", Gap => "gap" });
@@ -422,31 +426,77 @@ pub fn hash(bytes: impl AsRef<[u8]>) -> String {
     use sha2::{Digest, Sha256};
     format!("{:x}", Sha256::digest(bytes))
 }
+/// "a" or "an", as `word` needs.
+pub fn article(word: &str) -> &'static str {
+    if word.starts_with(['a', 'e', 'i', 'o', 'u']) {
+        "an"
+    } else {
+        "a"
+    }
+}
+/// Entries for an error message, one `ID  kind  title` line each, at most
+/// ten, then how many more there are.
+pub fn listing(entries: &[&Entry]) -> String {
+    const SHOWN: usize = 10;
+    let mut lines: Vec<String> = entries
+        .iter()
+        .take(SHOWN)
+        .map(|e| {
+            let r = &e.record;
+            format!("  {}  {:11} {}", r.id, r.data.kind(), r.title)
+        })
+        .collect();
+    if entries.len() > SHOWN {
+        lines.push(format!("  and {} more", entries.len() - SHOWN));
+    }
+    lines.join("\n")
+}
 impl Snapshot {
     /// The entry with exactly this ID; no prefix matching.
     pub fn get(&self, id: &str) -> Option<&Entry> {
         self.objects.iter().find(|e| e.record.id == id)
     }
+    /// The entry with this ID or unique ID prefix (case-insensitive). The
+    /// error lists the candidates of an ambiguous prefix, and explains the
+    /// kind letter IDs start with when a prefix without one matches nothing.
     pub fn find(&self, prefix: &str) -> Result<&Entry> {
-        if let Some(e) = self.objects.iter().find(|e| e.record.id == prefix) {
+        if let Some(e) = self.get(prefix) {
             return Ok(e);
         }
-        let hits: Vec<_> = self
+        let lower = prefix.to_lowercase();
+        let hits: Vec<&Entry> = self
             .objects
             .iter()
-            .filter(|e| {
-                e.record
-                    .id
-                    .to_lowercase()
-                    .starts_with(&prefix.to_lowercase())
-            })
+            .filter(|e| e.record.id.to_lowercase().starts_with(&lower))
             .collect();
-        ensure!(
-            hits.len() == 1,
-            "ID {prefix:?} matches {} objects; use a longer prefix",
-            hits.len()
-        );
-        Ok(hits[0])
+        match hits.as_slice() {
+            [e] => Ok(e),
+            [] => {
+                let kinds = <Kind as clap::ValueEnum>::value_variants();
+                let upper = prefix.to_uppercase();
+                let has_kind = kinds
+                    .iter()
+                    .any(|k| upper == k.prefix() || upper.starts_with(&format!("{}-", k.prefix())));
+                let hint = if has_kind {
+                    String::new()
+                } else {
+                    let letters: Vec<String> = kinds
+                        .iter()
+                        .map(|k| format!("{}- {k}", k.prefix()))
+                        .collect();
+                    format!(
+                        " (IDs start with their kind letter: {})",
+                        letters.join(", ")
+                    )
+                };
+                bail!("no record with ID (prefix) {prefix:?}{hint}")
+            }
+            _ => bail!(
+                "ID prefix {prefix:?} matches {} records; use a longer prefix:\n{}",
+                hits.len(),
+                listing(&hits)
+            ),
+        }
     }
     /// The hypothesis `id` and its criteria and predictions; with
     /// `active_only`, without archived ones.
@@ -657,6 +707,20 @@ impl Snapshot {
         out.require(!r.title.trim().is_empty(), Invalid, || {
             "title is required".into()
         });
+        if r.title.contains(['\n', '\r']) {
+            out.push(
+                Invalid,
+                "title must be a single line; put the rest in the body".into(),
+                Some(Repair {
+                    note: Some(
+                        "Edit the file by hand: keep the first line as the title and move \
+                         the rest into the body. hyp check confirms the fix."
+                            .into(),
+                    ),
+                    commands: vec![],
+                }),
+            );
+        }
         out.require(r.title.len() <= 2000, Invalid, || {
             "title is too long".into()
         });
@@ -954,11 +1018,7 @@ impl Snapshot {
         else {
             return Ok(());
         };
-        let article = if judgment.to_string().starts_with(['a', 'e', 'i', 'o', 'u']) {
-            "an"
-        } else {
-            "a"
-        };
+        let article = article(judgment.as_str());
         ensure!(
             *judgment == Judgment::Untested || !evidence.is_empty(),
             "{article} {judgment} assessment must cite evidence: every judgment except \
