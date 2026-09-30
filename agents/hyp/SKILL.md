@@ -30,10 +30,10 @@ running `hyp init`.
    test name, timestamp). Record only what you actually observed. Never
    invent, extrapolate or paraphrase an observation into something stronger.
 5. **Assess only with evidence and a reason.** You may record any judgment
-   (inconclusive, supported, weakened, falsified), but every assessment you
-   make must cite at least one evidence ID (`--evidence`) and give a
-   rationale (`--reason`). The tool requires evidence only for `falsified`
-   (plus `--criterion`); for other judgments citing evidence is your rule.
+   (inconclusive, supported, weakened, falsified). The tool requires a
+   rationale (`--reason`) and, for every judgment except `untested`, at least
+   one evidence ID (`--evidence`) already linked to the hypothesis or its
+   criteria or predictions; `falsified` also needs `--criterion`.
    "supported" never means proven.
 6. **Keep the record honest.** Do not delete or rewrite a hypothesis because
    it turned out wrong; assess it. Record gaps (`hyp gap`) you could not close.
@@ -70,13 +70,17 @@ Text arguments accept `-` to read stdin.
 `hyp assess` requires `--reviewed` with the `review_token` of the state you
 reviewed. `hyp --json show H-...` gives what the token covers:
 
-- `.related`: records that refer to the hypothesis (links, criteria,
-  predictions, experiments, assessments, gaps);
-- `.runs`: runs of its experiments; `.evidence`: every observation linked or
-  cited, with source and locator. Read these before judging;
-- `.basis`: every record the fingerprint covers, with its revision; the token
-  also covers `.state.assessment_ids`. When the token changed, compare both
-  with your earlier read to see what changed.
+- `.basis`: the content the fingerprint hashes, by record ID (see `.basis`
+  itself for which records and fields). The token also covers the current
+  assessments (`.state.assessment_ids`).
+- `.evidence` and `.runs`: those observations and runs in full, with source
+  and locator. `.related`: records that refer to the hypothesis. Read these
+  before judging.
+
+Cite only evidence that an active link connects to the hypothesis (or its
+active criteria or predictions). For other evidence, `hyp link E-... H-...`
+first, then re-read and review before assessing; in a `hyp apply` batch, link
+pre-existing evidence in an earlier write.
 
 ```bash
 hyp --json show H-...          # review it; note .state.review_token
@@ -86,8 +90,9 @@ hyp assess H-... --reviewed <review_token> --status weakened \
 
 Read the hypothesis again before each assessment, including right after your
 own previous one: every assessment changes the token. `.state.needs_review`
-is true when records changed after the current assessment; review and assess
-again.
+is true when the basis changed after the current assessment; review and
+assess again. Archiving the hypothesis changes the basis; closing,
+retagging, experiment status and gap resolution do not.
 
 ## Finishing
 
@@ -105,8 +110,8 @@ criterion before it can be `investigating`.
 ## Exit codes and errors
 
 - `0` success.
-- `1` the input is wrong (unknown or ambiguous ID, invalid value, missing
-  evidence for `falsified`, malformed token) or the project has errors
+- `1` the input is wrong (unknown or ambiguous ID, invalid value, a judgment
+  without evidence, unlinked evidence, malformed token) or the project has errors
   (`hyp check` names them). Fix that; retrying unchanged will not help.
 - `2` invalid command-line arguments (see `hyp <command> --help`).
 - `3` conflict: something the write depended on changed since you read it.

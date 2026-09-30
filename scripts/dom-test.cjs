@@ -268,6 +268,7 @@ async function main() {
       field(w, "title", "Judged before the counter-evidence");
       field(w, "body", "Written without seeing the agent's observation.");
       field(w, "judgment", "supported");
+      field(w, "evidence", ev.record.id);
     },
     () =>
       cli(
@@ -314,57 +315,62 @@ async function main() {
   const assessed = JSON.parse(cli("--json", "show", h.record.id)).state;
   assert.equal(assessed.judgment, "falsified");
   assert.equal(assessed.needs_review, false);
-  // Citing evidence brings its links and their other ends into the
-  // assessment's basis. A link an agent adds to that evidence while the form
-  // is open was never seen: the save is a conflict naming it (review P2).
+  // Every judgment except untested needs evidence (422, not a conflict), and
+  // the form says so before the author tries.
+  w.location.hash = "record/" + h.record.id;
+  await wait(() => h1(w) === "Concurrent change", "return to assess again");
+  click(w, '[data-action="create:assessment"]');
+  assert.ok(
+    w.document
+      .querySelector("#editor-fields")
+      .textContent.includes("Required for every judgment except untested"),
+  );
+  field(w, "title", "Supported without evidence");
+  field(w, "body", "No observation cited.");
+  field(w, "judgment", "supported");
+  click(w, 'button[type="submit"]');
+  await wait(
+    () => formError(w).includes("must cite evidence"),
+    "evidence required",
+  );
+  assert.ok(!formError(w).includes(DRAFT_HINT), formError(w));
+  // Only evidence already linked to this hypothesis may be cited; the error
+  // names the command that links it.
   const demoEvidence = JSON.parse(
     cli("--json", "list", "--kind", "evidence"),
   ).find((e) => e.record.title.startsWith("Timeout reproduced"));
-  const unrelated = JSON.parse(
-    cli("--json", "list", "--kind", "hypothesis"),
-  ).find((e) => e.record.title === "Unrelated hypothesis from an agent");
-  let newLink = "";
-  w.location.hash = "record/" + h.record.id;
-  await wait(() => h1(w) === "Concurrent change", "return to assess again");
-  await editDuring(
-    w,
-    () => click(w, '[data-action="create:assessment"]'),
-    () => {
-      field(w, "title", "Cites shared evidence");
-      field(w, "body", "The demo observation matters here too.");
-      field(w, "evidence", demoEvidence.record.id);
-    },
-    () => {
-      newLink = cli(
-        "link",
-        demoEvidence.record.id,
-        unrelated.record.id,
-        "--relation",
-        "supports",
-        "--reason",
-        "Linked by an agent meanwhile",
-      );
-    },
-  );
+  field(w, "evidence", demoEvidence.record.id);
   click(w, 'button[type="submit"]');
-  await wait(() => formError(w).includes("conflict:"), "unseen link");
-  assert.ok(formError(w).includes(newLink), formError(w));
-  assert.ok(formError(w).includes(DRAFT_HINT), formError(w));
-  assert.equal(
-    w.document.querySelector('[name="title"]').value,
-    "Cites shared evidence",
+  await wait(
+    () => formError(w).includes("hyp link " + demoEvidence.record.id),
+    "unlinked evidence rejected",
+  );
+  assert.ok(!formError(w).includes(DRAFT_HINT), formError(w));
+  assert.ok(
+    !cli("list", "--kind", "assessment").includes("Supported without evidence"),
   );
   click(w, "#cancel-editor");
+  await wait(() => !w.document.querySelector("#editor").open, "closed");
+  cli(
+    "link",
+    demoEvidence.record.id,
+    h.record.id,
+    "--relation",
+    "supports",
+    "--reason",
+    "The demo observation matters here too",
+  );
   await wait(
     () =>
-      !w.document.querySelector("#editor").open &&
-      w.document.querySelector("#notice").hidden,
-    "closed and refreshed",
+      w.document.body.textContent.includes(
+        "The demo observation matters here too",
+      ),
+    "new link shown for review",
   );
-  // Reopened on the new state, the form states those records and saves.
   click(w, '[data-action="create:assessment"]');
   field(w, "title", "Cites shared evidence");
   field(w, "body", "The demo observation matters here too.");
+  field(w, "judgment", "weakened");
   field(w, "evidence", demoEvidence.record.id);
   await save(w);
   await wait(() => h1(w) === "Cites shared evidence", "shared evidence");
@@ -452,7 +458,7 @@ async function main() {
   );
   assert.deepEqual(errors, []);
   console.log(
-    "PASS: DOM forms, real HTTP writes, CLI↔UI SSE updates, editor changes, two tabs, dirty-form preservation, conflicts by status, saves despite unrelated writes, stale assessment and unseen link rejected, criteria, evidence interpretations, falsification assessment, experiment and run, all views, malformed-file recovery, unavailable-project cause and offline export.",
+    "PASS: DOM forms, real HTTP writes, CLI↔UI SSE updates, editor changes, two tabs, dirty-form preservation, conflicts by status, saves despite unrelated writes, stale assessment rejected, evidence required and linked-only, criteria, evidence interpretations, falsification assessment, experiment and run, all views, malformed-file recovery, unavailable-project cause and offline export.",
   );
 }
 main()

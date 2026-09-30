@@ -244,6 +244,7 @@ fn assess_is_based_on_the_state_the_agent_reviewed() {
             .clone()
     };
     let token = || state()["review_token"].as_str().unwrap().to_string();
+    let e = first(p, "evidence");
     let assess = |token: &str, status: &str| {
         run(
             p,
@@ -254,6 +255,8 @@ fn assess_is_based_on_the_state_the_agent_reviewed() {
                 token,
                 "--status",
                 status,
+                "--evidence",
+                &e,
                 "--reason",
                 "Reviewed",
             ],
@@ -713,10 +716,11 @@ fn show_includes_the_evidence_a_hypothesis_links() {
     assert!(evidence.iter().all(|x| x["record"]["kind"] == "evidence"));
 }
 
-/// Everything a hypothesis's review token covers is visible in `show`: when
-/// the token changes, so does the rest of the output.
+/// `.basis` is what the fingerprint hashes: the SHA-256 of its compact JSON
+/// with sorted keys. Everything in it is visible in `show`; what is not in it
+/// (another hypothesis's content) does not change the token.
 #[test]
-fn show_reveals_every_change_the_review_token_covers() {
+fn show_prints_the_basis_the_fingerprint_hashes() {
     let project = demo();
     let p = project.path();
     let json = |args: &[&str]| -> serde_json::Value { serde_json::from_str(&ok(p, args)).unwrap() };
@@ -734,10 +738,14 @@ fn show_reveals_every_change_the_review_token_covers() {
     let (h, other) = (id_of("cache"), id_of("bus"));
     let x = first(p, "experiment");
     let show = || {
-        let mut shown = json(&["--json", "show", &h]);
-        let token = shown["state"]["review_token"].as_str().unwrap().to_string();
-        shown.as_object_mut().unwrap().remove("state");
-        (shown, token)
+        let shown = json(&["--json", "show", &h]);
+        let basis = serde_json::to_string(&shown["basis"]).unwrap();
+        assert_eq!(
+            hyp::model::hash(basis),
+            shown["state"]["fingerprint"].as_str().unwrap(),
+            "sha256 of .basis is .state.fingerprint"
+        );
+        shown
     };
     let ids = |v: &serde_json::Value| -> Vec<String> {
         v.as_array()
@@ -746,6 +754,11 @@ fn show_reveals_every_change_the_review_token_covers() {
             .map(|e| e["record"]["id"].as_str().unwrap().to_string())
             .collect()
     };
+    let before = show();
+    assert_eq!(
+        before["basis"][&h]["scope"],
+        before["entry"]["record"]["scope"]
+    );
 
     // Evidence of another hypothesis, cited only by a run of h's experiment.
     let e2 = ok(
@@ -760,15 +773,18 @@ fn show_reveals_every_change_the_review_token_covers() {
         ],
     );
     let e2 = e2.lines().next().unwrap().to_string();
-    let (before, token) = show();
+    assert_eq!(
+        show()["state"],
+        before["state"],
+        "evidence of another hypothesis"
+    );
     let run = ok(p, &["run", &x, "Run 2", "--evidence", &e2])
         .trim()
         .to_string();
-    let (after, token2) = show();
-    assert_ne!(token, token2);
-    assert!(
-        before != after,
-        "the run changed the token but not what show reveals"
+    let after = show();
+    assert_ne!(
+        after["state"]["review_token"],
+        before["state"]["review_token"]
     );
     assert!(ids(&after["runs"]).contains(&run), "{}", after["runs"]);
     assert!(
@@ -776,14 +792,180 @@ fn show_reveals_every_change_the_review_token_covers() {
         "{}",
         after["evidence"]
     );
-    assert!(after["basis"][&run].is_string() && after["basis"][&e2].is_string());
+    assert_eq!(after["basis"][&run]["outcome"], "observed");
+    assert_eq!(after["basis"][&e2]["title"], "Bus stalls at 8,000");
 
-    // A record merely linked to h (the competing hypothesis) is covered too.
-    assert!(after["basis"][&other].is_string());
+    // The competing hypothesis counts only through the link.
+    assert!(after["basis"][&other].is_null());
     ok(p, &["set", &other, "--title", "Bus contention, renamed"]);
-    let (renamed, token3) = show();
-    assert_ne!(token2, token3);
-    assert_ne!(after["basis"][&other], renamed["basis"][&other]);
+    ok(p, &["set", &other, "--lifecycle", "closed"]);
+    assert_eq!(show()["state"], after["state"]);
+}
+/// The 2026-09-30 dogfood: both agents assessed, then closed, and ended with
+/// every hypothesis needing review. Closing is not new information.
+#[test]
+fn closing_after_assessing_leaves_nothing_needing_review() {
+    let project = demo();
+    let p = project.path();
+    let rows: serde_json::Value =
+        serde_json::from_str(&ok(p, &["--json", "list", "--kind", "hypothesis"])).unwrap();
+    let hypotheses: Vec<String> = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["record"]["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(hypotheses.len(), 2, "the demo's cache and bus hypotheses");
+    let e = first(p, "evidence");
+    let state = |h: &str| -> serde_json::Value {
+        serde_json::from_str::<serde_json::Value>(&ok(p, &["--json", "show", h])).unwrap()["state"]
+            .clone()
+    };
+    for h in &hypotheses {
+        let token = state(h)["review_token"].as_str().unwrap().to_string();
+        ok(
+            p,
+            &[
+                "assess",
+                h,
+                "--reviewed",
+                &token,
+                "--status",
+                "weakened",
+                "--evidence",
+                &e,
+                "--reason",
+                "Reviewed",
+            ],
+        );
+    }
+    for h in &hypotheses {
+        ok(p, &["set", h, "--lifecycle", "closed", "--tags", "done"]);
+    }
+    for h in &hypotheses {
+        assert_eq!(state(h)["needs_review"], false, "{h}");
+    }
+    assert_eq!(ok(p, &["list", "--needs-review"]).trim(), "");
+}
+/// Decision-0003 items 2 and 4, as an agent meets them: a judgment needs
+/// evidence, and only evidence already linked to the hypothesis.
+#[test]
+fn assess_requires_linked_evidence_for_a_judgment() {
+    let project = demo();
+    let p = project.path();
+    let h = first(p, "hypothesis");
+    let token = || {
+        serde_json::from_str::<serde_json::Value>(&ok(p, &["--json", "show", &h])).unwrap()["state"]
+            ["review_token"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let assess = |status: &str, evidence: &[&str]| {
+        let token = token();
+        let mut args = vec!["assess", &h, "--reviewed", &token, "--status", status];
+        for e in evidence {
+            args.extend(["--evidence", e]);
+        }
+        args.extend(["--reason", "Reviewed"]);
+        run(p, &args)
+    };
+    let out = assess("supported", &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("a supported assessment must cite evidence"),
+        "{stderr}"
+    );
+    let out = assess("untested", &[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Evidence nobody linked to h: exit 1, and the message says how to link it.
+    let unlinked = ok(p, &["add", "Unrelated claim"]).trim().to_string();
+    let e = ok(
+        p,
+        &[
+            "evidence",
+            "add",
+            &unlinked,
+            "Seen elsewhere",
+            "--source",
+            "log",
+        ],
+    );
+    let e = e.lines().next().unwrap().to_string();
+    let out = assess("supported", &[&e]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains(&format!("hyp link {e} {h}")), "{stderr}");
+    ok(
+        p,
+        &[
+            "link",
+            &e,
+            &h,
+            "--relation",
+            "supports",
+            "--reason",
+            "Also here",
+        ],
+    );
+    let out = assess("supported", &[&e]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+/// HYPO-0026: the review token covers the current assessments' content, not
+/// only their IDs, so a hand edit (or a merge) of one is a conflict.
+#[test]
+fn a_hand_edited_current_assessment_invalidates_an_old_token() {
+    let project = demo();
+    let p = project.path();
+    let rows: serde_json::Value =
+        serde_json::from_str(&ok(p, &["--json", "list", "--kind", "hypothesis"])).unwrap();
+    let assessed = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["state"]["assessment_ids"][0].is_string())
+        .expect("the demo assesses one hypothesis");
+    let h = assessed["record"]["id"].as_str().unwrap().to_string();
+    let e = first(p, "evidence");
+    let shown: serde_json::Value = serde_json::from_str(&ok(p, &["--json", "show", &h])).unwrap();
+    let token = shown["state"]["review_token"].as_str().unwrap().to_string();
+    let current = shown["state"]["assessment_ids"][0].as_str().unwrap();
+    let path = p.join(format!("hyp/assessments/{current}.md"));
+    let text = read(&path);
+    let (header, _) = text.split_once("\n---\n").unwrap();
+    std::fs::write(
+        &path,
+        format!("{header}\n---\nRewritten by hand: supported after all.\n"),
+    )
+    .unwrap();
+    ok(p, &["check"]);
+    let out = run(
+        p,
+        &[
+            "assess",
+            &h,
+            "--reviewed",
+            &token,
+            "--status",
+            "supported",
+            "--evidence",
+            &e,
+            "--reason",
+            "Based on the old judgment",
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(3), "{stderr}");
+    assert!(stderr.contains("changed since you reviewed it"), "{stderr}");
 }
 
 /// An untestable reason is the stated alternative to a criterion, so

@@ -123,6 +123,31 @@ async fn transactions_need_only_the_preconditions_of_their_changes() {
         "{body}"
     );
 }
+/// Decision-0003 item 4 holds for the WebUI's API as for the CLI: a judgment
+/// other than untested without evidence is input to fix (422).
+#[tokio::test]
+async fn a_judgment_without_evidence_is_unprocessable() {
+    let (_dir, app, store) = app();
+    hyp::cli::seed_demo(&store).unwrap();
+    let s = store.snapshot().unwrap();
+    let (h, state) = s.hypotheses.iter().next().unwrap();
+    let change = |judgment: &str| {
+        serde_json::json!({"changes":[{"op":"create",
+            "record":{"kind":"assessment","title":"No evidence","body":"Why","hypothesis":h,"judgment":judgment},
+            "expected":{"hypotheses":{h.clone():{"review_token":state.review_token}}}}]})
+    };
+    let (status, body) = post(&app, change("supported")).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("a supported assessment must cite evidence"),
+        "{body}"
+    );
+    let (status, body) = post(&app, change("untested")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
 #[tokio::test]
 async fn rejects_foreign_host_origin_and_missing_token() {
     let (_dir, app, store) = app();

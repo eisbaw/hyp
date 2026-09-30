@@ -13,7 +13,8 @@ An assessment records the state it was based on (`based_on`, the hypothesis fing
 ## Decision
 
 1. **Content-only fingerprint.** Only substantive content counts:
-   - title and body of the hypothesis, its criteria, predictions and evidence (for these kinds the title is the claim or observation itself);
+   - title and body of the hypothesis, its criteria, predictions and evidence (for these kinds the title is the claim or observation itself), and the evidence's provenance: source, locator and attachment hashes (proposed 2026-09-30 during review, HYPO-0050, and implemented; PENDING USER CONFIRMATION: where an observation came from is part of its content);
+   - archiving the hypothesis itself (same status);
    - the hypothesis's scope and assumptions;
    - links: relation and reason;
    - evidence and criteria being added or archived;

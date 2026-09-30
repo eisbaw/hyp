@@ -715,6 +715,7 @@ function formFields(kind, owner, r = {}) {
         [],
         true,
       ) +
+      '<p class="small">Required for every judgment except untested. Cite only evidence already linked to this hypothesis or its criteria or predictions, so the judgment rests on what you reviewed; link other evidence first.</p>' +
       select(
         "criterion",
         "Falsification criterion",
@@ -840,12 +841,9 @@ function buildRecord(form) {
   return r;
 }
 // Mirrors Change::create_seen: the `expected` of a create, stating what
-// `seen` (the snapshot the form was opened on) held of the records the server
-// derives or freezes the new record's content from. For an assessment: its
-// hypothesis' state, and the records its cited evidence brings into the
-// fingerprint (store::assessment_additions: the evidence, links touching it
-// and their other ends; stating a few already covered is harmless). If this
-// misses one, the server answers 409 and names it.
+// `seen` (the snapshot the form was opened on) held of what the server
+// derives or freezes the new record's content from: for an assessment its
+// hypothesis' review token, which covers the linked evidence it may cite.
 function expectedFrom(r, seen) {
   const at = (id) => seen.objects.find((e) => e.record.id === id);
   const revisions = {};
@@ -853,20 +851,8 @@ function expectedFrom(r, seen) {
     if (at(id)) revisions[id] = at(id).revision;
   };
   const hypotheses = {};
-  if (r.kind === "assessment") {
-    const st = seen.hypotheses[r.hypothesis];
-    if (st)
-      hypotheses[r.hypothesis] = {
-        fingerprint: st.fingerprint,
-        assessment_ids: st.assessment_ids,
-      };
-    for (const id of r.evidence) {
-      state(id);
-      for (const { record: l } of seen.objects)
-        if (l.kind === "link" && (l.from === id || l.to === id))
-          [l.id, l.from, l.to].forEach(state);
-    }
-  }
+  const st = r.kind === "assessment" && seen.hypotheses[r.hypothesis];
+  if (st) hypotheses[r.hypothesis] = { review_token: st.review_token };
   if (r.kind === "experiment") {
     if (!r.targets.some((t) => t.id === r.hypothesis))
       r.targets.unshift({ id: r.hypothesis });

@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-09-30 01:18'
-updated_date: '2026-09-30 05:54'
+updated_date: '2026-09-30 11:32'
 labels:
   - cli
   - agents
@@ -34,4 +34,6 @@ From the HYPO-0002 Codex round-3 review (finding 1, documented as a known limit)
 
 <!-- SECTION:NOTES:BEGIN -->
 Per decision-0003 (linked-only citations), AC #2 (cited evidence reviewed outside the fingerprint) is obsolete once HYPO-0009 lands: cited evidence is always inside the basis. What remains is --reviewed for hyp run and hyp experiment add.
+
+2026-09-30: confirmed by the review basis v2 change: assessments may cite only evidence already linked when read (checked against the pre-batch state), so AC #2 is obsolete; cited evidence is always inside the review token.
 <!-- SECTION:NOTES:END -->

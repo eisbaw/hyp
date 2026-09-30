@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-09-30 00:28'
-updated_date: '2026-09-30 01:18'
+updated_date: '2026-09-30 11:49'
 labels:
   - hardening
   - cli
@@ -40,4 +40,8 @@ Non-blocking findings from the HYPO-0002 round-2 deep gate:
 
 <!-- SECTION:NOTES:BEGIN -->
 From the HYPO-0002 round-3 QA: the same assessment race yields two messages depending on where it is caught (CLI pre-check: 'changed since you reviewed it ... review token differs'; commit: 'since you read the project: the assessments of H changed (assessment_ids)'); unify the wording for CLI users. --reviewed accepts upper-case hex; say so or normalise.
+
+2026-09-30, review basis v2 (HYPO-0009/0031/0026/0040, uncommitted): obsolete bullets: relevant_with (deleted, so its clone is gone), 'let relevant = after.relevant_with' in commit (deleted), the prefix ID in expected.hypotheses[H].assessment_ids (the field is gone; it is now {review_token}), and 'omitting a closure record is exit 3' (no closure). AC #2's relevant_with half is obsolete; the needs_expected duplication (create_seen vs check_create) still stands. The two conflict wordings for the same race are now 'changed since you reviewed it ... the review token differs' (CLI pre-check) and 'hypothesis H changed: its basis or its current assessments (review_token)' (commit): closer, still two.
+
+Filed from the review basis v2 deep gate (2026-09-30): the README fingerprint recipe ("SHA-256 of basis as compact JSON with sorted keys") should say the bytes are UTF-8 with serde_json's escaping (non-ASCII kept literal, no spaces), so an agent recomputing it outside Rust (e.g. Python json.dumps needs separators=(",", ":"), ensure_ascii=False, sort_keys=True) gets the same hash.
 <!-- SECTION:NOTES:END -->

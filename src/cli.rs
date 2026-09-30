@@ -7,7 +7,6 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::{
-    collections::BTreeMap,
     io::{Read, Write},
     path::PathBuf,
 };
@@ -98,8 +97,8 @@ pub enum Command {
         hypothesis: String,
         /// The review token of the hypothesis state you reviewed:
         /// .state.review_token of `hyp --json show H-…` (or `hyp --json list`).
-        /// If the hypothesis's records (evidence, links, criteria, predictions,
-        /// experiments, runs) or its current assessments changed since, nothing
+        /// If its basis (.basis: claim, criteria, predictions, links, linked
+        /// evidence, runs) or its current assessments changed since, nothing
         /// is written and the command exits 3: review the change and assess again.
         #[arg(long, value_name = "TOKEN")]
         reviewed: String,
@@ -107,6 +106,8 @@ pub enum Command {
         status: Judgment,
         #[arg(long)]
         confidence: Option<f64>,
+        /// Evidence already linked to the hypothesis or its criteria or
+        /// predictions (`hyp link` first). Required unless --status untested.
         #[arg(long, value_delimiter = ',')]
         evidence: Vec<String>,
         #[arg(long)]
@@ -644,29 +645,22 @@ pub async fn run(cli: Cli) -> Result<()> {
                     .iter()
                     .filter(|x| x.record.data.references().contains(&e.record.id.as_str()))
                     .collect();
-                // For a hypothesis, what its review token covers: every record
-                // with its revision, plus in full the runs and evidence, which
-                // `related` does not reach (a link or run names only IDs).
+                // For a hypothesis, what its fingerprint hashes (`basis`), plus
+                // in full the runs and evidence in it, which `related` does not
+                // reach (a link or run names only IDs).
                 let (basis, runs, evidence) = match e.record.data {
                     Data::Hypothesis { .. } => {
-                        let relevant = s.relevant(&e.record.id);
-                        let covered: Vec<&Entry> = s
-                            .objects
-                            .iter()
-                            .filter(|x| relevant.contains(&x.record.id))
-                            .collect();
+                        let basis = s.basis(&e.record.id);
                         let of_kind = |kind: &str| -> Vec<&Entry> {
-                            covered
+                            s.objects
                                 .iter()
-                                .copied()
-                                .filter(|x| x.record.data.kind() == kind)
+                                .filter(|x| {
+                                    x.record.data.kind() == kind && basis.contains_key(&x.record.id)
+                                })
                                 .collect()
                         };
-                        let basis: BTreeMap<&str, &str> = covered
-                            .iter()
-                            .map(|x| (x.record.id.as_str(), x.revision.as_str()))
-                            .collect();
-                        (Some(basis), Some(of_kind("run")), Some(of_kind("evidence")))
+                        let (runs, evidence) = (of_kind("run"), of_kind("evidence"));
+                        (Some(basis), Some(runs), Some(evidence))
                     }
                     _ => (None, None, None),
                 };

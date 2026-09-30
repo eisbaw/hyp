@@ -3,7 +3,7 @@ use anyhow::{Context, Result, bail, ensure};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -73,45 +73,21 @@ pub enum Change {
 #[serde(deny_unknown_fields)]
 pub struct Expected {
     /// Hypothesis ID -> its state as read (`Snapshot::hypotheses`, the
-    /// `state` of `hyp --json show`). An assessment states its hypothesis.
+    /// `state` of `hyp --json show`). An assessment states its hypothesis;
+    /// it may cite only evidence linked to it, which the state covers.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub hypotheses: BTreeMap<String, SeenHypothesis>,
-    /// Record ID -> its revision as read: every experiment target, a run's
-    /// experiment and cited evidence, and every record an assessment adds to
-    /// its hypothesis' relevant set (see `assessment_additions`).
+    /// Record ID -> its revision as read: every experiment target, and a
+    /// run's experiment and cited evidence.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub revisions: BTreeMap<String, String>,
 }
-/// The fields of `HypothesisState` that an assessment depends on.
+/// The field of `HypothesisState` that an assessment depends on.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SeenHypothesis {
     #[serde(default)]
-    pub fingerprint: String,
-    /// Absent is a missing statement; an empty list states "no assessments".
-    #[serde(default)]
-    pub assessment_ids: Option<Vec<String>>,
-}
-/// Records an assessment brings into its hypothesis' fingerprint beyond what
-/// the fingerprint already covered in `read`: its cited evidence, links
-/// touching that evidence and their other ends. `current` is the state the
-/// assessment is added to. Only IDs that exist in `read` are returned. The
-/// server and `Change::create_seen` both use this; web/app.js mirrors it.
-pub fn assessment_additions(
-    read: &Snapshot,
-    current: &Snapshot,
-    assessment: &Record,
-) -> Vec<String> {
-    let Data::Assessment { hypothesis, .. } = &assessment.data else {
-        return vec![];
-    };
-    let covered = read.relevant(hypothesis);
-    current
-        .relevant_with(assessment)
-        .difference(&covered)
-        .filter(|id| read.get(id).is_some())
-        .cloned()
-        .collect()
+    pub review_token: String,
 }
 impl Change {
     /// A create whose `expected` states what `seen`, the snapshot the caller
@@ -136,9 +112,6 @@ impl Change {
             } => {
                 based_on.clear();
                 supersedes.clear();
-                for id in assessment_additions(seen, seen, &record) {
-                    state(&id);
-                }
             }
             Data::Experiment {
                 hypothesis,
@@ -176,8 +149,7 @@ impl Change {
                 expected.hypotheses.insert(
                     hypothesis.clone(),
                     SeenHypothesis {
-                        fingerprint: st.fingerprint.clone(),
-                        assessment_ids: Some(st.assessment_ids.clone()),
+                        review_token: st.review_token.clone(),
                     },
                 );
             }
@@ -216,7 +188,7 @@ fn stated<'a>(after: &'a Snapshot, id: &str, expected_revision: &str) -> Result<
     Ok(current)
 }
 /// Where the create's statements disagree with `before`, the state the
-/// caller read: stated hypotheses whose fingerprint or assessments changed,
+/// caller read: stated hypotheses whose review token changed,
 /// stated revisions that changed, and stated records that disappeared.
 /// Incomplete statements are ordinary errors.
 fn stale_statements(before: &Snapshot, expected: &Expected) -> Result<Vec<String>> {
@@ -233,30 +205,27 @@ fn stale_statements(before: &Snapshot, expected: &Expected) -> Result<Vec<String
     let mut stale = Vec::new();
     for (id, seen) in &expected.hypotheses {
         ensure!(
-            !seen.fingerprint.is_empty(),
-            "expected.hypotheses[\"{id}\"].fingerprint is required: \
-             .state.fingerprint of `hyp --json show {id}` as you read it"
+            !seen.review_token.is_empty(),
+            "expected.hypotheses[\"{id}\"].review_token is required: \
+             .state.review_token of `hyp --json show {id}` as you read it"
         );
-        let Some(ids) = &seen.assessment_ids else {
-            bail!(
-                "expected.hypotheses[\"{id}\"].assessment_ids is required: \
-                 .state.assessment_ids of `hyp --json show {id}` as you read it ([] for none)"
-            );
-        };
+        ensure!(
+            seen.review_token.len() == 64
+                && seen.review_token.bytes().all(|b| b.is_ascii_hexdigit()),
+            "expected.hypotheses[\"{id}\"].review_token must be the 64-hex-digit \
+             .state.review_token of `hyp --json show {id}`"
+        );
         full_id(id)?;
         match before.hypotheses.get(id) {
             None => stale.push(format!(
                 "hypothesis {id} does not exist (deleted since you read it, or never existed)"
             )),
-            Some(now) => {
-                if now.fingerprint != seen.fingerprint {
-                    stale.push(format!("hypothesis {id} changed (fingerprint)"));
-                }
-                let current: BTreeSet<&String> = now.assessment_ids.iter().collect();
-                if current != ids.iter().collect() {
-                    stale.push(format!("the assessments of {id} changed (assessment_ids)"));
-                }
+            Some(now) if !now.review_token.eq_ignore_ascii_case(&seen.review_token) => {
+                stale.push(format!(
+                    "hypothesis {id} changed: its basis or its current assessments (review_token)"
+                ))
             }
+            Some(_) => {}
         }
     }
     for (id, revision) in &expected.revisions {
@@ -275,19 +244,31 @@ fn stale_statements(before: &Snapshot, expected: &Expected) -> Result<Vec<String
     }
     Ok(stale)
 }
-/// Checks a create against `before`, the project as the caller read it,
-/// before the server derives or freezes content for it from `after` (the
-/// state including earlier changes of the batch). Without this, an
-/// assessment would be recorded as based on records its author never saw.
-/// Records created earlier in the batch are the caller's own and need no
-/// statement. Missing statements are ordinary errors; stale ones and
-/// records the author could not have stated are one `Conflict` listing them.
-fn check_create(
+/// IDs in `basis` (of `hypothesis`, at a create's position in a batch) that
+/// were not in its basis in `before`, the state the caller's review token
+/// covers, and that the batch did not create. Within a batch the basis may
+/// grow only by the author's own new records.
+fn basis_growth(
     before: &Snapshot,
-    after: &Snapshot,
-    record: &Record,
-    expected: Option<&Expected>,
-) -> Result<()> {
+    basis: &BTreeMap<String, serde_json::Value>,
+    hypothesis: &str,
+    created: &[String],
+) -> Vec<String> {
+    let reviewed = before.basis(hypothesis);
+    basis
+        .keys()
+        .filter(|id| !reviewed.contains_key(*id) && !created.contains(id))
+        .cloned()
+        .collect()
+}
+/// Checks a create against `before`, the project as the caller read it,
+/// before the server derives or freezes content for it from the state
+/// including earlier changes of the batch. Without this, an assessment
+/// would be recorded as based on records its author never saw. Records
+/// created earlier in the batch are the caller's own and need no statement.
+/// Missing statements are ordinary errors; stale ones are one `Conflict`
+/// listing them.
+fn check_create(before: &Snapshot, record: &Record, expected: Option<&Expected>) -> Result<()> {
     let kind = record.data.kind();
     match &record.data {
         Data::Assessment {
@@ -344,21 +325,14 @@ fn check_create(
         }
         Ok(())
     };
-    let mut problems = stale_statements(before, expected)?;
-    let mut unstated = Vec::new();
+    let problems = stale_statements(before, expected)?;
     match &record.data {
-        Data::Assessment { hypothesis, .. } => {
-            if before.get(hypothesis).is_some() {
-                ensure!(
-                    expected.hypotheses.contains_key(hypothesis),
-                    "an assessment of {hypothesis} requires expected.hypotheses[\"{hypothesis}\"]: \
-                     {{fingerprint, assessment_ids}} as you read them (.state of `hyp --json show {hypothesis}`)"
-                );
-            }
-            unstated = assessment_additions(before, after, record)
-                .into_iter()
-                .filter(|id| !expected.revisions.contains_key(id))
-                .collect();
+        Data::Assessment { hypothesis, .. } if before.get(hypothesis).is_some() => {
+            ensure!(
+                expected.hypotheses.contains_key(hypothesis),
+                "an assessment of {hypothesis} requires expected.hypotheses[\"{hypothesis}\"]: \
+                 {{review_token}} as you read it (.state of `hyp --json show {hypothesis}`)"
+            );
         }
         Data::Experiment {
             hypothesis,
@@ -384,13 +358,6 @@ fn check_create(
             }
         }
         _ => {}
-    }
-    if !unstated.is_empty() {
-        problems.push(format!(
-            "the assessment would also be based on {}, not stated in expected.revisions \
-             (new or newly linked?)",
-            unstated.join(", ")
-        ));
     }
     if !problems.is_empty() {
         bail!(Conflict(format!(
@@ -700,8 +667,14 @@ impl Store {
             } = &entry.record.data
             {
                 // An untestable reason is the stated alternative to a criterion.
-                if untestable_reason.trim().is_empty() && !snap.objects.iter().any(|e|!e.record.archived && matches!(&e.record.data,Data::Criterion{hypothesis} if hypothesis==&entry.record.id)) {
-                    snap.diagnostics.push(Diagnostic{path:entry.record.id.clone(),message:"no active falsification criterion".into(),severity:"warning".into()});
+                if untestable_reason.trim().is_empty()
+                    && !snap.has_active_criterion(&entry.record.id)
+                {
+                    snap.diagnostics.push(Diagnostic {
+                        path: entry.record.id.clone(),
+                        message: "no active falsification criterion".into(),
+                        severity: "warning".into(),
+                    });
                 }
             }
         }
@@ -719,6 +692,7 @@ impl Store {
         }
         let mut after = before.clone();
         let mut writes = BTreeMap::new();
+        let mut created = Vec::new();
         for change in changes {
             let record = match change {
                 Change::Create {
@@ -732,11 +706,12 @@ impl Store {
                         !after.objects.iter().any(|e| e.record.id == record.id),
                         "ID already exists"
                     );
-                    check_create(&before, &after, &record, expected.as_ref())?;
+                    check_create(&before, &record, expected.as_ref())?;
+                    after.validate_new(&record)?;
+                    created.push(record.id.clone());
                     record.created_at = chrono::Utc::now().to_rfc3339();
                     // Derived and frozen content comes from the current state, which
                     // check_create tied to what the caller read.
-                    let relevant = after.relevant_with(&record);
                     match &mut record.data {
                         Data::Assessment {
                             hypothesis,
@@ -744,7 +719,16 @@ impl Store {
                             supersedes,
                             ..
                         } => {
-                            *based_on = after.fingerprint_of(&relevant);
+                            let basis = after.basis(hypothesis);
+                            let unreviewed = basis_growth(&before, &basis, hypothesis, &created);
+                            ensure!(
+                                unreviewed.is_empty(),
+                                "this batch brings {} into the basis of {hypothesis} (a new or \
+                                 restored link or run), which your review token did not cover; \
+                                 link pre-existing evidence in an earlier write, re-read, then assess",
+                                unreviewed.join(", ")
+                            );
+                            *based_on = fingerprint_of(&basis);
                             *supersedes = after
                                 .assessment_heads(hypothesis)
                                 .iter()
@@ -842,6 +826,14 @@ impl Store {
                 }
             };
             let mut record = record;
+            // An update or archive that changes nothing but updated_at is not
+            // written, so the file and its revision stay as they are.
+            if let Some(old) = after.get(&record.id) {
+                record.updated_at.clone_from(&old.record.updated_at);
+                if encode(&record)? == encode(&old.record)? {
+                    continue;
+                }
+            }
             record.updated_at = chrono::Utc::now().to_rfc3339();
             let raw = encode(&record)?;
             ensure!(

@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-09-29 23:15'
-updated_date: '2026-09-30 02:00'
+updated_date: '2026-09-30 11:49'
 labels:
   - cli
   - ux
@@ -34,4 +34,6 @@ From the cycle-2 QA gate (non-blocking). (1) `hyp --project <empty dir> list` sa
 HYPO-0002 added tests/cli.rs unrelated_write_between_read_and_commit_does_not_fail_a_cli_write, which also checks exit 3 for a stale per-object revision through 'hyp edit' (a concurrent 'hyp set' of the same record). AC #3 asks for it through 'hyp apply'; still open if that path should be covered separately.
 
 From the HYPO-0016 QA: `hyp evidence attach E FILE` prints 'Attached ./FILE' instead of an ID, unlike the other write commands (the skill says write commands print IDs). Print the evidence ID (and asset hash).
+
+Filed from the review basis v2 deep gate (2026-09-30): vague errors for agents. "falsified requires a criterion and evidence" does not say which is missing; an unknown ID gives "ID \"X\" matches 0 objects; use a longer prefix", which suggests the ID is too short rather than unknown. Say "no object with ID X" for zero matches.
 <!-- SECTION:NOTES:END -->

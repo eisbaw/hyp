@@ -253,17 +253,24 @@ pub struct HypothesisState {
     pub needs_review: bool,
     pub assessment_ids: Vec<String>,
     pub fingerprint: String,
-    /// The fingerprint and the current assessments as one value, so a reviewer
-    /// can state both; `hyp assess --reviewed` takes it. It does not cover
-    /// evidence a new assessment cites from outside the fingerprint.
+    /// The fingerprint and the current assessments (IDs and revisions) as
+    /// one value: what a new assessment states it reviewed
+    /// (`hyp assess --reviewed`, `expected.hypotheses`).
     pub review_token: String,
 }
+/// The SHA-256 of a basis as compact JSON with sorted keys.
+pub fn fingerprint_of(basis: &BTreeMap<String, serde_json::Value>) -> String {
+    hash(serde_json::to_string(basis).expect("JSON values serialize"))
+}
 /// `HypothesisState::review_token`: a hash of the fingerprint and the sorted
-/// IDs of the current assessments.
-pub fn review_token(fingerprint: &str, assessment_ids: &[String]) -> String {
-    let mut ids = assessment_ids.to_vec();
-    ids.sort();
-    hash(format!("{fingerprint}\n{}", ids.join("\n")))
+/// `ID:revision` lines of the current assessments.
+pub fn review_token(fingerprint: &str, assessments: &[&Entry]) -> String {
+    let mut lines: Vec<String> = assessments
+        .iter()
+        .map(|e| format!("{}:{}", e.record.id, e.revision))
+        .collect();
+    lines.sort();
+    hash(format!("{fingerprint}\n{}", lines.join("\n")))
 }
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Snapshot {
@@ -302,81 +309,126 @@ impl Snapshot {
         );
         Ok(hits[0])
     }
-    /// The fingerprint of hypothesis `id`: a hash of the revisions of the
-    /// records in `relevant(id)`.
-    pub fn fingerprint(&self, id: &str) -> String {
-        self.fingerprint_of(&self.relevant(id))
-    }
-    pub fn fingerprint_of(&self, relevant: &BTreeSet<String>) -> String {
-        hash(
+    /// The hypothesis `id` and its criteria and predictions; with
+    /// `active_only`, without archived ones.
+    fn claim_records<'a>(&'a self, id: &'a str, active_only: bool) -> BTreeSet<&'a str> {
+        let mut own = BTreeSet::from([id]);
+        own.extend(
             self.objects
                 .iter()
-                .filter(|e| relevant.contains(&e.record.id))
-                .map(|e| format!("{}:{}\n", e.record.id, e.revision))
-                .collect::<String>(),
-        )
+                .filter(|e| {
+                    e.record.data.owner() == Some(id)
+                        && matches!(
+                            e.record.data,
+                            Data::Criterion { .. } | Data::Prediction { .. }
+                        )
+                        && !(active_only && e.record.archived)
+                })
+                .map(|e| e.record.id.as_str()),
+        );
+        own
     }
-    /// `relevant` for the hypothesis of `assessment`, with it added to this
-    /// state: what a new assessment's fingerprint covers.
-    pub fn relevant_with(&self, assessment: &Record) -> BTreeSet<String> {
-        let Data::Assessment { hypothesis, .. } = &assessment.data else {
-            return BTreeSet::new();
-        };
-        let mut basis = self.clone();
-        basis.objects.push(Entry {
-            record: assessment.clone(),
-            revision: String::new(),
-        });
-        basis.relevant(hypothesis)
+    /// Evidence with an active link to hypothesis `id` or one of its active
+    /// criteria or predictions: what an assessment of `id` may cite.
+    pub fn linked_evidence<'a>(&'a self, id: &'a str) -> BTreeSet<&'a str> {
+        let targets = self.claim_records(id, true);
+        self.objects
+            .iter()
+            .filter(|e| !e.record.archived)
+            .filter_map(|e| match &e.record.data {
+                Data::Link {
+                    from,
+                    to,
+                    relation: Relation::Supports | Relation::Contradicts | Relation::Qualifies,
+                } if targets.contains(to.as_str()) => Some(from.as_str()),
+                _ => None,
+            })
+            .collect()
     }
-    /// IDs of the records an assessment of hypothesis `id` is based on. The
-    /// direct ones: the hypothesis, its non-assessment records, runs of its
-    /// experiments, the evidence those runs cite and the evidence its
-    /// assessments cite. Then links touching any direct record, with both
-    /// ends. May name IDs that do not exist.
-    pub fn relevant(&self, id: &str) -> BTreeSet<String> {
-        let mut relevant = BTreeSet::from([id.to_string()]);
+    /// What an assessment of hypothesis `id` is based on (decision-0003):
+    /// record ID -> the fields of that record that count. Covered: the claim
+    /// (title, body, scope, assumptions, archived), its criteria and
+    /// predictions, links touching any of them (for a link to another
+    /// hypothesis only the link, not that hypothesis), `linked_evidence`, and
+    /// runs of its experiments with the evidence they cite. Evidence counts
+    /// with its provenance (source, locator, attachment hashes). Not covered:
+    /// lifecycle, tags, the untestable reason, experiments themselves, gaps,
+    /// assessments and timestamps. `fingerprint` hashes it; `hyp --json show`
+    /// prints it.
+    pub fn basis(&self, id: &str) -> BTreeMap<String, serde_json::Value> {
+        use serde_json::json;
+        let own = self.claim_records(id, false);
+        let experiments: BTreeSet<&str> = self
+            .objects
+            .iter()
+            .filter(|e| matches!(&e.record.data, Data::Experiment { hypothesis, .. } if hypothesis == id))
+            .map(|e| e.record.id.as_str())
+            .collect();
+        let mut basis = BTreeMap::new();
+        let mut evidence_ids = self.linked_evidence(id);
         for e in &self.objects {
-            if e.record.data.owner() == Some(id)
-                && !matches!(e.record.data, Data::Assessment { .. })
-            {
-                relevant.insert(e.record.id.clone());
-            }
+            let r = &e.record;
+            let (title, body, archived) = (&r.title, &r.body, r.archived);
+            let fields = match &r.data {
+                Data::Hypothesis {
+                    scope, assumptions, ..
+                } if r.id == id => {
+                    json!({"title": title, "body": body, "scope": scope, "assumptions": assumptions, "archived": archived})
+                }
+                Data::Criterion { .. } if own.contains(r.id.as_str()) => {
+                    json!({"title": title, "body": body, "archived": archived})
+                }
+                Data::Prediction { conditions, .. } if own.contains(r.id.as_str()) => {
+                    json!({"title": title, "body": body, "conditions": conditions, "archived": archived})
+                }
+                Data::Link { from, to, relation }
+                    if own.contains(from.as_str()) || own.contains(to.as_str()) =>
+                {
+                    json!({"from": from, "to": to, "relation": relation, "body": body, "archived": archived})
+                }
+                Data::Run {
+                    experiment,
+                    outcome,
+                    evidence,
+                    ..
+                } if experiments.contains(experiment.as_str()) => {
+                    evidence_ids.extend(evidence.iter().map(String::as_str));
+                    json!({"title": title, "body": body, "outcome": outcome, "evidence": evidence})
+                }
+                _ => continue,
+            };
+            basis.insert(r.id.clone(), fields);
         }
         for e in &self.objects {
-            if let Data::Run {
-                experiment,
-                evidence,
+            let r = &e.record;
+            if let Data::Evidence {
+                source,
+                locator,
+                attachments,
                 ..
-            } = &e.record.data
+            } = &r.data
             {
-                if relevant.contains(experiment) {
-                    relevant.insert(e.record.id.clone());
-                    relevant.extend(evidence.iter().cloned());
+                if evidence_ids.contains(r.id.as_str()) {
+                    let hashes: Vec<&str> = attachments.iter().map(|a| a.sha256.as_str()).collect();
+                    basis.insert(
+                        r.id.clone(),
+                        json!({"title": r.title, "body": r.body, "archived": r.archived,
+                               "source": source, "locator": locator, "attachments": hashes}),
+                    );
                 }
             }
         }
-        for e in &self.objects {
-            if let Data::Assessment {
-                hypothesis,
-                evidence,
-                ..
-            } = &e.record.data
-            {
-                if hypothesis == id {
-                    relevant.extend(evidence.iter().cloned());
-                }
-            }
-        }
-        let direct = relevant.clone();
-        for e in &self.objects {
-            if let Data::Link { from, to, .. } = &e.record.data {
-                if direct.contains(from) || direct.contains(to) {
-                    relevant.extend([e.record.id.clone(), from.clone(), to.clone()]);
-                }
-            }
-        }
-        relevant
+        basis
+    }
+    /// The fingerprint of hypothesis `id`: `fingerprint_of(basis(id))`.
+    pub fn fingerprint(&self, id: &str) -> String {
+        fingerprint_of(&self.basis(id))
+    }
+    pub fn has_active_criterion(&self, id: &str) -> bool {
+        self.objects.iter().any(|e| {
+            !e.record.archived
+                && matches!(&e.record.data, Data::Criterion { hypothesis } if hypothesis == id)
+        })
     }
     pub fn assessment_heads(&self, id: &str) -> Vec<&Entry> {
         let assessments: Vec<_> = self
@@ -421,13 +473,14 @@ impl Snapshot {
                 (Judgment::Untested, None, !heads.is_empty())
             };
             let assessment_ids: Vec<String> = heads.iter().map(|e| e.record.id.clone()).collect();
+            let review_token = review_token(&fingerprint, &heads);
             self.hypotheses.insert(
                 id.clone(),
                 HypothesisState {
                     judgment,
                     confidence,
                     needs_review,
-                    review_token: review_token(&fingerprint, &assessment_ids),
+                    review_token,
                     assessment_ids,
                     fingerprint,
                 },
@@ -474,7 +527,10 @@ impl Snapshot {
                 untestable_reason,
                 ..
             } => {
-                ensure!(!untestable_reason.trim().is_empty() || self.objects.iter().any(|e| !e.record.archived && matches!(&e.record.data,Data::Criterion{hypothesis} if hypothesis==&r.id)), "investigating requires a falsification criterion or untestable_reason");
+                ensure!(
+                    !untestable_reason.trim().is_empty() || self.has_active_criterion(&r.id),
+                    "investigating requires a falsification criterion or untestable_reason"
+                );
             }
             Data::Evidence {
                 source,
@@ -651,6 +707,45 @@ impl Snapshot {
                 }
             }
             _ => {}
+        }
+        Ok(())
+    }
+    /// Rules for creating record `r` in this state, on top of `validate`.
+    /// They are not checked on stored records: assessments are immutable
+    /// history, and archiving a link later must not invalidate one. Every
+    /// judgment except untested cites evidence, and only `linked_evidence`.
+    pub fn validate_new(&self, r: &Record) -> Result<()> {
+        let Data::Assessment {
+            hypothesis,
+            judgment,
+            evidence,
+            ..
+        } = &r.data
+        else {
+            return Ok(());
+        };
+        let article = if judgment.to_string().starts_with(['a', 'e', 'i', 'o', 'u']) {
+            "an"
+        } else {
+            "a"
+        };
+        ensure!(
+            *judgment == Judgment::Untested || !evidence.is_empty(),
+            "{article} {judgment} assessment must cite evidence: every judgment except \
+             untested needs at least one evidence ID linked to {hypothesis}"
+        );
+        let linked = self.linked_evidence(hypothesis);
+        for id in evidence {
+            // Unknown IDs and prefixes are reported by `validate`.
+            if self.get(id).is_some() {
+                ensure!(
+                    linked.contains(id.as_str()),
+                    "{id} is not linked to {hypothesis} or its active criteria or predictions, \
+                     and an assessment may cite only linked evidence. Link it first \
+                     (hyp link {id} {hypothesis} --relation supports|contradicts|qualifies \
+                     --reason \"...\"), then re-read and assess"
+                );
+            }
         }
         Ok(())
     }

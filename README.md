@@ -120,25 +120,25 @@ Errors go to stderr, with `--json` as `{"error": "…"}`. A conflict's message s
 
 ### Preconditions
 
-Every change states what it depends on, as read from a snapshot (`hyp --json show ID` gives a record's `entry.revision`, a hypothesis's `state`, the records that refer to it (`related`), and for a hypothesis everything its review token covers: `runs` of its experiments and all linked or cited `evidence` in full, `basis` (the ID and revision of each record the fingerprint covers) and `state.assessment_ids`; `hyp export --format json` gives everything). A change that depended on something that changed is rejected; a change that did not is unaffected by other writers.
+Every change states what it depends on, as read from a snapshot. `hyp --json show ID` gives a record's `entry.revision` and the records that refer to it (`related`); for a hypothesis also its `state` and `basis`, what its fingerprint covers (see [The model](#the-model)), with the `runs` and `evidence` in it in full. `hyp export --format json` gives everything. A change that depended on something that changed is rejected; a change that did not is unaffected by other writers.
 
-- update, archive, delete: `expected_revision`, the record's revision.
-- create an assessment, experiment or run: an `expected` object next to `record`:
-  - `expected.hypotheses`: for an assessment, its hypothesis's `fingerprint` and `assessment_ids` as read (`[]` for none).
-  - `expected.revisions`: full ID to revision, for each experiment target (the hypothesis must be one of the targets), for a run's experiment and the evidence it cites, and for every record an assessment brings into its hypothesis's fingerprint that was not already part of it: the cited evidence, links touching that evidence, and their other ends. Stating a record that is already covered is harmless, so the practical recipe for an assessment is: for each cited evidence `E`, state `E`, every link in `.related` of `hyp --json show E`, and both ends of each such link.
+- update, archive, delete: `expected_revision`, the record's revision. An update or archive that changes nothing is not written.
+- create an assessment: `expected.hypotheses[H].review_token`, the `state.review_token` of its hypothesis as read. The token covers the fingerprint and the current assessments (their IDs and revisions).
+- create an experiment or run: `expected.revisions`, full ID to revision, for each experiment target (the hypothesis must be one of the targets), or for a run's experiment and the evidence it cites.
 - `based_on`, `supersedes`, a target's `revision`, `title` and `body`, and a run's `plan` are set by the server; a create that fills them in is rejected. Targets are given as `{"id": "P-…"}`.
 
 ```json
 [{"op": "create",
   "record": {"kind": "assessment", "title": "Weakened", "body": "Why …",
              "hypothesis": "H-…", "judgment": "weakened", "evidence": ["E-…"]},
-  "expected": {"hypotheses": {"H-…": {"fingerprint": "…", "assessment_ids": ["A-…"]}},
-               "revisions": {"E-…": "…", "L-…": "…", "H-other…": "…"}}}]
+  "expected": {"hypotheses": {"H-…": {"review_token": "…"}}}}]
 ```
 
-A statement that no longer holds (the record changed or was deleted), or a record the assessment would now also be based on that you did not state (for example a link added since), is a conflict: exit `3`, HTTP 409, and the message lists the IDs. Re-read, review what changed, then retry. A missing or malformed statement is an ordinary error (exit `1`, HTTP 422) naming the field; retrying it unchanged will not help. Records created earlier in the same batch need no statement. A batch that links existing evidence into the hypothesis and then assesses it must state that evidence in the assessment's `expected.revisions`: the link makes it part of the fingerprint.
+A statement that no longer holds (the record changed or was deleted) is a conflict: exit `3`, HTTP 409, and the message names what changed. Re-read, review what changed, then retry. A missing or malformed statement is an ordinary error (exit `1`, HTTP 422) naming the field; retrying it unchanged will not help. Records created earlier in the same batch need no statement.
 
-The CLI commands state preconditions from their own read, so they protect only the moment between that read and the write. `hyp assess` is the exception: it requires `--reviewed` with the `review_token` from the `state` you reviewed (`hyp --json show H-…` or `hyp --json list`), a hash of the fingerprint and the current assessment IDs. If the hypothesis's records or its current assessments changed since, it writes nothing and exits `3`; a malformed token exits `1`. The revisions of the evidence it cites still come from the command's own read. To protect a longer window for other records, use `hyp apply`. The WebUI states everything as of the moment a form was opened.
+An assessment may cite only evidence with an active link to its hypothesis, or to one of its active criteria or predictions (`hyp link E-… H-… --relation supports --reason "…"`). Citing other evidence, or a judgment other than `untested` without evidence, is an ordinary error. In an `apply` batch, the assessment's basis may grow only by records the batch creates: to bring in evidence that already existed, link it in an earlier write, re-read, then assess.
+
+The CLI commands state preconditions from their own read, so they protect only the moment between that read and the write. `hyp assess` is the exception: it requires `--reviewed` with the `review_token` from the `state` you reviewed (`hyp --json show H-…` or `hyp --json list`). If the hypothesis's basis or its current assessments changed since, it writes nothing and exits `3`; a malformed token exits `1`. To protect a longer window for other records, use `hyp apply`. The WebUI states everything as of the moment a form was opened.
 
 ## The model
 
@@ -159,9 +159,9 @@ Predictions and criteria are separate Markdown records, which makes them individ
 Lifecycle is **draft / investigating / paused / closed**. Assessment is **untested / inconclusive / supported / weakened / falsified**. Closing an investigation never declares its hypothesis true.
 
 - Drafts may be incomplete. Investigating requires an active criterion or an explicit `untestable_reason`.
-- Falsification requires a rationale, evidence and a criterion belonging to that hypothesis. Whoever records the assessment, agent or human, judges whether the observation actually satisfies it. The agent skill asks agents to cite evidence and give a rationale for every judgment, not only for falsification.
+- Every assessment needs a rationale. Every judgment except untested must cite evidence linked to the hypothesis, and falsification also a criterion belonging to it. Whoever records the assessment, agent or human, judges whether the observation actually satisfies it.
 - Confidence is optional, subjective, and in `[0, 1]`. Evidence counts never calculate it.
-- An assessment fingerprints the hypothesis's relevant records, interpretations and cited observations. Changes show **needs review** without rewriting the judgment.
+- An assessment records the hypothesis's fingerprint: the SHA-256 of its `basis` (`hyp --json show`) as compact JSON with sorted keys. The basis holds content only: the claim (title, body, scope, assumptions, archived); its criteria and predictions (title, body, conditions, archived); links touching the hypothesis or those (ends, relation, reason, archived), so another hypothesis counts only through its link; the evidence with an active link to the hypothesis or an active criterion or prediction; and runs of its experiments (title, body, outcome, cited evidence) with the evidence they cite. Evidence counts with its provenance (title, body, source, locator, attachment hashes, archived). A change to it shows **needs review** without rewriting the judgment. Lifecycle, tags, the untestable reason, experiments, gaps and timestamps are not part of it, so closing a hypothesis does not flag it; archiving it does.
 - A new assessment supersedes the current assessment heads. Divergent heads after any merge or sync require explicit reconciliation; neither silently wins by timestamp.
 - Experiments freeze complete target content and revisions at creation. Runs freeze the complete experiment plan at execution-record creation. `hyp run` records an execution; it does not execute commands.
 - Historic assessments and runs cannot be edited or deleted through the tool. To keep a history of all file edits, use any version control, e.g. Git. There is no claim of tamper-proof auditing.

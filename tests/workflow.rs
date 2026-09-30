@@ -110,35 +110,121 @@ fn complete_workflow_preserves_assessment_and_detects_new_evidence() {
     assert_eq!(s.hypotheses[&h.id].assessment_ids, vec![a2.id]);
     assert!(s.find(&a.id).is_ok());
 }
+/// Decision-0003 item 2: an assessment may cite only evidence that was
+/// already linked to the hypothesis, or to its criteria or predictions, when
+/// its author read it. So the review token covers everything it cites.
 #[test]
-fn unlinked_assessment_evidence_changes_trigger_review() {
+fn assessment_may_cite_only_evidence_already_linked() {
     let (_d, store) = project();
-    let h = hypothesis();
-    create(&store, &h);
-    let f = Record::new(
-        "Reject if timeout",
-        Data::Criterion {
-            hypothesis: h.id.clone(),
-        },
+    let i = investigation(&store);
+    let unlinked = evidence();
+    create(&store, &unlinked);
+    let seen = store.snapshot().unwrap();
+    let err = rejected(
+        &store,
+        Change::create_seen(assess(&i.h, &unlinked, &i.f), &seen),
     );
-    create(&store, &f);
-    let e = evidence();
-    create(&store, &e);
-    create(&store, &assess(&h, &e, &f));
-    let s = store.snapshot().unwrap();
-    let entry = s.find(&e.id).unwrap();
-    let mut changed = entry.record.clone();
-    changed.body = "The source was retracted".into();
-    store
+    assert!(
+        err.contains(&format!("hyp link {} {}", unlinked.id, i.h.id)),
+        "{err}"
+    );
+    // Linking it in the same batch is not enough: the author never reviewed it.
+    let err = store
         .commit(
-            vec![Change::Update {
-                record: changed,
-                expected_revision: entry.revision.clone(),
-            }],
+            vec![
+                Change::create_seen(link(&unlinked, &i.h, Relation::Supports), &seen),
+                Change::create_seen(assess(&i.h, &unlinked, &i.f), &seen),
+            ],
+            None,
+        )
+        .unwrap_err();
+    assert_eq!(hyp::cli::exit_code(&err), 1, "{err:#}");
+    assert!(format!("{err:#}").contains("earlier write"), "{err:#}");
+    // An archived link does not count.
+    let criterion_link = link(&unlinked, &i.f, Relation::Supports);
+    create(&store, &criterion_link);
+    update(&store, &criterion_link.id, |r| r.archived = true);
+    rejected(
+        &store,
+        Change::create_seen(assess(&i.h, &unlinked, &i.f), &store.snapshot().unwrap()),
+    );
+    // A link to one of its criteria counts, written first and then re-read.
+    update(&store, &criterion_link.id, |r| r.archived = false);
+    let s = store
+        .commit(
+            vec![Change::create_seen(
+                assess(&i.h, &unlinked, &i.f),
+                &store.snapshot().unwrap(),
+            )],
             None,
         )
         .unwrap();
-    assert!(store.snapshot().unwrap().hypotheses[&h.id].needs_review);
+    assert!(!s.hypotheses[&i.h.id].needs_review);
+}
+/// Decision-0003 item 4, enforced for every writer when an assessment is
+/// created. Stored assessments from before the rule stay valid.
+#[test]
+fn judgments_other_than_untested_require_evidence() {
+    let (_d, store) = project();
+    let i = investigation(&store);
+    let without = |judgment: Judgment| {
+        let mut a = assess(&i.h, &i.e, &i.f);
+        if let Data::Assessment {
+            judgment: j,
+            evidence,
+            criterion,
+            ..
+        } = &mut a.data
+        {
+            *j = judgment;
+            evidence.clear();
+            *criterion = None;
+        }
+        a
+    };
+    for judgment in [
+        Judgment::Inconclusive,
+        Judgment::Supported,
+        Judgment::Weakened,
+    ] {
+        let err = rejected(
+            &store,
+            Change::create_seen(without(judgment), &store.snapshot().unwrap()),
+        );
+        let article = if judgment == Judgment::Inconclusive {
+            "an"
+        } else {
+            "a"
+        };
+        assert!(
+            err.contains(&format!(
+                "{article} {judgment} assessment must cite evidence"
+            )),
+            "{err}"
+        );
+    }
+    let untested = without(Judgment::Untested);
+    create(&store, &untested);
+    // An evidence-less judgment written by an older hyp is not an error.
+    let mut legacy = without(Judgment::Supported);
+    if let Data::Assessment {
+        based_on,
+        supersedes,
+        ..
+    } = &mut legacy.data
+    {
+        *based_on = "0".repeat(64);
+        supersedes.push(untested.id.clone());
+    }
+    std::fs::write(
+        store.root.join(format!("hyp/assessments/{}.md", legacy.id)),
+        encode(&legacy).unwrap(),
+    )
+    .unwrap();
+    let s = store.snapshot().unwrap();
+    s.assert_healthy().unwrap();
+    assert_eq!(s.hypotheses[&i.h.id].judgment, Judgment::Supported);
+    create(&store, &hypothesis());
 }
 #[test]
 fn stale_object_and_project_writes_are_rejected() {
@@ -358,29 +444,13 @@ fn investigation_requires_criterion_and_referenced_objects_cannot_disappear() {
 #[test]
 fn falsification_requires_evidence_and_criterion() {
     let (_d, store) = project();
-    let h = hypothesis();
-    create(&store, &h);
-    let mut a = Record::new(
-        "Rejected",
-        Data::Assessment {
-            hypothesis: h.id,
-            judgment: Judgment::Falsified,
-            confidence: Some(0.1),
-            evidence: vec![],
-            criterion: None,
-            based_on: String::new(),
-            supersedes: vec![],
-        },
-    );
-    a.body = "A feeling".into();
-    let seen = store.snapshot().unwrap();
-    assert!(
-        store
-            .commit(vec![Change::create_seen(a, &seen)], None)
-            .unwrap_err()
-            .to_string()
-            .contains("criterion and evidence")
-    );
+    let i = investigation(&store);
+    let mut a = assess(&i.h, &i.e, &i.f);
+    if let Data::Assessment { criterion, .. } = &mut a.data {
+        *criterion = None;
+    }
+    let err = rejected(&store, Change::create_seen(a, &store.snapshot().unwrap()));
+    assert!(err.contains("criterion and evidence"), "{err}");
 }
 #[test]
 fn dependency_cycles_rejected_but_competing_hypotheses_allowed() {
@@ -866,7 +936,7 @@ fn assessment_is_a_conflict_when_the_hypothesis_changed_after_it_was_read() {
     create(&store, &link(&counter, &i.h, Relation::Contradicts));
     let err = conflict(&store, assessment.clone());
     assert!(
-        err.contains(&format!("hypothesis {} changed (fingerprint)", i.h.id)),
+        err.contains(&format!("hypothesis {} changed", i.h.id)) && err.contains("review_token"),
         "{err}"
     );
     // Re-reading and reviewing the new state is what makes it succeed.
@@ -895,101 +965,7 @@ fn assessment_is_a_conflict_when_another_assessment_arrived_after_it_was_read() 
         seen.hypotheses[&i.h.id].fingerprint
     );
     let err = conflict(&store, mine);
-    assert!(err.contains("assessment_ids"), "{err}");
-}
-
-#[test]
-fn assessment_is_a_conflict_when_cited_unlinked_evidence_changed_after_it_was_read() {
-    let (_d, store) = project();
-    let i = investigation(&store);
-    let unlinked = evidence();
-    create(&store, &unlinked);
-    let seen = store.snapshot().unwrap();
-    let assessment = Change::create_seen(assess(&i.h, &unlinked, &i.f), &seen);
-    update(&store, &unlinked.id, |r| {
-        r.body = "Retracted: wrong board".into()
-    });
-    // Evidence nobody linked is outside the hypothesis fingerprint until cited.
-    assert_eq!(
-        store.snapshot().unwrap().hypotheses[&i.h.id].fingerprint,
-        seen.hypotheses[&i.h.id].fingerprint
-    );
-    let err = conflict(&store, assessment);
-    assert!(
-        err.contains(&format!("{} changed (revision)", unlinked.id)),
-        "{err}"
-    );
-}
-
-/// Citing evidence brings its links and their other ends into the stored
-/// fingerprint; changes to them after the read are conflicts too (review P2).
-#[test]
-fn assessment_is_a_conflict_when_records_its_evidence_brings_in_changed_after_it_was_read() {
-    let (_d, store) = project();
-    let i = investigation(&store);
-    let other = hypothesis();
-    create(&store, &other);
-    let shared = evidence();
-    create(&store, &shared);
-    create(&store, &link(&shared, &other, Relation::Supports));
-    // A record that existed when read, and changed since.
-    let seen = store.snapshot().unwrap();
-    let assessment = Change::create_seen(assess(&i.h, &shared, &i.f), &seen);
-    update(&store, &other.id, |r| {
-        r.title = "Changed competing claim".into()
-    });
-    let err = conflict(&store, assessment);
-    assert!(err.contains(&format!("{} changed", other.id)), "{err}");
-    // A link that did not exist when read: the author could not have stated it.
-    let seen = store.snapshot().unwrap();
-    let assessment = Change::create_seen(assess(&i.h, &shared, &i.f), &seen);
-    let third = hypothesis();
-    create(&store, &third);
-    let new_link = link(&shared, &third, Relation::Contradicts);
-    create(&store, &new_link);
-    let err = conflict(&store, assessment);
-    assert!(err.contains("not stated in expected.revisions"), "{err}");
-    assert!(
-        err.contains(&new_link.id) && err.contains(&third.id),
-        "{err}"
-    );
-}
-
-/// A batch that links existing evidence into the hypothesis and then assesses
-/// it brings that evidence into the fingerprint; it must be stated (review P1).
-#[test]
-fn batch_linking_existing_evidence_must_state_what_it_brings_in() {
-    let (_d, store) = project();
-    let i = investigation(&store);
-    let old = evidence();
-    create(&store, &old);
-    let seen = store.snapshot().unwrap();
-    update(&store, &old.id, |r| {
-        r.body = "Retracted: wrong board".into()
-    });
-    let batch = |seen: &Snapshot| {
-        vec![
-            Change::create_seen(link(&old, &i.h, Relation::Supports), seen),
-            Change::create_seen(assess(&i.h, &i.e, &i.f), seen),
-        ]
-    };
-    let err = store.commit(batch(&seen), None).unwrap_err();
-    assert_eq!(hyp::cli::exit_code(&err), 3, "{err:#}");
-    assert!(format!("{err:#}").contains(&old.id), "{err:#}");
-    // As an agent does after reading the conflict: state it, from a fresh read.
-    let seen = store.snapshot().unwrap();
-    let mut changes = batch(&seen);
-    if let Change::Create {
-        expected: Some(expected),
-        ..
-    } = &mut changes[1]
-    {
-        expected
-            .revisions
-            .insert(old.id.clone(), seen.get(&old.id).unwrap().revision.clone());
-    }
-    let s = store.commit(changes, None).unwrap();
-    assert!(!s.hypotheses[&i.h.id].needs_review);
+    assert!(err.contains("review_token"), "{err}");
 }
 
 /// Preconditions refer to the state the caller read, not to the batch so far:
@@ -998,10 +974,8 @@ fn batch_linking_existing_evidence_must_state_what_it_brings_in() {
 fn own_earlier_changes_in_the_batch_are_not_conflicts() {
     let (_d, store) = project();
     let i = investigation(&store);
-    let unlinked = evidence();
-    create(&store, &unlinked);
     let seen = store.snapshot().unwrap();
-    let entry = seen.get(&unlinked.id).unwrap();
+    let entry = seen.get(&i.e.id).unwrap();
     let mut clarified = entry.record.clone();
     clarified.body = "Clarified by the author".into();
     let s = store
@@ -1011,7 +985,7 @@ fn own_earlier_changes_in_the_batch_are_not_conflicts() {
                     record: clarified,
                     expected_revision: entry.revision.clone(),
                 },
-                Change::create_seen(assess(&i.h, &unlinked, &i.f), &seen),
+                Change::create_seen(assess(&i.h, &i.e, &i.f), &seen),
             ],
             None,
         )
@@ -1052,18 +1026,9 @@ fn stated_records_deleted_after_the_read_are_conflicts() {
             )
             .unwrap();
     };
-    let unlinked = evidence();
-    create(&store, &unlinked);
     let seen = store.snapshot().unwrap();
-    let assessment = Change::create_seen(assess(&i.h, &unlinked, &i.f), &seen);
     let run = Change::create_seen(run(&i), &seen);
     let gap = seen.get(&i.x.id).unwrap().clone();
-    archive_and_delete(&unlinked.id);
-    let err = conflict(&store, assessment);
-    assert!(
-        err.contains(&format!("{} does not exist", unlinked.id)),
-        "{err}"
-    );
     archive_and_delete(&i.x.id);
     let err = conflict(&store, run);
     assert!(err.contains(&format!("{} does not exist", i.x.id)), "{err}");
@@ -1112,17 +1077,17 @@ fn incomplete_statements_are_clear_errors_not_conflicts() {
             with(assess(&i.h, &i.e, &i.f), &|e| {
                 e.hypotheses
                     .values_mut()
-                    .for_each(|h| h.assessment_ids = None)
+                    .for_each(|h| h.review_token.clear())
             }),
-            "assessment_ids is required",
+            "review_token is required",
         ),
         (
             with(assess(&i.h, &i.e, &i.f), &|e| {
                 e.hypotheses
                     .values_mut()
-                    .for_each(|h| h.fingerprint.clear())
+                    .for_each(|h| h.review_token = "xyz".into())
             }),
-            "fingerprint is required",
+            "64-hex-digit",
         ),
         (
             with(experiment(&i), &|e| e.revisions.clear()),
@@ -1196,12 +1161,7 @@ fn assessment_create_as_an_agent_writes_it() {
             "body": "The timeout persists with the cache disabled.",
             "hypothesis": i.h.id, "judgment": "weakened", "evidence": [i.e.id]
         },
-        "expected": {
-            "hypotheses": {i.h.id.clone(): {
-                "fingerprint": state.fingerprint, "assessment_ids": state.assessment_ids
-            }},
-            "revisions": {i.e.id.clone(): seen.get(&i.e.id).unwrap().revision}
-        }
+        "expected": {"hypotheses": {i.h.id.clone(): {"review_token": state.review_token}}}
     });
     let change: Change = serde_json::from_value(json).unwrap();
     let s = store.commit(vec![change], None).unwrap();
@@ -1233,7 +1193,7 @@ fn records_created_earlier_in_the_same_batch_need_no_stated_revision() {
                 Change::create_seen(link(&fresh, &i.h, Relation::Supports), &seen),
                 Change::create_seen(p2, &seen),
                 Change::create_seen(x2, &seen),
-                Change::create_seen(assess(&i.h, &fresh, &i.f), &seen),
+                Change::create_seen(assess(&i.h, &i.e, &i.f), &seen),
             ],
             None,
         )
@@ -1321,10 +1281,11 @@ fn stale_archive_and_delete_are_still_conflicts() {
     assert!(err.contains("object changed"), "{err}");
 }
 
-/// Links touching evidence cited by the hypothesis' runs, and their far ends,
-/// are part of what an assessment is based on (review round 2, finding 1).
+/// Evidence cited by the hypothesis' runs is part of the basis, but other
+/// hypotheses' interpretations of it are not (decision-0003: another
+/// hypothesis counts only through a link to this one).
 #[test]
-fn links_on_run_evidence_are_part_of_the_fingerprint() {
+fn run_evidence_counts_but_its_interpretations_elsewhere_do_not() {
     let (_d, store) = project();
     let i = investigation(&store);
     let observed = evidence();
@@ -1337,15 +1298,15 @@ fn links_on_run_evidence_are_part_of_the_fingerprint() {
     let other = hypothesis();
     create(&store, &other);
     create(&store, &assess(&i.h, &i.e, &i.f));
-    assert!(!store.snapshot().unwrap().hypotheses[&i.h.id].needs_review);
+    let needs_review = || store.snapshot().unwrap().hypotheses[&i.h.id].needs_review;
+    assert!(!needs_review());
     create(&store, &link(&observed, &other, Relation::Supports));
-    assert!(
-        store.snapshot().unwrap().hypotheses[&i.h.id].needs_review,
-        "a new interpretation of run evidence went unnoticed"
-    );
-    create(&store, &assess(&i.h, &i.e, &i.f));
     update(&store, &other.id, |r| r.title = "Changed far end".into());
-    assert!(store.snapshot().unwrap().hypotheses[&i.h.id].needs_review);
+    assert!(!needs_review());
+    update(&store, &observed.id, |r| {
+        r.body = "Corrected reading".into()
+    });
+    assert!(needs_review());
 }
 
 /// A run depends on the evidence it cites as its author read it (review
@@ -1407,6 +1368,427 @@ fn run_is_a_conflict_when_cited_evidence_changed_after_it_was_read() {
     create(&store, &run(&i));
 }
 
+/// Assesses `i.h` from a fresh read, citing its linked evidence.
+fn reassess(store: &Store, i: &Investigation) {
+    create(store, &assess(&i.h, &i.e, &i.f));
+    assert!(!store.snapshot().unwrap().hypotheses[&i.h.id].needs_review);
+}
+/// Decision-0003 item 1: only content counts. Each change here left the
+/// hypothesis needing review before the fingerprint became a projection.
+#[test]
+fn changes_outside_the_basis_do_not_flag_an_assessment() {
+    let (_d, store) = project();
+    let i = investigation(&store);
+    let other = hypothesis();
+    let gap = Record::new(
+        "Does timing change?",
+        Data::Gap {
+            hypothesis: i.h.id.clone(),
+            resolved: false,
+        },
+    );
+    for r in [
+        &other,
+        &link(&i.h, &other, Relation::CompetesWith),
+        &link(&i.e, &other, Relation::Qualifies),
+        &gap,
+    ] {
+        create(&store, r);
+    }
+    let mut judged = assess(&other, &i.e, &i.f);
+    if let Data::Assessment {
+        judgment,
+        criterion,
+        ..
+    } = &mut judged.data
+    {
+        *judgment = Judgment::Weakened;
+        *criterion = None;
+    }
+    create(&store, &judged);
+    reassess(&store, &i);
+    let unflagged = |what: &str, id: &str, edit: &dyn Fn(&mut Record)| {
+        update(&store, id, edit);
+        let s = store.snapshot().unwrap();
+        assert!(
+            !s.hypotheses[&i.h.id].needs_review,
+            "{what} flagged the hypothesis"
+        );
+        assert!(
+            !s.hypotheses[&other.id].needs_review,
+            "{what} flagged the competing hypothesis"
+        );
+    };
+    unflagged("close the hypothesis", &i.h.id, &|r| {
+        set_lifecycle(r, Lifecycle::Closed)
+    });
+    unflagged("retag the hypothesis", &i.h.id, &|r| {
+        r.tags = vec!["dma".into()]
+    });
+    unflagged("give an untestable reason", &i.h.id, &|r| {
+        if let Data::Hypothesis {
+            untestable_reason, ..
+        } = &mut r.data
+        {
+            *untestable_reason = "Also hard to test".into();
+        }
+    });
+    unflagged("start the experiment", &i.x.id, &|r| {
+        if let Data::Experiment { status, .. } = &mut r.data {
+            *status = ExperimentStatus::Running;
+        }
+    });
+    unflagged("revise the experiment's procedure", &i.x.id, &|r| {
+        r.body = "Revised".into()
+    });
+    unflagged("resolve the gap", &gap.id, &|r| {
+        if let Data::Gap { resolved, .. } = &mut r.data {
+            *resolved = true;
+        }
+    });
+    unflagged("fix a typo in the gap", &gap.id, &|r| {
+        r.title = "Does timing change at all?".into()
+    });
+    unflagged("retag the evidence", &i.e.id, &|r| {
+        r.tags = vec!["replicated".into()]
+    });
+    unflagged("close the competing hypothesis", &other.id, &|r| {
+        set_lifecycle(r, Lifecycle::Closed)
+    });
+    // Renaming it changes its own claim, which flags only its own assessment.
+    update(&store, &other.id, |r| r.title = "Bus contention".into());
+    let s = store.snapshot().unwrap();
+    assert!(
+        !s.hypotheses[&i.h.id].needs_review,
+        "renaming the competing hypothesis"
+    );
+    assert!(s.hypotheses[&other.id].needs_review);
+}
+/// Decision-0003 item 1: content still counts. Each change flags the
+/// current assessment; re-assessing clears it for the next.
+#[test]
+fn changes_to_the_basis_flag_an_assessment() {
+    let (_d, store) = project();
+    let i = investigation(&store);
+    let criterion_link = link(&i.e, &i.f, Relation::Supports);
+    create(&store, &criterion_link);
+    let p = store
+        .snapshot()
+        .unwrap()
+        .objects
+        .iter()
+        .find(|e| matches!(e.record.data, Data::Prediction { .. }))
+        .unwrap()
+        .record
+        .id
+        .clone();
+    let evidence_link = store
+        .snapshot()
+        .unwrap()
+        .objects
+        .iter()
+        .find(|e| matches!(&e.record.data, Data::Link { to, .. } if *to == i.h.id))
+        .unwrap()
+        .record
+        .id
+        .clone();
+    reassess(&store, &i);
+    let flags = |what: &str, change: &dyn Fn()| {
+        change();
+        assert!(
+            store.snapshot().unwrap().hypotheses[&i.h.id].needs_review,
+            "{what} went unnoticed"
+        );
+        reassess(&store, &i);
+    };
+    flags("editing the claim", &|| {
+        update(&store, &i.h.id, |r| r.title = "Narrowed claim".into())
+    });
+    flags("editing the scope", &|| {
+        update(&store, &i.h.id, |r| {
+            if let Data::Hypothesis { scope, .. } = &mut r.data {
+                *scope = "rev D".into();
+            }
+        })
+    });
+    flags("editing a criterion's title", &|| {
+        update(&store, &i.f.id, |r| {
+            r.title = "Reject if any timeout".into()
+        })
+    });
+    flags("editing a prediction's conditions", &|| {
+        update(&store, &p, |r| {
+            if let Data::Prediction { conditions, .. } = &mut r.data {
+                *conditions = "5 transfers".into();
+            }
+        })
+    });
+    flags("correcting the evidence source", &|| {
+        update(&store, &i.e.id, |r| {
+            if let Data::Evidence { source, .. } = &mut r.data {
+                *source = "logs/run143.txt".into();
+            }
+        })
+    });
+    flags("attaching the raw capture", &|| {
+        let capture = store.root.join("capture.txt");
+        std::fs::write(&capture, "timeout at 8,142").unwrap();
+        store.attach(&i.e.id, &capture).unwrap();
+    });
+    flags("editing the observation", &|| {
+        update(&store, &i.e.id, |r| r.body = "Wrong board".into())
+    });
+    flags("editing a link's reason", &|| {
+        update(&store, &evidence_link, |r| {
+            r.body = "On second thought".into()
+        })
+    });
+    flags("adding contradicting evidence", &|| {
+        let counter = evidence();
+        create(&store, &counter);
+        create(&store, &link(&counter, &i.h, Relation::Contradicts));
+    });
+    flags("a new run outcome", &|| create(&store, &run(&i)));
+    flags("archiving a link", &|| {
+        update(&store, &criterion_link.id, |r| r.archived = true)
+    });
+    flags("adding a criterion", &|| {
+        create(
+            &store,
+            &Record::new(
+                "Reject if slower",
+                Data::Criterion {
+                    hypothesis: i.h.id.clone(),
+                },
+            ),
+        )
+    });
+    flags("archiving a criterion", &|| {
+        update(&store, &i.f.id, |r| r.archived = true)
+    });
+}
+#[test]
+fn an_update_that_changes_nothing_is_not_written() {
+    let (_d, store) = project();
+    let h = hypothesis();
+    create(&store, &h);
+    let path = store.root.join(format!("hyp/hypotheses/{}.md", h.id));
+    let before = std::fs::read_to_string(&path).unwrap();
+    update(&store, &h.id, |_| {});
+    update(&store, &h.id, |r| {
+        r.updated_at = chrono::Utc::now().to_rfc3339()
+    });
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    update(&store, &h.id, |r| r.tags = vec!["x".into()]);
+    assert_ne!(std::fs::read_to_string(&path).unwrap(), before);
+}
+fn set_lifecycle(r: &mut Record, to: Lifecycle) {
+    if let Data::Hypothesis { lifecycle, .. } = &mut r.data {
+        *lifecycle = to;
+    }
+}
+/// Codex P2: archiving the assessed hypothesis itself is a change to review.
+#[test]
+fn archiving_the_assessed_hypothesis_needs_review() {
+    let (_d, store) = project();
+    let i = investigation(&store);
+    reassess(&store, &i);
+    let stale = Change::create_seen(assess(&i.h, &i.e, &i.f), &store.snapshot().unwrap());
+    update(&store, &i.h.id, |r| r.archived = true);
+    assert!(store.snapshot().unwrap().hypotheses[&i.h.id].needs_review);
+    let err = conflict(&store, stale);
+    assert!(err.contains("review_token"), "{err}");
+}
+/// Evidence reached only through an archived link, or linked only to an
+/// archived criterion, is neither in the basis nor citable. The archived link
+/// and criterion themselves stay in the basis, so archiving them flags.
+#[test]
+fn evidence_reached_only_through_archived_records_is_not_in_the_basis() {
+    let (_d, store) = project();
+    let i = investigation(&store);
+    let via_link = evidence();
+    let via_criterion = evidence();
+    let f2 = Record::new(
+        "Reject if slower",
+        Data::Criterion {
+            hypothesis: i.h.id.clone(),
+        },
+    );
+    let archived_link = link(&via_link, &i.h, Relation::Supports);
+    for r in [
+        &via_link,
+        &via_criterion,
+        &f2,
+        &archived_link,
+        &link(&via_criterion, &f2, Relation::Supports),
+    ] {
+        create(&store, r);
+    }
+    update(&store, &archived_link.id, |r| r.archived = true);
+    update(&store, &f2.id, |r| r.archived = true);
+    let s = store.snapshot().unwrap();
+    let basis = s.basis(&i.h.id);
+    assert!(basis.contains_key(&archived_link.id) && basis.contains_key(&f2.id));
+    for e in [&via_link, &via_criterion] {
+        assert!(!basis.contains_key(&e.id), "{} in the basis", e.title);
+        let err = rejected(&store, Change::create_seen(assess(&i.h, e, &i.f), &s));
+        assert!(err.contains("not linked"), "{err}");
+    }
+}
+/// Architect M1: within one batch the basis may grow only by records the
+/// batch creates. A new link to evidence that existed before brings in
+/// content the author's review token never covered.
+#[test]
+fn a_batch_may_not_bring_unreviewed_records_into_the_basis() {
+    let (_d, store) = project();
+    let i = investigation(&store);
+    let other = evidence();
+    create(&store, &other);
+    let seen = store.snapshot().unwrap();
+    update(&store, &other.id, |r| {
+        r.title = "Edited by someone else".into()
+    });
+    let before = store.snapshot().unwrap().revision;
+    let err = store
+        .commit(
+            vec![
+                Change::create_seen(link(&other, &i.h, Relation::Supports), &seen),
+                Change::create_seen(assess(&i.h, &i.e, &i.f), &seen),
+            ],
+            None,
+        )
+        .unwrap_err();
+    assert_eq!(hyp::cli::exit_code(&err), 1, "{err:#}");
+    let err = format!("{err:#}");
+    assert!(
+        err.contains(&other.id) && err.contains("earlier write"),
+        "{err}"
+    );
+    assert_eq!(store.snapshot().unwrap().revision, before);
+    // Observe, link and assess in one batch: all of it is the author's own.
+    let seen = store.snapshot().unwrap();
+    let fresh = evidence();
+    let s = store
+        .commit(
+            vec![
+                Change::create_seen(fresh.clone(), &seen),
+                Change::create_seen(link(&fresh, &i.h, Relation::Supports), &seen),
+                Change::create_seen(assess(&i.h, &fresh, &i.f), &seen),
+            ],
+            None,
+        )
+        .unwrap();
+    assert!(!s.hypotheses[&i.h.id].needs_review);
+}
+/// Architect M2: `based_on` values are stored, so the canonical form of the
+/// basis is a contract. A serde_json `preserve_order` flip, a renamed field
+/// or enum value, or a new field changes every fingerprint; this makes that
+/// loud.
+#[test]
+fn the_fingerprint_canonical_form_is_pinned() {
+    let entry = |id: &str, title: &str, data: Data| Entry {
+        record: Record {
+            id: id.into(),
+            title: title.into(),
+            body: format!("{title}."),
+            tags: vec!["tag".into()],
+            archived: false,
+            created_at: "2026-01-01T00:00:00+00:00".into(),
+            updated_at: "2026-01-02T00:00:00+00:00".into(),
+            data,
+        },
+        revision: "0".repeat(64),
+    };
+    let id = |prefix: &str, n: u8| format!("{prefix}-00000000-0000-4000-8000-0000000000{n:02}");
+    let (h, f, p, e, l, x, r) = (
+        id("H", 1),
+        id("F", 2),
+        id("P", 3),
+        id("E", 4),
+        id("L", 5),
+        id("X", 6),
+        id("R", 7),
+    );
+    let s = Snapshot {
+        objects: vec![
+            entry(
+                &h,
+                "Claim",
+                Data::Hypothesis {
+                    scope: "Scope".into(),
+                    assumptions: "None".into(),
+                    lifecycle: Lifecycle::Investigating,
+                    untestable_reason: String::new(),
+                },
+            ),
+            entry(
+                &f,
+                "Criterion",
+                Data::Criterion {
+                    hypothesis: h.clone(),
+                },
+            ),
+            entry(
+                &p,
+                "Prediction",
+                Data::Prediction {
+                    hypothesis: h.clone(),
+                    conditions: "Conditions".into(),
+                },
+            ),
+            entry(
+                &e,
+                "Observation",
+                Data::Evidence {
+                    source: "log.txt".into(),
+                    locator: "line 1".into(),
+                    observed_at: "2026-01-01".into(),
+                    attachments: vec![Attachment {
+                        path: format!("assets/{}", "a".repeat(64)),
+                        sha256: "a".repeat(64),
+                    }],
+                },
+            ),
+            entry(
+                &l,
+                "Interpretation",
+                Data::Link {
+                    from: e.clone(),
+                    to: h.clone(),
+                    relation: Relation::Contradicts,
+                },
+            ),
+            entry(
+                &x,
+                "Experiment",
+                Data::Experiment {
+                    hypothesis: h.clone(),
+                    targets: vec![],
+                    status: ExperimentStatus::Completed,
+                },
+            ),
+            entry(
+                &r,
+                "Run",
+                Data::Run {
+                    experiment: x.clone(),
+                    plan: FrozenRef::default(),
+                    outcome: Outcome::Observed,
+                    evidence: vec![e.clone()],
+                },
+            ),
+        ],
+        ..Snapshot::default()
+    };
+    assert_eq!(
+        serde_json::to_string(&s.basis(&h)).unwrap(),
+        r#"{"E-00000000-0000-4000-8000-000000000004":{"archived":false,"attachments":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"body":"Observation.","locator":"line 1","source":"log.txt","title":"Observation"},"F-00000000-0000-4000-8000-000000000002":{"archived":false,"body":"Criterion.","title":"Criterion"},"H-00000000-0000-4000-8000-000000000001":{"archived":false,"assumptions":"None","body":"Claim.","scope":"Scope","title":"Claim"},"L-00000000-0000-4000-8000-000000000005":{"archived":false,"body":"Interpretation.","from":"E-00000000-0000-4000-8000-000000000004","relation":"contradicts","to":"H-00000000-0000-4000-8000-000000000001"},"P-00000000-0000-4000-8000-000000000003":{"archived":false,"body":"Prediction.","conditions":"Conditions","title":"Prediction"},"R-00000000-0000-4000-8000-000000000007":{"body":"Run.","evidence":["E-00000000-0000-4000-8000-000000000004"],"outcome":"observed","title":"Run"}}"#
+    );
+    assert_eq!(
+        s.fingerprint(&h),
+        "6bff2cf94d53b7f9235ed7173e93b7c0011efeaa04429140bb9c3d8a548638ac"
+    );
+}
 /// Frozen history stripped of its content on disk is reported, not loaded
 /// silently with empty defaults.
 #[test]
