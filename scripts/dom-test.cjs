@@ -92,6 +92,38 @@ function click(w, selector) {
   assert.ok(el, "element " + selector);
   el.click();
 }
+const formError = (w) => w.document.querySelector("#form-error").textContent;
+const DRAFT_HINT = "Copy your draft before closing";
+/** Opens the editor through `open`, lets `concurrent` write through the CLI
+ * while the draft is dirty, and waits until the form has noticed it. */
+async function editDuring(w, open, fill, concurrent) {
+  open();
+  fill();
+  concurrent();
+  await wait(
+    () =>
+      w.document
+        .querySelector("#notice")
+        .textContent.includes("while you were editing"),
+    "dirty form notified of a concurrent write",
+  );
+}
+/** Submits with the next transaction answered by `status` and `error`,
+ * as a way to check how the form classifies failures. */
+async function submitAnswered(w, status, error) {
+  const real = w.fetch;
+  w.fetch = async (u, o) =>
+    o?.method === "POST"
+      ? new Response(JSON.stringify({ error }), { status })
+      : real(u, o);
+  try {
+    click(w, 'button[type="submit"]');
+    await wait(() => formError(w).includes(error), "stubbed answer shown");
+  } finally {
+    w.fetch = real;
+  }
+  return formError(w);
+}
 function h1(w) {
   return w.document.querySelector("h1")?.textContent;
 }
@@ -178,17 +210,36 @@ async function main() {
     "Preserve this draft",
   );
   click(w, 'button[type="submit"]');
-  await wait(
-    () =>
-      w.document.querySelector("#form-error").textContent.includes("conflict:"),
-    "stale edit rejected",
-  );
+  await wait(() => formError(w).includes("conflict:"), "stale edit rejected");
+  assert.ok(formError(w).includes(DRAFT_HINT), formError(w));
   assert.equal(
     JSON.parse(cli("--json", "show", h.record.id)).entry.record.title,
     "Concurrent change",
   );
   click(w, "#cancel-editor");
   await wait(() => h1(w) === "Concurrent change", "cancel and refresh");
+  // Conflict or not is decided by the HTTP status, not by the message text.
+  click(w, '[data-action="edit"][data-id="' + h.record.id + '"]');
+  assert.ok(
+    (await submitAnswered(w, 409, "precondition failed")).includes(DRAFT_HINT),
+  );
+  assert.ok(
+    !(await submitAnswered(w, 422, "conflict: only text")).includes(DRAFT_HINT),
+  );
+  click(w, "#cancel-editor");
+  await wait(() => !w.document.querySelector("#editor").open, "closed");
+  // An agent's write to an unrelated record does not reject the form.
+  await editDuring(
+    w,
+    () => click(w, '[data-action="edit"][data-id="' + h.record.id + '"]'),
+    () => field(w, "scope", "Saved despite an unrelated write"),
+    () => cli("add", "Unrelated hypothesis from an agent"),
+  );
+  await save(w);
+  assert.equal(
+    JSON.parse(cli("--json", "show", h.record.id)).entry.record.scope,
+    "Saved despite an unrelated write",
+  );
   click(w, '[data-action="create:criterion"]');
   field(w, "title", "Reject if output is zero");
   await save(w);
@@ -208,6 +259,46 @@ async function main() {
   assert.ok(ev);
   w.location.hash = "record/" + h.record.id;
   await wait(() => h1(w) === "Concurrent change", "return to assess");
+  // Counter-evidence that arrives while an assessment is being written is a
+  // conflict: the assessment would otherwise claim to be based on it.
+  await editDuring(
+    w,
+    () => click(w, '[data-action="create:assessment"]'),
+    () => {
+      field(w, "title", "Judged before the counter-evidence");
+      field(w, "body", "Written without seeing the agent's observation.");
+      field(w, "judgment", "supported");
+    },
+    () =>
+      cli(
+        "evidence",
+        "add",
+        h.record.id,
+        "Agent saw the failure again",
+        "--source",
+        "agent/run-2.txt",
+        "--against",
+      ),
+  );
+  click(w, 'button[type="submit"]');
+  await wait(() => formError(w).includes("conflict:"), "stale assessment");
+  assert.ok(formError(w).includes(DRAFT_HINT), formError(w));
+  assert.equal(
+    w.document.querySelector('[name="title"]').value,
+    "Judged before the counter-evidence",
+  );
+  assert.ok(
+    !cli("list", "--kind", "assessment").includes(
+      "Judged before the counter-evidence",
+    ),
+  );
+  click(w, "#cancel-editor");
+  await wait(
+    () =>
+      !w.document.querySelector("#editor").open &&
+      w.document.body.textContent.includes("Agent saw the failure again"),
+    "discarded, and the counter-evidence shown for review",
+  );
   click(w, '[data-action="create:assessment"]');
   field(w, "title", "Reviewed the output");
   field(w, "body", "The criterion is satisfied by the observation.");
@@ -220,10 +311,94 @@ async function main() {
   field(w, "criterion", f.record.id);
   await save(w);
   await wait(() => h1(w) === "Reviewed the output", "assessment");
-  assert.equal(
-    JSON.parse(cli("--json", "show", h.record.id)).state.judgment,
-    "falsified",
+  const assessed = JSON.parse(cli("--json", "show", h.record.id)).state;
+  assert.equal(assessed.judgment, "falsified");
+  assert.equal(assessed.needs_review, false);
+  // Citing evidence brings its links and their other ends into the
+  // assessment's basis. A link an agent adds to that evidence while the form
+  // is open was never seen: the save is a conflict naming it (review P2).
+  const demoEvidence = JSON.parse(
+    cli("--json", "list", "--kind", "evidence"),
+  ).find((e) => e.record.title.startsWith("Timeout reproduced"));
+  const unrelated = JSON.parse(
+    cli("--json", "list", "--kind", "hypothesis"),
+  ).find((e) => e.record.title === "Unrelated hypothesis from an agent");
+  let newLink = "";
+  w.location.hash = "record/" + h.record.id;
+  await wait(() => h1(w) === "Concurrent change", "return to assess again");
+  await editDuring(
+    w,
+    () => click(w, '[data-action="create:assessment"]'),
+    () => {
+      field(w, "title", "Cites shared evidence");
+      field(w, "body", "The demo observation matters here too.");
+      field(w, "evidence", demoEvidence.record.id);
+    },
+    () => {
+      newLink = cli(
+        "link",
+        demoEvidence.record.id,
+        unrelated.record.id,
+        "--relation",
+        "supports",
+        "--reason",
+        "Linked by an agent meanwhile",
+      );
+    },
   );
+  click(w, 'button[type="submit"]');
+  await wait(() => formError(w).includes("conflict:"), "unseen link");
+  assert.ok(formError(w).includes(newLink), formError(w));
+  assert.ok(formError(w).includes(DRAFT_HINT), formError(w));
+  assert.equal(
+    w.document.querySelector('[name="title"]').value,
+    "Cites shared evidence",
+  );
+  click(w, "#cancel-editor");
+  await wait(
+    () =>
+      !w.document.querySelector("#editor").open &&
+      w.document.querySelector("#notice").hidden,
+    "closed and refreshed",
+  );
+  // Reopened on the new state, the form states those records and saves.
+  click(w, '[data-action="create:assessment"]');
+  field(w, "title", "Cites shared evidence");
+  field(w, "body", "The demo observation matters here too.");
+  field(w, "evidence", demoEvidence.record.id);
+  await save(w);
+  await wait(() => h1(w) === "Cites shared evidence", "shared evidence");
+  assert.equal(
+    JSON.parse(cli("--json", "show", h.record.id)).state.needs_review,
+    false,
+  );
+  // Experiments and runs freeze what the form showed, stated by revision.
+  w.location.hash = "record/" + h.record.id;
+  await wait(() => h1(w) === "Concurrent change", "return to plan");
+  click(w, '[data-action="create:experiment"]');
+  field(w, "title", "Repeat with output capture");
+  field(w, "targets", f.record.id);
+  field(w, "body", "Capture the output of 100 runs.");
+  await save(w);
+  await wait(() => h1(w) === "Repeat with output capture", "experiment");
+  const x = JSON.parse(cli("--json", "list", "--kind", "experiment")).find(
+    (e) => e.record.title === "Repeat with output capture",
+  );
+  assert.deepEqual(
+    x.record.targets.map((t) => t.id),
+    [h.record.id, f.record.id],
+  );
+  click(w, '[data-action="create:run"]');
+  field(w, "title", "First capture");
+  field(w, "outcome", "observed");
+  field(w, "evidence", ev.record.id);
+  await save(w);
+  await wait(() => h1(w) === "First capture", "run");
+  const run = JSON.parse(cli("--json", "list", "--kind", "run")).find(
+    (e) => e.record.title === "First capture",
+  );
+  assert.equal(run.record.plan.revision, x.revision);
+  assert.deepEqual(run.record.evidence, [ev.record.id]);
   for (const [view, title] of [
     ["matrix", "Evidence matrix"],
     ["graph", "Relationships"],
@@ -277,7 +452,7 @@ async function main() {
   );
   assert.deepEqual(errors, []);
   console.log(
-    "PASS: DOM forms, real HTTP writes, CLI↔UI SSE updates, editor changes, two tabs, dirty-form preservation, conflicts, criteria, evidence interpretations, falsification assessment, all views, malformed-file recovery, unavailable-project cause and offline export.",
+    "PASS: DOM forms, real HTTP writes, CLI↔UI SSE updates, editor changes, two tabs, dirty-form preservation, conflicts by status, saves despite unrelated writes, stale assessment and unseen link rejected, criteria, evidence interpretations, falsification assessment, experiment and run, all views, malformed-file recovery, unavailable-project cause and offline export.",
   );
 }
 main()

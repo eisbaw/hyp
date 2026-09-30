@@ -108,7 +108,11 @@ async fn snapshot(State(s): State<Arc<AppState>>) -> std::result::Result<Json<Sn
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Transaction {
-    expected_revision: String,
+    /// Optional whole-project precondition. Each change already carries the
+    /// preconditions it depends on, so ordinary edits omit this; sending it
+    /// makes any concurrent write, related or not, a conflict.
+    #[serde(default)]
+    expected_revision: Option<String>,
     changes: Vec<Change>,
 }
 async fn mutate(
@@ -126,10 +130,11 @@ async fn mutate(
         return Err(anyhow::anyhow!("transaction must contain 1–100 changes").into());
     }
     let store = s.store.clone();
-    let snap =
-        tokio::task::spawn_blocking(move || store.commit(tx.changes, Some(&tx.expected_revision)))
-            .await
-            .map_err(anyhow::Error::from)??;
+    let snap = tokio::task::spawn_blocking(move || {
+        store.commit(tx.changes, tx.expected_revision.as_deref())
+    })
+    .await
+    .map_err(anyhow::Error::from)??;
     s.events.send_replace(snap.revision.clone());
     Ok(Json(snap))
 }

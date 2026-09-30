@@ -64,6 +64,65 @@ async fn api_and_cli_store_share_state_and_reject_stale_writes() {
     let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert!(error["error"].as_str().unwrap().starts_with("conflict:"));
 }
+/// POSTs a transaction and returns the status and the decoded JSON body.
+async fn post(app: &axum::Router, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+    let response = app
+        .clone()
+        .oneshot(req("POST", "/api/transaction", body))
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+#[tokio::test]
+async fn transactions_need_only_the_preconditions_of_their_changes() {
+    let (_dir, app, store) = app();
+    let hypothesis = |title: &str| serde_json::json!({"kind":"hypothesis","title":title,"scope":"","assumptions":"","lifecycle":"draft","untestable_reason":""});
+    let (status, body) = post(
+        &app,
+        serde_json::json!({"changes":[{"op":"create","record":hypothesis("No project revision")}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let read = store.snapshot().unwrap();
+    let entry = read.objects[0].clone();
+    // An unrelated write (another agent, through the CLI store) lands after the read.
+    store
+        .commit(
+            vec![hyp::store::Change::create_seen(
+                serde_json::from_value(hypothesis("Unrelated")).unwrap(),
+                &read,
+            )],
+            None,
+        )
+        .unwrap();
+    let mut record = serde_json::to_value(&entry.record).unwrap();
+    record["title"] = "Edited after an unrelated write".into();
+    let update =
+        serde_json::json!({"op":"update","record":record,"expected_revision":entry.revision});
+    let (status, body) = post(&app, serde_json::json!({"changes":[update.clone()]})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // The same per-object revision is now stale.
+    let (status, body) = post(&app, serde_json::json!({"changes":[update]})).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body["error"].as_str().unwrap().starts_with("conflict:"));
+    // A missing precondition is a request to fix (422), not a race to retry (409).
+    let assessment = serde_json::json!({"kind":"assessment","title":"Unstated","body":"Why","hypothesis":entry.record.id,"judgment":"inconclusive"});
+    let (status, body) = post(
+        &app,
+        serde_json::json!({"changes":[{"op":"create","record":assessment}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("requires `expected`"),
+        "{body}"
+    );
+}
 #[tokio::test]
 async fn rejects_foreign_host_origin_and_missing_token() {
     let (_dir, app, store) = app();

@@ -154,6 +154,180 @@ fn stale_cli_write_exits_with_code_3_and_a_conflict_message() {
     assert_eq!(out.status.code(), Some(1), "ordinary errors exit 1");
 }
 
+/// Runs `hyp edit id` with an editor that first makes another hyp write
+/// (`concurrent`), deterministically between the command's read and its commit.
+fn edit_during_concurrent_write(project: &Path, id: &str, concurrent: &str) -> Output {
+    use std::os::unix::fs::PermissionsExt;
+    let editor = project.join("editor.sh");
+    std::fs::write(
+        &editor,
+        "#!/bin/sh\nset -e\n\"$HYP_BIN\" --project \"$HYP_PROJECT\" $HYP_CONCURRENT >/dev/null\n\
+         sed -i 's/^title: .*/title: Edited in editor/' \"$1\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
+    hyp(project)
+        .args(["edit", id])
+        .env("VISUAL", &editor)
+        .env("HYP_BIN", env!("CARGO_BIN_EXE_hyp"))
+        .env("HYP_PROJECT", project)
+        .env("HYP_CONCURRENT", concurrent)
+        .output()
+        .unwrap()
+}
+fn first(project: &Path, kind: &str) -> String {
+    let rows: serde_json::Value =
+        serde_json::from_str(&ok(project, &["--json", "list", "--kind", kind])).unwrap();
+    rows[0]["record"]["id"].as_str().unwrap().to_string()
+}
+
+#[test]
+fn unrelated_write_between_read_and_commit_does_not_fail_a_cli_write() {
+    let project = demo();
+    let h = first(project.path(), "hypothesis");
+    let out = edit_during_concurrent_write(project.path(), &h, "add Unrelated");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let shown: serde_json::Value =
+        serde_json::from_str(&ok(project.path(), &["--json", "show", &h])).unwrap();
+    assert_eq!(shown["entry"]["record"]["title"], "Edited in editor");
+    assert!(ok(project.path(), &["list"]).contains("Unrelated"));
+    // A write to the same record in that window is still a conflict.
+    let out =
+        edit_during_concurrent_write(project.path(), &h, &format!("set {h} --title Concurrent"));
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn apply_rejects_an_assessment_that_does_not_state_what_it_saw() {
+    let project = demo();
+    let h = first(project.path(), "hypothesis");
+    let change = serde_json::json!([{"op":"create","record":{"kind":"assessment","title":"Unstated","body":"Why","hypothesis":h,"judgment":"inconclusive"}}]);
+    let mut child = hyp(project.path())
+        .args(["--json", "apply"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(
+        &mut child.stdin.take().unwrap(),
+        change.to_string().as_bytes(),
+    )
+    .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    let error: serde_json::Value = serde_json::from_str(&stderr).unwrap();
+    let message = error["error"].as_str().unwrap();
+    assert!(message.contains("requires `expected`"), "{message}");
+}
+
+/// `hyp assess` records what the agent reviewed, not what the command read a
+/// moment before writing: counter-evidence or another agent's assessment in
+/// between is a conflict.
+#[test]
+fn assess_is_based_on_the_state_the_agent_reviewed() {
+    let project = demo();
+    let p = project.path();
+    let h = first(p, "hypothesis");
+    let state = || -> serde_json::Value {
+        serde_json::from_str::<serde_json::Value>(&ok(p, &["--json", "show", &h])).unwrap()["state"]
+            .clone()
+    };
+    let token = || state()["review_token"].as_str().unwrap().to_string();
+    let assess = |token: &str, status: &str| {
+        run(
+            p,
+            &[
+                "assess",
+                &h,
+                "--reviewed",
+                token,
+                "--status",
+                status,
+                "--reason",
+                "Reviewed",
+            ],
+        )
+    };
+    let listed: serde_json::Value =
+        serde_json::from_str(&ok(p, &["--json", "list", "--kind", "hypothesis"])).unwrap();
+    let row = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["record"]["id"] == h.as_str())
+        .unwrap();
+    assert_eq!(row["state"]["review_token"].as_str().unwrap(), token());
+    // Counter-evidence after the review.
+    let reviewed = token();
+    ok(
+        p,
+        &[
+            "evidence",
+            "add",
+            &h,
+            "Counter-evidence",
+            "--source",
+            "log",
+            "--against",
+        ],
+    );
+    let out = assess(&reviewed, "supported");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(3), "{stderr}");
+    assert!(stderr.contains("changed since you reviewed it"), "{stderr}");
+    // Another agent's assessment after the review: not part of the fingerprint.
+    let reviewed = token();
+    let fingerprint = state()["fingerprint"].clone();
+    let out = assess(&token(), "weakened");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(state()["fingerprint"], fingerprint);
+    let out = assess(&reviewed, "supported");
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(state()["judgment"], "weakened");
+    // Malformed tokens are usage mistakes to fix, not races to retry.
+    for bad in ["abc", &token()[..63], &"z".repeat(64)] {
+        let out = assess(bad, "supported");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{bad}: {stderr}");
+        assert!(stderr.contains("64-hex-digit"), "{stderr}");
+    }
+    let out = run(p, &["assess", &h, "--status", "supported", "--reason", "x"]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a missing --reviewed is a usage error"
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--reviewed"));
+    let out = assess(&token(), "supported");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(state()["judgment"], "supported");
+    assert_eq!(state()["needs_review"], false);
+}
+
 #[test]
 fn closed_stdout_ends_quietly_without_panic() {
     use std::os::unix::{net::UnixStream, process::ExitStatusExt};

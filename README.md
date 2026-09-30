@@ -52,10 +52,11 @@ hyp evidence add H-… "Timeout at transfer 8,142" \
   --against --source logs/run-142.txt --locator "lines 81–96" \
   --reason "A failure with cache disabled contradicts the cache explanation."
 hyp run X-… "Run 142" --outcome observed --evidence E-…
-hyp assess H-… --status weakened --confidence 0.2 --evidence E-… \
-  --reason "Check the timing confound before rejecting the hypothesis."
-hyp assess H-… --status falsified --criterion F-… --evidence E-… \
-  --reason "Controlled replication satisfies the rejection criterion."
+hyp --json show H-…          # review it; note .state.review_token
+hyp assess H-… --reviewed <token> --status weakened --confidence 0.2 \
+  --evidence E-… --reason "Check the timing confound before rejecting the hypothesis."
+hyp assess H-… --reviewed <token> --status falsified --criterion F-… \
+  --evidence E-… --reason "Controlled replication satisfies the rejection criterion."
 hyp show H-…
 hyp list --kind hypothesis --needs-review
 hyp search "cache"
@@ -80,7 +81,27 @@ hyp delete H-…               # only archived and unreferenced records
 
 `depends-on`, `competes-with`, and `supersedes` are CLI relation values. Serialized files use underscores. Dependencies and supersession cannot form cycles. Competing hypotheses may be linked in either direction; the relation does not imply mutual exclusivity.
 
-Use `-` for a text argument to read stdin. Flags accept literal multiline values. All ordinary commands support `--json`. Exit codes: `0` success, `1` domain/I/O failure, `2` invalid CLI arguments, `3` revision conflict. JSON errors go to stderr. `hyp apply` accepts a JSON array of transactions on stdin, with optional `--expected-revision` for a whole-project precondition; update/archive/delete operations always require an object revision.
+Use `-` for a text argument to read stdin. Flags accept literal multiline values. All ordinary commands support `--json`. Exit codes: `0` success, `1` domain/I/O failure, `2` invalid CLI arguments, `3` revision conflict. JSON errors go to stderr. `hyp apply` accepts a JSON array of create/update/archive/delete changes on stdin, with optional `--expected-revision` for a whole-project precondition.
+
+Every change states what it depends on, as read from a snapshot (`hyp --json show ID` gives a record's `entry.revision` and a hypothesis's `state`; `hyp export --format json` gives everything). A change that depended on something that changed is rejected; a change that did not is unaffected by other writers.
+
+- update, archive, delete: `expected_revision`, the record's revision.
+- create an assessment, experiment or run: an `expected` object next to `record`:
+  - `expected.hypotheses`: for an assessment, its hypothesis's `fingerprint` and `assessment_ids` as read (`[]` for none).
+  - `expected.revisions`: full ID to revision, for each experiment target (the hypothesis must be one of the targets), for a run's experiment and the evidence it cites, and for every record an assessment brings into its hypothesis's fingerprint that was not already part of it: the cited evidence, links touching that evidence, and their other ends. Stating a record that is already covered is harmless, so the practical recipe for an assessment is: for each cited evidence `E`, state `E`, every link in `.related` of `hyp --json show E`, and both ends of each such link.
+- `based_on`, `supersedes`, a target's `revision`, `title` and `body`, and a run's `plan` are set by the server; a create that fills them in is rejected. Targets are given as `{"id": "P-…"}`.
+
+```json
+[{"op": "create",
+  "record": {"kind": "assessment", "title": "Weakened", "body": "Why …",
+             "hypothesis": "H-…", "judgment": "weakened", "evidence": ["E-…"]},
+  "expected": {"hypotheses": {"H-…": {"fingerprint": "…", "assessment_ids": ["A-…"]}},
+               "revisions": {"E-…": "…", "L-…": "…", "H-other…": "…"}}}]
+```
+
+A statement that no longer holds (the record changed or was deleted), or a record the assessment would now also be based on that you did not state (for example a link added since), is a conflict: exit `3`, HTTP 409, and the message lists the IDs. Re-read, review what changed, then retry. A missing or malformed statement is an ordinary error (exit `1`, HTTP 422) naming the field; retrying it unchanged will not help. Records created earlier in the same batch need no statement. A batch that links existing evidence into the hypothesis and then assesses it must state that evidence in the assessment's `expected.revisions`: the link makes it part of the fingerprint.
+
+The CLI commands state preconditions from their own read, so they protect only the moment between that read and the write. `hyp assess` is the exception: it requires `--reviewed` with the `review_token` from the `state` you reviewed (`hyp --json show H-…` or `hyp --json list`), a hash of the fingerprint and the current assessment IDs. If the hypothesis's records or its current assessments changed since, it writes nothing and exits `3`; a malformed token exits `1`. The revisions of the evidence it cites still come from the command's own read. To protect a longer window for other records, use `hyp apply`. The WebUI states everything as of the moment a form was opened.
 
 ## The model
 
@@ -136,7 +157,7 @@ All authoritative content is under `hyp/`:
 
 Markdown files have YAML front matter and an ordinary notes body. IDs are UUIDs with readable type prefixes. Renaming files independently of IDs is rejected. Unknown schema fields, broken references and invalid states are reported by `hyp check`. `hyp check --strict` also fails on warnings such as a missing falsification criterion.
 
-A process-shared advisory lock serializes tool writes. Optimistic object/project hashes reject stale updates. Atomic file replacements and an fsynced roll-forward journal recover interrupted multi-file operations. Reads through hyp recover pending transactions under the same lock. Manual editors and Git do not honour that lock: ordinary overlapping saves are detected where possible, but arbitrary simultaneous external writes cannot be made transactional. Avoid Git checkout/merge during a tool write. Run `hyp check` after merges.
+A process-shared advisory lock serializes tool writes. Each change carries an optimistic precondition on what it depends on (see above), so stale writes are rejected without turning unrelated concurrent writes into conflicts. Atomic file replacements and an fsynced roll-forward journal recover interrupted multi-file operations. Reads through hyp recover pending transactions under the same lock. Manual editors and Git do not honour that lock: ordinary overlapping saves are detected where possible, but arbitrary simultaneous external writes cannot be made transactional. Avoid Git checkout/merge during a tool write. Run `hyp check` after merges.
 
 Git operations are entirely yours. The app never commits, pushes, fetches or resolves Git conflicts. Commit the complete `hyp/` directory when you want a history checkpoint. Archive is recoverable; deletion is explicit and limited to unreferenced archived records. Unreferenced assets are retained rather than garbage-collected automatically.
 

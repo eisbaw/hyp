@@ -1,6 +1,6 @@
 use crate::{
     model::*,
-    store::{Change, Store},
+    store::{Change, Conflict, Store},
     web,
 };
 use anyhow::{Context, Result, ensure};
@@ -80,8 +80,16 @@ pub enum Command {
         #[arg(long)]
         reason: String,
     },
+    /// Record a judgment of a hypothesis, based on the state you reviewed.
     Assess {
         hypothesis: String,
+        /// The review token of the hypothesis state you reviewed:
+        /// .state.review_token of `hyp --json show H-…` (or `hyp --json list`).
+        /// If the hypothesis's records (evidence, links, criteria, predictions,
+        /// experiments, runs) or its current assessments changed since, nothing
+        /// is written and the command exits 3: review the change and assess again.
+        #[arg(long, value_name = "TOKEN")]
+        reviewed: String,
         #[arg(long, value_enum)]
         status: Judgment,
         #[arg(long)]
@@ -142,7 +150,9 @@ pub enum Command {
     Delete {
         id: String,
     },
-    /// Apply a JSON array of create/update/archive/delete operations from stdin.
+    /// Apply a JSON array of create/update/archive/delete changes from stdin.
+    /// Each states what it depends on: `expected_revision`, or for creating an
+    /// assessment, experiment or run an `expected` object (see the README).
     Apply {
         #[arg(long)]
         expected_revision: Option<String>,
@@ -218,8 +228,9 @@ fn ids(s: &Snapshot, ids: &[String]) -> Result<Vec<String>> {
         .map(|id| s.find(id).map(|e| e.record.id.clone()))
         .collect()
 }
-fn create(r: Record) -> Change {
-    Change::Create { record: r }
+/// A create with its preconditions stated from `s`, the snapshot the command read.
+fn create(s: &Snapshot, r: Record) -> Change {
+    Change::create_seen(r, s)
 }
 fn hypothesis(s: &Snapshot, id: &str) -> Result<String> {
     let e = s.find(id)?;
@@ -266,38 +277,47 @@ pub async fn run(cli: Cli) -> Result<()> {
             );
             r.body = input(body)?;
             r.tags = tags;
-            changes.push(create(r));
+            changes.push(create(&s, r));
         }
         Command::Predict {
             hypothesis: h,
             title,
             conditions,
-        } => changes.push(create(Record::new(
-            input(title)?,
-            Data::Prediction {
-                hypothesis: hypothesis(&s, &h)?,
-                conditions,
-            },
-        ))),
+        } => changes.push(create(
+            &s,
+            Record::new(
+                input(title)?,
+                Data::Prediction {
+                    hypothesis: hypothesis(&s, &h)?,
+                    conditions,
+                },
+            ),
+        )),
         Command::FalsifyIf {
             hypothesis: h,
             title,
-        } => changes.push(create(Record::new(
-            input(title)?,
-            Data::Criterion {
-                hypothesis: hypothesis(&s, &h)?,
-            },
-        ))),
+        } => changes.push(create(
+            &s,
+            Record::new(
+                input(title)?,
+                Data::Criterion {
+                    hypothesis: hypothesis(&s, &h)?,
+                },
+            ),
+        )),
         Command::Gap {
             hypothesis: h,
             title,
-        } => changes.push(create(Record::new(
-            input(title)?,
-            Data::Gap {
-                hypothesis: hypothesis(&s, &h)?,
-                resolved: false,
-            },
-        ))),
+        } => changes.push(create(
+            &s,
+            Record::new(
+                input(title)?,
+                Data::Gap {
+                    hypothesis: hypothesis(&s, &h)?,
+                    resolved: false,
+                },
+            ),
+        )),
         Command::Evidence { command } => match command {
             EvidenceCommand::Add {
                 hypothesis: h,
@@ -339,7 +359,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 } else {
                     input(reason)?
                 };
-                changes.extend([create(r), create(l)]);
+                changes.extend([create(&s, r), create(&s, l)]);
             }
             EvidenceCommand::Attach { id, path } => {
                 let result = store.attach(&id, &path)?;
@@ -372,7 +392,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 },
             );
             r.body = input(body)?;
-            changes.push(create(r));
+            changes.push(create(&s, r));
         }
         Command::Run {
             experiment,
@@ -392,7 +412,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 },
             );
             r.body = input(body)?;
-            changes.push(create(r));
+            changes.push(create(&s, r));
         }
         Command::Link {
             from,
@@ -409,10 +429,11 @@ pub async fn run(cli: Cli) -> Result<()> {
                 },
             );
             r.body = input(reason)?;
-            changes.push(create(r));
+            changes.push(create(&s, r));
         }
         Command::Assess {
             hypothesis: h,
+            reviewed,
             status,
             confidence,
             evidence,
@@ -420,10 +441,28 @@ pub async fn run(cli: Cli) -> Result<()> {
             reason,
         } => {
             let h = hypothesis(&s, &h)?;
+            ensure!(
+                reviewed.len() == 64 && reviewed.bytes().all(|b| b.is_ascii_hexdigit()),
+                "--reviewed must be the 64-hex-digit .state.review_token of `hyp --json show {h}`"
+            );
+            let state = s
+                .hypotheses
+                .get(&h)
+                .with_context(|| format!("no derived state for hypothesis {h}"))?;
+            // The token covers the agent's review up to this command's read;
+            // the preconditions stated below cover this read up to the write.
+            if !reviewed.eq_ignore_ascii_case(&state.review_token) {
+                return Err(Conflict(format!(
+                    "hypothesis {h} changed since you reviewed it (its records or current \
+                     assessments; the review token differs); re-read `hyp --json show {h}`, \
+                     review what changed and retry"
+                ))
+                .into());
+            }
             let mut r = Record::new(
                 format!("Assessment: {status}"),
                 Data::Assessment {
-                    hypothesis: h,
+                    hypothesis: h.clone(),
                     judgment: status,
                     confidence,
                     evidence: ids(&s, &evidence)?,
@@ -435,7 +474,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 },
             );
             r.body = input(reason)?;
-            changes.push(create(r));
+            changes.push(create(&s, r));
         }
         Command::Set {
             id,
@@ -555,7 +594,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                         })
                 })
                 .collect();
-            list(&rows, cli.json)?;
+            list(&s, &rows, cli.json)?;
             return Ok(());
         }
         Command::Search { query } => {
@@ -570,7 +609,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                         .contains(&q)
                 })
                 .collect::<Vec<_>>();
-            list(&rows, cli.json)?;
+            list(&s, &rows, cli.json)?;
             return Ok(());
         }
         Command::Edit { id } => {
@@ -667,11 +706,13 @@ pub async fn run(cli: Cli) -> Result<()> {
     let affected: Vec<String> = changes
         .iter()
         .map(|c| match c {
-            Change::Create { record } | Change::Update { record, .. } => record.id.clone(),
+            Change::Create { record, .. } | Change::Update { record, .. } => record.id.clone(),
             Change::Archive { id, .. } | Change::Delete { id, .. } => id.clone(),
         })
         .collect();
-    let result = store.commit(changes, Some(&s.revision))?;
+    // Each change states what it depends on; the whole-project revision would
+    // turn unrelated concurrent writes into conflicts.
+    let result = store.commit(changes, None)?;
     if cli.json {
         print_json(&serde_json::json!({"ids":affected,"snapshot":result}))?;
     } else {
@@ -681,8 +722,19 @@ pub async fn run(cli: Cli) -> Result<()> {
     }
     Ok(())
 }
-fn list(rows: &[&Entry], json: bool) -> Result<()> {
+/// With `json`, each row is the entry plus, for a hypothesis, its derived `state`.
+fn list(s: &Snapshot, rows: &[&Entry], json: bool) -> Result<()> {
     if json {
+        let rows: Vec<_> = rows
+            .iter()
+            .map(|e| {
+                let mut row = serde_json::json!(e);
+                if let Some(state) = s.hypotheses.get(&e.record.id) {
+                    row["state"] = serde_json::json!(state);
+                }
+                row
+            })
+            .collect();
         return print_json(&rows);
     }
     for e in rows {
@@ -834,14 +886,15 @@ pub fn seed_demo(store: &Store) -> Result<()> {
         },
     );
     l.body = "Compare both explanations under controlled bus load.".into();
+    let s = store.snapshot()?;
     store.commit(
         vec![
-            create(h.clone()),
-            create(f.clone()),
-            create(p.clone()),
-            create(g),
-            create(alt.clone()),
-            create(l),
+            create(&s, h.clone()),
+            create(&s, f.clone()),
+            create(&s, p.clone()),
+            create(&s, g),
+            create(&s, alt.clone()),
+            create(&s, l),
         ],
         None,
     )?;
@@ -855,7 +908,7 @@ pub fn seed_demo(store: &Store) -> Result<()> {
         },
     );
     x.body="1. Disable D-cache.\n2. Keep clock and DMA configuration fixed.\n3. Run 10,000 transfers.\n4. Record timeouts and bus load.".into();
-    store.commit(vec![create(x.clone())], None)?;
+    store.commit(vec![create(&s, x.clone())], None)?;
     let mut e = Record::new(
         "Timeout reproduced at transfer 8,142",
         Data::Evidence {
@@ -884,17 +937,23 @@ pub fn seed_demo(store: &Store) -> Result<()> {
         },
     );
     l2.body = "Compatible, but bus contention has not been isolated.".into();
+    let s = store.snapshot()?;
     let run = Record::new(
         "Cache-disabled run #142",
         Data::Run {
             experiment: x.id.clone(),
-            plan: store.snapshot()?.find(&x.id)?.frozen(),
+            plan: s.find(&x.id)?.frozen(),
             outcome: Outcome::Observed,
             evidence: vec![e.id.clone()],
         },
     );
     store.commit(
-        vec![create(e.clone()), create(l), create(l2), create(run)],
+        vec![
+            create(&s, e.clone()),
+            create(&s, l),
+            create(&s, l2),
+            create(&s, run),
+        ],
         None,
     )?;
     let mut a = Record::new(
@@ -910,7 +969,7 @@ pub fn seed_demo(store: &Store) -> Result<()> {
         },
     );
     a.body="The observation contradicts the prediction. Keep the hypothesis weakened until the cache-disabled build and timing confound are independently checked.".into();
-    store.commit(vec![create(a)], None)?;
+    store.commit(vec![create(&store.snapshot()?, a)], None)?;
     Ok(())
 }
 /// Process exit code for a failed command: 3 when a write lost a race

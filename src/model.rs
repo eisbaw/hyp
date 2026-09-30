@@ -21,12 +21,18 @@ values!(Relation { Supports => "supports", Contradicts => "contradicts", Qualifi
 values!(ExperimentStatus { Planned => "planned", Running => "running", Completed => "completed", Cancelled => "cancelled" });
 values!(Outcome { Observed => "observed", Inconclusive => "inconclusive", Failed => "failed" });
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A copy of a record as it was when an experiment or run was created. On a
+/// create only `id` is input (an experiment target); the server fills in the
+/// rest, so those fields default to empty on input.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FrozenRef {
     pub id: String,
+    #[serde(default)]
     pub revision: String,
+    #[serde(default)]
     pub title: String,
+    #[serde(default)]
     pub body: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,6 +84,7 @@ pub enum Data {
     },
     Run {
         experiment: String,
+        #[serde(default)]
         plan: FrozenRef,
         outcome: Outcome,
         #[serde(default)]
@@ -246,6 +253,17 @@ pub struct HypothesisState {
     pub needs_review: bool,
     pub assessment_ids: Vec<String>,
     pub fingerprint: String,
+    /// The fingerprint and the current assessments as one value, so a reviewer
+    /// can state both; `hyp assess --reviewed` takes it. It does not cover
+    /// evidence a new assessment cites from outside the fingerprint.
+    pub review_token: String,
+}
+/// `HypothesisState::review_token`: a hash of the fingerprint and the sorted
+/// IDs of the current assessments.
+pub fn review_token(fingerprint: &str, assessment_ids: &[String]) -> String {
+    let mut ids = assessment_ids.to_vec();
+    ids.sort();
+    hash(format!("{fingerprint}\n{}", ids.join("\n")))
 }
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Snapshot {
@@ -259,6 +277,10 @@ pub fn hash(bytes: impl AsRef<[u8]>) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 impl Snapshot {
+    /// The entry with exactly this ID; no prefix matching.
+    pub fn get(&self, id: &str) -> Option<&Entry> {
+        self.objects.iter().find(|e| e.record.id == id)
+    }
     pub fn find(&self, prefix: &str) -> Result<&Entry> {
         if let Some(e) = self.objects.iter().find(|e| e.record.id == prefix) {
             return Ok(e);
@@ -280,7 +302,39 @@ impl Snapshot {
         );
         Ok(hits[0])
     }
+    /// The fingerprint of hypothesis `id`: a hash of the revisions of the
+    /// records in `relevant(id)`.
     pub fn fingerprint(&self, id: &str) -> String {
+        self.fingerprint_of(&self.relevant(id))
+    }
+    pub fn fingerprint_of(&self, relevant: &BTreeSet<String>) -> String {
+        hash(
+            self.objects
+                .iter()
+                .filter(|e| relevant.contains(&e.record.id))
+                .map(|e| format!("{}:{}\n", e.record.id, e.revision))
+                .collect::<String>(),
+        )
+    }
+    /// `relevant` for the hypothesis of `assessment`, with it added to this
+    /// state: what a new assessment's fingerprint covers.
+    pub fn relevant_with(&self, assessment: &Record) -> BTreeSet<String> {
+        let Data::Assessment { hypothesis, .. } = &assessment.data else {
+            return BTreeSet::new();
+        };
+        let mut basis = self.clone();
+        basis.objects.push(Entry {
+            record: assessment.clone(),
+            revision: String::new(),
+        });
+        basis.relevant(hypothesis)
+    }
+    /// IDs of the records an assessment of hypothesis `id` is based on. The
+    /// direct ones: the hypothesis, its non-assessment records, runs of its
+    /// experiments, the evidence those runs cite and the evidence its
+    /// assessments cite. Then links touching any direct record, with both
+    /// ends. May name IDs that do not exist.
+    pub fn relevant(&self, id: &str) -> BTreeSet<String> {
         let mut relevant = BTreeSet::from([id.to_string()]);
         for e in &self.objects {
             if e.record.data.owner() == Some(id)
@@ -290,9 +344,15 @@ impl Snapshot {
             }
         }
         for e in &self.objects {
-            if let Data::Run { experiment, .. } = &e.record.data {
+            if let Data::Run {
+                experiment,
+                evidence,
+                ..
+            } = &e.record.data
+            {
                 if relevant.contains(experiment) {
                     relevant.insert(e.record.id.clone());
+                    relevant.extend(evidence.iter().cloned());
                 }
             }
         }
@@ -315,19 +375,8 @@ impl Snapshot {
                     relevant.extend([e.record.id.clone(), from.clone(), to.clone()]);
                 }
             }
-            if let Data::Run { evidence, .. } = &e.record.data {
-                if relevant.contains(&e.record.id) {
-                    relevant.extend(evidence.iter().cloned());
-                }
-            }
         }
-        hash(
-            self.objects
-                .iter()
-                .filter(|e| relevant.contains(&e.record.id))
-                .map(|e| format!("{}:{}\n", e.record.id, e.revision))
-                .collect::<String>(),
-        )
+        relevant
     }
     pub fn assessment_heads(&self, id: &str) -> Vec<&Entry> {
         let assessments: Vec<_> = self
@@ -371,13 +420,14 @@ impl Snapshot {
             } else {
                 (Judgment::Untested, None, !heads.is_empty())
             };
-            let assessment_ids = heads.iter().map(|e| e.record.id.clone()).collect();
+            let assessment_ids: Vec<String> = heads.iter().map(|e| e.record.id.clone()).collect();
             self.hypotheses.insert(
                 id.clone(),
                 HypothesisState {
                     judgment,
                     confidence,
                     needs_review,
+                    review_token: review_token(&fingerprint, &assessment_ids),
                     assessment_ids,
                     fingerprint,
                 },
@@ -523,7 +573,11 @@ impl Snapshot {
                         ),
                         "invalid experiment target"
                     );
-                    ensure!(t.revision.len() == 64, "missing target revision");
+                    ensure!(
+                        t.revision.len() == 64 && !t.title.is_empty() && !t.body.is_empty(),
+                        "experiment target {} is missing its frozen revision, title or body",
+                        t.id
+                    );
                 }
             }
             Data::Run {
@@ -537,8 +591,12 @@ impl Snapshot {
                     "run requires an experiment"
                 );
                 ensure!(
-                    plan.id == *experiment && plan.revision.len() == 64,
-                    "invalid frozen experiment plan"
+                    plan.id == *experiment
+                        && plan.revision.len() == 64
+                        && !plan.title.is_empty()
+                        && !plan.body.is_empty(),
+                    "invalid frozen experiment plan: it must name the experiment and keep \
+                     its revision, title and body"
                 );
                 evidence_check(evidence)?;
             }

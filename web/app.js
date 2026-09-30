@@ -16,7 +16,6 @@ let snapshot = null,
   view = "overview",
   selected = "",
   editing = null,
-  draftRevision = "",
   dirty = false,
   pending = false,
   connected = false;
@@ -100,7 +99,11 @@ async function fetchJSON(url, options) {
   } catch {
     throw new Error(`Request failed (${res.status})`);
   }
-  if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
+  if (!res.ok) {
+    const error = new Error(data.error || `Request failed (${res.status})`);
+    error.status = res.status;
+    throw error;
+  }
   return data;
 }
 async function refresh() {
@@ -560,8 +563,9 @@ function objectOptions(kind) {
 }
 function openEditor(kind, owner = "", entry = null) {
   if (readOnly) return;
-  editing = { kind, owner, entry };
-  draftRevision = snapshot.revision;
+  // The form shows this snapshot, so every precondition of the save is taken
+  // from it, never from a refresh that arrives while the form is open.
+  editing = { kind, owner, entry, seen: snapshot };
   dirty = false;
   pending = false;
   $("#form-error").textContent = "";
@@ -799,18 +803,11 @@ function buildRecord(form) {
       break;
     case "experiment":
       r.status = get("status");
-      if (!entry)
-        r.targets = many("targets").map((id) => ({
-          id,
-          revision: "",
-          title: "",
-          body: "",
-        }));
+      if (!entry) r.targets = many("targets").map((id) => ({ id }));
       break;
     case "run":
       Object.assign(r, {
         experiment: get("experiment"),
-        plan: { id: get("experiment"), revision: "", title: "", body: "" },
         outcome: get("outcome"),
         evidence: many("evidence"),
       });
@@ -842,11 +839,49 @@ function buildRecord(form) {
   }
   return r;
 }
-async function transact(changes, revision = snapshot.revision) {
+// Mirrors Change::create_seen: the `expected` of a create, stating what
+// `seen` (the snapshot the form was opened on) held of the records the server
+// derives or freezes the new record's content from. For an assessment: its
+// hypothesis' state, and the records its cited evidence brings into the
+// fingerprint (store::assessment_additions: the evidence, links touching it
+// and their other ends; stating a few already covered is harmless). If this
+// misses one, the server answers 409 and names it.
+function expectedFrom(r, seen) {
+  const at = (id) => seen.objects.find((e) => e.record.id === id);
+  const revisions = {};
+  const state = (id) => {
+    if (at(id)) revisions[id] = at(id).revision;
+  };
+  const hypotheses = {};
+  if (r.kind === "assessment") {
+    const st = seen.hypotheses[r.hypothesis];
+    if (st)
+      hypotheses[r.hypothesis] = {
+        fingerprint: st.fingerprint,
+        assessment_ids: st.assessment_ids,
+      };
+    for (const id of r.evidence) {
+      state(id);
+      for (const { record: l } of seen.objects)
+        if (l.kind === "link" && (l.from === id || l.to === id))
+          [l.id, l.from, l.to].forEach(state);
+    }
+  }
+  if (r.kind === "experiment") {
+    if (!r.targets.some((t) => t.id === r.hypothesis))
+      r.targets.unshift({ id: r.hypothesis });
+    r.targets.forEach((t) => state(t.id));
+  }
+  if (r.kind === "run") [r.experiment, ...r.evidence].forEach(state);
+  return { hypotheses, revisions };
+}
+// Each change carries its own precondition; no whole-project revision, so
+// unrelated concurrent writes do not reject the save.
+async function transact(changes) {
   return fetchJSON("/api/transaction", {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Hyp-Token": token },
-    body: JSON.stringify({ expected_revision: revision, changes }),
+    body: JSON.stringify({ changes }),
   });
 }
 async function save(ev) {
@@ -858,7 +893,11 @@ async function save(ev) {
     const changes = [
       editing.entry
         ? { op: "update", record: r, expected_revision: editing.entry.revision }
-        : { op: "create", record: r },
+        : {
+            op: "create",
+            record: r,
+            expected: expectedFrom(r, editing.seen),
+          },
     ];
     const fd = new FormData(ev.target);
     if (!editing.entry && r.kind === "evidence" && fd.get("target"))
@@ -878,7 +917,7 @@ async function save(ev) {
           updated_at: "",
         },
       });
-    snapshot = await transact(changes, draftRevision);
+    snapshot = await transact(changes);
     dirty = false;
     pending = false;
     $("#editor").close();
@@ -889,7 +928,7 @@ async function save(ev) {
   } catch (e) {
     $("#form-error").textContent =
       e.message +
-      (e.message.startsWith("conflict:")
+      (e.status === 409
         ? " Copy your draft before closing, then reopen the record to reconcile changes."
         : "");
   } finally {
