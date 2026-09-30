@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-09-29 22:16'
-updated_date: '2026-09-30 05:34'
+updated_date: '2026-09-30 05:54'
 labels:
   - design
 dependencies: []
@@ -30,6 +30,7 @@ If most review flags are noise, users learn to ignore them, and the flag's value
 - [ ] #3 No-op updates do not change the file (and therefore the revision)
 - [ ] #4 Root cause fixed: the fingerprint hashes a canonical projection of the meaningful fields, not file-byte revisions (which include `updated_at`); object revisions stay raw-byte hashes, which is right for detecting external edits
 - [ ] #5 Dogfood regression: `hyp set H --lifecycle closed` (the skill's finishing step), tag or title edits do not set needs_review on H or on hypotheses linked to it. In the 2026-09-30 test-drive both the Claude Code and the Codex session ended with every hypothesis 'needs review' purely because they closed them
+- [ ] #6 Implements decision-0003 items 1-3: the fingerprint hashes a canonical projection of the listed content fields; lifecycle, tags, experiment status, gap resolution and updated_at are excluded; linked hypotheses count only via the link; assessments may cite only linked evidence; the citation-closure machinery is removed
 <!-- AC:END -->
 
 ## Implementation Notes
@@ -52,4 +53,6 @@ Decide: a principled closure (e.g. evidence reachable within the hypothesis's ow
 Test-drive 2026-09-30: concrete, high-visibility symptom. Both dogfood agents (Claude Code, Codex) followed the skill, assessed, then ran `hyp set H --lifecycle closed`; that changed H's revision, hence its fingerprint, so needs_review became true for H and for the competing hypothesis linked to it. Every finished investigation therefore looks stale.
 
 COMPASS 2026-09-30: settle the scope as a user decision first (proposed decision-0003 'review basis'), then implement HYPO-0031 -> 0009 -> 0026 as one deep-gated change. Open questions for the user: per-kind which field edits invalidate (title/body yes? lifecycle/tags/status no? archiving?); whether linked/competing hypotheses' content counts or only the link; whether an assessment may cite evidence outside the basis (if not, relevant_with/assessment_additions/expectedFrom mostly disappear); migration: accept a one-time needs-review wave or version the scheme in based_on. Watch: the title IS the claim for hypotheses/criteria/predictions/evidence, so 'title edits do not invalidate' must not apply to those kinds.
+
+DECIDED by the user 2026-09-30: see decision-0003 (content-only fingerprint; linked-only citations; accept one needs-review wave; evidence required for judgments, tracked separately). Implement HYPO-0031 -> 0009 -> 0026 as one deep-gated change and remove the citation-closure machinery (relevant_with, assessment_additions, expectedFrom, README recipe).
 <!-- SECTION:NOTES:END -->

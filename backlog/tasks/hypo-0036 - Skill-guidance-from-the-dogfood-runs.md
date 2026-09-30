@@ -4,7 +4,7 @@ title: Skill guidance from the dogfood runs
 status: To Do
 assignee: []
 created_date: '2026-09-30 02:26'
-updated_date: '2026-09-30 05:33'
+updated_date: '2026-09-30 05:54'
 labels:
   - agents
   - docs
@@ -26,3 +26,9 @@ Test-drive 2026-09-30: fresh Claude Code and Codex sessions, given only the inst
 - [ ] #2 The skill tells agents to search existing hypotheses first and to reuse evidence with `hyp link`
 - [ ] #3 A second dogfood run shows short evidence titles
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Per decision-0003, rewrite the skill's Assessing section once, after HYPO-0009 and the evidence-rule task: linked-only citations, and evidence enforced for all judgments except untested.
+<!-- SECTION:NOTES:END -->
