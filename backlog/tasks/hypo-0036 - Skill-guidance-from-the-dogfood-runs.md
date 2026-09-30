@@ -4,7 +4,7 @@ title: Skill guidance from the dogfood runs
 status: To Do
 assignee: []
 created_date: '2026-09-30 02:26'
-updated_date: '2026-09-30 12:22'
+updated_date: '2026-09-30 16:30'
 labels:
   - agents
   - docs
@@ -35,4 +35,14 @@ Per decision-0003, rewrite the skill's Assessing section once, after HYPO-0009 a
 Carried from HYPO-0028/0033/0034 (2026-09-30): write commands with --json now print `{"ids":[{"id","kind"}],"revision"}` (no snapshot; `.ids[0].id`, not `.ids[0]`); plain `hyp apply` prints IDs, not JSON; `evidence attach` prints the evidence ID. `hyp list` lists hypotheses only by default (`--kind K` or `--all` for others) and rows show judgment, lifecycle and needs-review; unknown --kind/--status exit 2. Plain `hyp show H` now shows the review token and a readable summary, so a skill example may use it for humans, but agents should still parse `hyp --json show`. SKILL.md Commands was minimally updated for the shapes; the rewrite is this task.
 
 Correction to the note above (2026-09-30 review fix): the write JSON is `{"written":[{"id","kind","revision"}],"revision"}` (not `ids`); read `.written[0].id`, and `.written[i].revision` is the record's revision to state in a follow-up update/archive/delete. `hyp --json init` prints the same shape. Impossible `hyp list` filter combinations exit 2.
+
+Carried from human CLI batch 2 (HYPO-0058, 0059, 0063, 0068), 2026-09-30:
+- `hyp assess --reviewed` accepts the full review token or a prefix of 12+ hex digits (case-insensitive). The plain `hyp show H` line "review token:" prints it, so the skill may show plain show for people; agents still parse `hyp --json show` (.state.review_token). `hyp apply` expected.hypotheses[H].review_token still requires the full 64 hex digits.
+- A stale token conflict (exit 3) says nothing was written and to compare `hyp show H` with what was reviewed; it does not name the changed records (HYPO-0069).
+- `--confidence` is 0.0-1.0; 80 is an ordinary error (exit 1) with a hint; a non-number exits 2.
+- Stdout of write commands is unchanged (IDs; --json shape). Human summaries go to stderr ONLY when stderr is a terminal, so agents (pipes) see nothing new, except: a write that changes nothing prints "no changes" (or "no changes: ID is not archived" / "is already archived") to stderr in plain mode, even when piped, and exits 0. With --json stderr stays reserved for {"error"}; an unchanged .written[i].revision says it.
+- Only one text argument per command may be '-'; two or more is exit 1 before stdin is read.
+- `hyp edit` refuses assessments and runs before opening the editor; agents should not use `hyp edit` anyway (interactive).
+
+- (batch 2 review fix) `hyp edit` reopens the editor only on a terminal; without one the first error fails with exit 1, the error and a kept-copy path (also in --json {"error"}).
 <!-- SECTION:NOTES:END -->

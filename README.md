@@ -78,7 +78,7 @@ hyp assess H-… --reviewed <token> --status weakened --confidence 0.2 \
   --evidence E-… --reason "Check the timing confound before rejecting the hypothesis."
 hyp assess H-… --reviewed <token> --status falsified --criterion F-… \
   --evidence E-… --reason "Controlled replication satisfies the rejection criterion."
-hyp show H-…                 # a summary with the review token; --json for everything
+hyp show H-…                 # a summary with its review token; --json for everything
 hyp list --needs-review      # hypotheses by default; --kind KIND or --all for others
 hyp search "cache"
 hyp check
@@ -94,7 +94,7 @@ hyp set G-… --resolved true
 hyp evidence attach E-… ./capture.txt
 hyp experiment add H-… "Replication" --targets P-…,F-…
 hyp set X-… --experiment-status running
-hyp edit H-…                 # $VISUAL, then $EDITOR, then vi
+hyp edit H-…                 # $VISUAL, then $EDITOR, then vi; not assessments or runs
 hyp archive H-…
 hyp restore H-…
 hyp delete H-…               # only archived and unreferenced records
@@ -102,7 +102,9 @@ hyp delete H-…               # only archived and unreferenced records
 
 `depends-on`, `competes-with`, and `supersedes` are CLI relation values, and plain output (`list`, `show`, `graph`, Markdown export, error messages) spells them so. Files and JSON use the serialized form with underscores (`competes_with`). Dependencies and supersession cannot form cycles. Competing hypotheses may be linked in either direction; the relation does not imply mutual exclusivity.
 
-Use `-` for a text argument to read stdin. Flags accept literal multiline values. A title is one line: with `-`, the first line of stdin is the title and the rest is appended to the body (after a blank line if the body is not empty); a given title with a newline is an error, and `hyp check` reports a stored one. All ordinary commands support `--json`. `hyp apply` accepts a JSON array of create/update/archive/delete changes on stdin, with optional `--expected-revision` for a whole-project precondition; `hyp apply --help` shows each change with examples.
+Use `-` for a text argument to read stdin. Flags accept literal multiline values. A title is one line: with `-`, the first line of stdin is the title and the rest is appended to the body (after a blank line if the body is not empty); a given title with a newline is an error, and `hyp check` reports a stored one. All ordinary commands support `--json`. `hyp apply` accepts a JSON array of create/update/archive/delete changes on stdin, with optional `--expected-revision` for a whole-project precondition; `hyp apply --help` shows each change with examples. Only one argument of a command can be `-` (stdin is read once); more is an error (exit `1`).
+
+For people at a terminal: when stderr is a terminal, a write command also prints a one-line summary there (`created evidence E-… (+ link L-…: E-… supports H-…)`), and a `-` argument read from a terminal prints how to end the input (Ctrl-D). A write that changes nothing (`hyp set H-…` without flags, restoring a record that is not archived, saving `hyp edit` unchanged) prints `no changes` to stderr, whether or not it is a terminal (not with `--json`), and exits `0`. When `hyp edit` rejects the edited record and stdin and stderr are terminals, the editor reopens with the error as `# hyp:` comment lines under the opening `---`; line numbers in it count lines of that file. Saving it unchanged, or emptying it, aborts (exit `1`) with the last error and names a copy of the text. Without a terminal (a scripted editor) the first error fails the command the same way, without reopening.
 
 `hyp list` lists hypotheses, each with its judgment, lifecycle and a `needs-review` marker; `--kind KIND` lists another kind and `--all` every kind. A `--status` or `--needs-review` the listed kind cannot have (`--status planned` without `--kind experiment`) is an argument error (exit `2`), not an empty list.
 
@@ -118,7 +120,7 @@ Agents depend on these; they are kept stable.
 | `3`           | Conflict: something the write depended on changed since it was read. Nothing was written. Re-read, review, retry.                                  |
 | `141`         | Killed by SIGPIPE: stdout was closed early (`hyp list \| head`). A write command prints after writing, so its write may already be on disk.           |
 
-Write commands (`add`, `evidence add`, `assess`, `set`, `apply`, `evidence attach` and the rest) print the full ID of each record their changes named, one per line and in order (`evidence add`: the evidence, then its link; `evidence attach`: the evidence). With `--json` they print `{"written": [{"id": "H-…", "kind": "hypothesis", "revision": "…"}], "revision": "…"}`: each record's revision after the write (`null` once deleted), usable as the `expected_revision` of a next change, and the project revision (what `apply --expected-revision` takes). `hyp --json init` prints the same shape, listing every record of the new project.
+Write commands (`add`, `evidence add`, `assess`, `set`, `apply`, `evidence attach` and the rest) print the full ID of each record their changes named, one per line and in order (`evidence add`: the evidence, then its link; `evidence attach`: the evidence). With `--json` they print `{"written": [{"id": "H-…", "kind": "hypothesis", "revision": "…"}], "revision": "…"}`: each record's revision after the write (`null` once deleted), usable as the `expected_revision` of a next change, and the project revision (what `apply --expected-revision` takes). `hyp --json init` prints the same shape, listing every record of the new project. Stdout is the same when a change turned out to change nothing (the revision stays as it was). Stderr carries a human summary only when it is a terminal, `no changes` only without `--json`.
 
 Errors go to stderr, with `--json` as `{"error": "…"}`. A conflict's message starts with `conflict:`. The WebUI's HTTP API answers `403` for a missing or invalid request token or an untrusted `Host`/`Origin`, `409` for a conflict, `422` for input the domain rules reject, and another `4xx` for other rejected input (malformed JSON, an oversized body, a wrong content type).
 
@@ -142,7 +144,7 @@ A statement that no longer holds (the record changed or was deleted) is a confli
 
 An assessment may cite only evidence with an active link to its hypothesis, or to one of its active criteria or predictions (`hyp link E-… H-… --relation supports --reason "…"`). Citing other evidence, or a judgment other than `untested` without evidence, is an ordinary error. In an `apply` batch, the assessment's basis may grow only by records the batch creates: to bring in evidence that already existed, link it in an earlier write, re-read, then assess.
 
-The CLI commands state preconditions from their own read, so they protect only the moment between that read and the write. `hyp assess` is the exception: it requires `--reviewed` with the `review_token` from the `state` you reviewed (`hyp --json show H-…` or `hyp --json list`). If the hypothesis's basis or its current assessments changed since, it writes nothing and exits `3`; a malformed token exits `1`. To protect a longer window for other records, use `hyp apply`. The WebUI states everything as of the moment a form was opened.
+The CLI commands state preconditions from their own read, so they protect only the moment between that read and the write. `hyp assess` is the exception: it requires `--reviewed` with the review token of the state you reviewed: the `review token:` line of `hyp show H-…`, or `.state.review_token` of `hyp --json show H-…` or `hyp --json list`. Its first 12 or more hex digits suffice. If the hypothesis's basis or its current assessments changed since, it writes nothing and exits `3`; `hyp show H-…` then lists the basis to compare with what you reviewed. A malformed token, or a `--confidence` outside 0.0 to 1.0, exits `1`. `hyp apply` takes only the full token. To protect a longer window for other records, use `hyp apply`. The WebUI states everything as of the moment a form was opened.
 
 ## The model
 

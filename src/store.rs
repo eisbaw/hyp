@@ -45,6 +45,10 @@ pub struct Written {
     pub id: String,
     pub kind: Kind,
     pub revision: Option<String>,
+    /// False for an update or archive that changed nothing and was not
+    /// written. Not part of the JSON: there, an unchanged revision says so.
+    #[serde(skip)]
+    pub changed: bool,
 }
 impl Written {
     pub fn of(e: &Entry) -> Self {
@@ -52,6 +56,7 @@ impl Written {
             id: e.record.id.clone(),
             kind: e.record.data.kind_value(),
             revision: Some(e.revision.clone()),
+            changed: true,
         }
     }
 }
@@ -408,6 +413,34 @@ pub fn encode(r: &Record) -> Result<String> {
         r.body
     ))
 }
+/// An error in the YAML front matter of a record file, its line numbers
+/// counted in the file (line 1 is the opening `---`).
+#[derive(Debug)]
+pub struct FrontMatter(pub String);
+impl std::fmt::Display for FrontMatter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for FrontMatter {}
+/// `message` with every "line N column M" (how serde_yaml locates an error)
+/// moved down by `by` lines.
+pub fn shift_lines(message: &str, by: usize) -> String {
+    let mut out = String::new();
+    let mut rest = message;
+    while let Some(at) = rest.find("line ") {
+        let (before, after) = rest.split_at(at + "line ".len());
+        out.push_str(before);
+        let digits = after.bytes().take_while(u8::is_ascii_digit).count();
+        match after[..digits].parse::<usize>() {
+            Ok(n) if after[digits..].starts_with(" column ") => out.push_str(&(n + by).to_string()),
+            _ => out.push_str(&after[..digits]),
+        }
+        rest = &after[digits..];
+    }
+    out.push_str(rest);
+    out
+}
 pub fn decode(s: &str) -> Result<Record> {
     let s = s
         .strip_prefix("---\n")
@@ -415,7 +448,8 @@ pub fn decode(s: &str) -> Result<Record> {
     let (header, body) = s
         .split_once("\n---\n")
         .context("missing front matter closing delimiter")?;
-    let mut r: Record = serde_yaml::from_str(header)?;
+    let mut r: Record =
+        serde_yaml::from_str(header).map_err(|e| FrontMatter(shift_lines(&e.to_string(), 1)))?;
     r.body = body.to_string();
     Ok(r)
 }
@@ -738,7 +772,8 @@ impl Store {
         let mut after = before.clone();
         let mut writes = BTreeMap::new();
         let mut created = Vec::new();
-        let mut named: Vec<(String, Kind)> = Vec::new();
+        // (ID, kind, file) of the object each change names.
+        let mut named: Vec<(String, Kind, String)> = Vec::new();
         for change in changes {
             let record = match change {
                 Change::Create {
@@ -755,7 +790,11 @@ impl Store {
                     check_create(&before, &record, expected.as_ref())?;
                     after.validate_new(&record)?;
                     created.push(record.id.clone());
-                    named.push((record.id.clone(), record.data.kind_value()));
+                    named.push((
+                        record.id.clone(),
+                        record.data.kind_value(),
+                        Self::relative(&record),
+                    ));
                     record.created_at = chrono::Utc::now().to_rfc3339();
                     // Derived and frozen content comes from the current state, which
                     // check_create tied to what the caller read.
@@ -811,7 +850,11 @@ impl Store {
                     expected_revision,
                 } => {
                     let old = stated(&after, &record.id, &expected_revision)?;
-                    named.push((old.record.id.clone(), old.record.data.kind_value()));
+                    named.push((
+                        old.record.id.clone(),
+                        old.record.data.kind_value(),
+                        Self::relative(&old.record),
+                    ));
                     ensure!(
                         old.record.data.kind() == record.data.kind(),
                         "cannot change object kind"
@@ -842,7 +885,11 @@ impl Store {
                     expected_revision,
                 } => {
                     let old = stated(&after, &id, &expected_revision)?;
-                    named.push((old.record.id.clone(), old.record.data.kind_value()));
+                    named.push((
+                        old.record.id.clone(),
+                        old.record.data.kind_value(),
+                        Self::relative(&old.record),
+                    ));
                     ensure!(
                         !matches!(old.record.data, Data::Assessment { .. } | Data::Run { .. }),
                         "historical assessments and runs cannot be archived"
@@ -856,7 +903,11 @@ impl Store {
                     expected_revision,
                 } => {
                     let old = stated(&after, &id, &expected_revision)?.clone();
-                    named.push((old.record.id.clone(), old.record.data.kind_value()));
+                    named.push((
+                        old.record.id.clone(),
+                        old.record.data.kind_value(),
+                        Self::relative(&old.record),
+                    ));
                     let id = &old.record.id;
                     ensure!(
                         !matches!(old.record.data, Data::Assessment { .. } | Data::Run { .. }),
@@ -958,8 +1009,9 @@ impl Store {
         let snapshot = self.read_unlocked()?;
         let written = named
             .into_iter()
-            .map(|(id, kind)| Written {
+            .map(|(id, kind, file)| Written {
                 revision: snapshot.get(&id).map(|e| e.revision.clone()),
+                changed: writes.contains_key(&file),
                 id,
                 kind,
             })

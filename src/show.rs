@@ -138,6 +138,13 @@ pub fn plain(s: &Snapshot, e: &Entry) -> String {
                         continue;
                     }
                     let v = value(v).map(|v| if name.ends_with("_at") { when(&v) } else { v });
+                    // The fingerprint of the basis the assessment was based on,
+                    // not the review token that `hyp assess --reviewed` took.
+                    let name = if name == "based_on" {
+                        "based on fingerprint"
+                    } else {
+                        name
+                    };
                     field(&mut out, "", name, v.as_deref().unwrap_or_default());
                 }
             }

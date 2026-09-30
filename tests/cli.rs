@@ -172,6 +172,7 @@ fn edit_during_concurrent_write(project: &Path, id: &str, concurrent: &str) -> O
         .env("HYP_BIN", env!("CARGO_BIN_EXE_hyp"))
         .env("HYP_PROJECT", project)
         .env("HYP_CONCURRENT", concurrent)
+        .env("TMPDIR", project)
         .output()
         .unwrap()
 }
@@ -195,15 +196,21 @@ fn unrelated_write_between_read_and_commit_does_not_fail_a_cli_write() {
         serde_json::from_str(&ok(project.path(), &["--json", "show", &h])).unwrap();
     assert_eq!(shown["entry"]["record"]["title"], "Edited in editor");
     assert!(ok(project.path(), &["list"]).contains("Unrelated"));
-    // A write to the same record in that window is still a conflict.
+    // A write to the same record in that window is still a conflict. (A new
+    // title first, so that the editor's edit differs from the record.)
+    ok(project.path(), &["set", &h, "--title", "Before"]);
     let out =
         edit_during_concurrent_write(project.path(), &h, &format!("set {h} --title Concurrent"));
-    assert_eq!(
-        out.status.code(),
-        Some(3),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(3), "{stderr}");
+    // The edit is not lost: the conflict names a copy of it.
+    assert!(stderr.starts_with("hyp: conflict:"), "{stderr}");
+    let kept = stderr
+        .trim_end()
+        .split("your text is kept in ")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no kept path in {stderr}"));
+    assert!(read(kept).contains("title: Edited in editor"));
 }
 
 #[test]
@@ -308,11 +315,16 @@ fn assess_is_based_on_the_state_the_agent_reviewed() {
     );
     assert_eq!(state()["judgment"], "weakened");
     // Malformed tokens are usage mistakes to fix, not races to retry.
-    for bad in ["abc", &token()[..63], &"z".repeat(64)] {
+    for bad in [
+        "abc",
+        &token()[..11],
+        &"z".repeat(64),
+        &format!("{}0", token()),
+    ] {
         let out = assess(bad, "supported");
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert_eq!(out.status.code(), Some(1), "{bad}: {stderr}");
-        assert!(stderr.contains("64-hex-digit"), "{stderr}");
+        assert!(stderr.contains("first 12 or more hex digits"), "{stderr}");
     }
     let out = run(p, &["assess", &h, "--status", "supported", "--reason", "x"]);
     assert_eq!(
@@ -1938,5 +1950,524 @@ fn check_counts_in_the_singular_and_init_says_what_to_do_next() {
     assert!(
         ok(p, &["check"]).ends_with("Checked 1 object\n"),
         "singular"
+    );
+}
+
+fn stderr_of(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+fn stdout_of(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+#[test]
+fn assess_accepts_a_review_token_prefix_of_12_or_more_hex_digits() {
+    let project = demo();
+    let p = project.path();
+    let h = first(p, "hypothesis");
+    let e = first(p, "evidence");
+    let token = || -> String {
+        let shown: serde_json::Value =
+            serde_json::from_str(&ok(p, &["--json", "show", &h])).unwrap();
+        shown["state"]["review_token"].as_str().unwrap().to_string()
+    };
+    // Plain show prints the full token for people to copy.
+    assert!(ok(p, &["show", &h]).contains(&format!("review token: {}", token())));
+    let assess = |reviewed: &str| {
+        run(
+            p,
+            &[
+                "assess",
+                &h,
+                "--reviewed",
+                reviewed,
+                "--status",
+                "weakened",
+                "--evidence",
+                &e,
+                "--reason",
+                "Reviewed",
+            ],
+        )
+    };
+    let out = assess(&token()[..11]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
+    assert!(stderr_of(&out).contains("`hyp show"), "{}", stderr_of(&out));
+    let stale = token();
+    let out = assess(&stale[..12].to_uppercase());
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    // The assessment changed the token: the old prefix is now a conflict
+    // that says how to compare.
+    let out = assess(&stale[..12]);
+    let stderr = stderr_of(&out);
+    assert_eq!(out.status.code(), Some(3), "{stderr}");
+    assert!(
+        stderr.contains("nothing was written") && stderr.contains(&format!("`hyp show {h}`")),
+        "{stderr}"
+    );
+    let out = assess(&token()[..20]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    // Plain show of the assessment names what based_on is.
+    let a = stdout_of(&out).trim().to_string();
+    let shown = ok(p, &["show", &a]);
+    assert!(shown.contains("based on fingerprint: "), "{shown}");
+    assert!(!shown.contains("based_on"), "{shown}");
+}
+
+#[test]
+fn a_percent_looking_confidence_gets_a_hint() {
+    let project = demo();
+    let p = project.path();
+    let h = first(p, "hypothesis");
+    let shown: serde_json::Value = serde_json::from_str(&ok(p, &["--json", "show", &h])).unwrap();
+    let token = shown["state"]["review_token"].as_str().unwrap().to_string();
+    let assess = |confidence: &str| {
+        run(
+            p,
+            &[
+                "assess",
+                &h,
+                "--reviewed",
+                &token,
+                "--status",
+                "untested",
+                "--confidence",
+                confidence,
+                "--reason",
+                "x",
+            ],
+        )
+    };
+    let out = assess("80");
+    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
+    assert!(
+        stderr_of(&out).contains("from 0.0 to 1.0, got 80 (did you mean 0.8?)"),
+        "{}",
+        stderr_of(&out)
+    );
+    for unlikely_percent in ["150", "1.5"] {
+        let out = assess(unlikely_percent);
+        assert_eq!(out.status.code(), Some(1));
+        assert!(
+            !stderr_of(&out).contains("did you mean"),
+            "{}",
+            stderr_of(&out)
+        );
+    }
+    let out = assess("high");
+    assert_eq!(out.status.code(), Some(2), "not a number: a usage error");
+    assert!(stderr_of(&out).contains("a number from 0.0 to 1.0"));
+    let help = ok(p, &["assess", "--help"]);
+    assert!(help.contains("from 0.0 to 1.0"), "{help}");
+    assert!(help.contains("review token:"), "{help}");
+}
+
+#[test]
+fn stdin_can_be_given_to_one_argument_only() {
+    let dir = TempDir::new().unwrap();
+    let p = dir.path();
+    ok(p, &["init"]);
+    let out = with_stdin(p, &["add", "-", "--body", "-"], "Title\nBody\n");
+    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
+    assert!(
+        stderr_of(&out).contains("TITLE and --body are each '-'"),
+        "{}",
+        stderr_of(&out)
+    );
+    assert_eq!(ok(p, &["list", "--all"]), "", "nothing written");
+    let h = ok(p, &["add", "Claim"]).trim().to_string();
+    let out = with_stdin(p, &["set", &h, "--title", "-", "--body", "-"], "T\n");
+    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
+    assert!(stderr_of(&out).contains("--title and --body"));
+    // One '-' still reads stdin, and says nothing when stdin is not a terminal.
+    let out = with_stdin(p, &["set", &h, "--body", "-"], "From stdin\n");
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    assert_eq!(stderr_of(&out), "");
+    assert_eq!(record(p, &h)["body"], "From stdin");
+}
+
+#[test]
+fn a_write_that_changes_nothing_says_so() {
+    let project = demo();
+    let p = project.path();
+    let h = first(p, "hypothesis");
+    let revision = || record_revision(p, &h);
+    let before = revision();
+    let no_op = |args: &[&str], notice: &str| {
+        let out = run(p, args);
+        assert!(out.status.success(), "{args:?}: {}", stderr_of(&out));
+        // The ID contract on stdout is unchanged.
+        assert_eq!(stdout_of(&out), format!("{h}\n"), "{args:?}");
+        assert_eq!(stderr_of(&out), format!("{notice}\n"), "{args:?}");
+    };
+    no_op(&["set", &h], "no changes");
+    no_op(
+        &["restore", &h],
+        &format!("no changes: {} is not archived", &h[..10]),
+    );
+    let out = hyp(p)
+        .args(["edit", &h])
+        .env("VISUAL", "true")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    assert_eq!(stderr_of(&out), "no changes\n");
+    assert_eq!(revision(), before, "nothing was written");
+    // A real change prints only the IDs when stderr is not a terminal.
+    let out = run(p, &["archive", &h]);
+    assert!(out.status.success());
+    assert_eq!(stderr_of(&out), "");
+    assert_ne!(revision(), before);
+    no_op(
+        &["archive", &h],
+        &format!("no changes: {} is already archived", &h[..10]),
+    );
+    // --json keeps stderr for errors; an unchanged revision says it there.
+    let out = run(p, &["--json", "restore", &h]);
+    assert_eq!(stderr_of(&out), "");
+    let out = run(p, &["--json", "restore", &h]);
+    assert_eq!(stderr_of(&out), "");
+}
+fn record_revision(p: &Path, id: &str) -> String {
+    let shown: serde_json::Value = serde_json::from_str(&ok(p, &["--json", "show", id])).unwrap();
+    shown["entry"]["revision"].as_str().unwrap().to_string()
+}
+
+/// A pseudo-terminal pair (master, slave): what a process writes to the
+/// slave is read from the master, `\n` arriving as `\r\n`. Both are opened
+/// close-on-exec (std's default), so only the stdio given to a child leaks.
+fn pty() -> (std::fs::File, std::fs::File) {
+    use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
+    let open = |path: &str| {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOCTTY)
+            .open(path)
+            .unwrap_or_else(|e| panic!("open {path}: {e}"))
+    };
+    let master = open("/dev/ptmx");
+    let fd = master.as_raw_fd();
+    let mut name = [0 as libc::c_char; 128];
+    // SAFETY: libc calls on a descriptor `master` owns; ptsname_r writes a
+    // NUL-terminated name into the buffer on success.
+    let path = unsafe {
+        assert_eq!(libc::grantpt(fd), 0, "grantpt");
+        assert_eq!(libc::unlockpt(fd), 0, "unlockpt");
+        assert_eq!(libc::ptsname_r(fd, name.as_mut_ptr(), name.len()), 0);
+        std::ffi::CStr::from_ptr(name.as_ptr())
+            .to_string_lossy()
+            .into_owned()
+    };
+    (master, open(&path))
+}
+/// Waits for `child`, killing it after `secs` seconds: a hang fails the test
+/// instead of stalling it.
+fn wait_or_kill(mut child: std::process::Child, secs: u64) -> Output {
+    let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() > deadline {
+            child.kill().unwrap();
+            let out = child.wait_with_output().unwrap();
+            panic!("still running after {secs} s; stderr: {}", stderr_of(&out));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    child.wait_with_output().unwrap()
+}
+/// Runs `command` with stdin and stderr on a terminal, typing `input` when
+/// given: after the command printed a line (or 10 s passed), then Ctrl-D.
+/// Returns stdout and what the terminal showed, `\r\n` as `\n`.
+fn on_terminal(mut command: Command, input: Option<&str>) -> (Output, String) {
+    use std::io::{Read, Write};
+    let (mut master, slave) = pty();
+    let child = command
+        .stdout(Stdio::piped())
+        .stdin(slave.try_clone().unwrap())
+        .stderr(slave.try_clone().unwrap())
+        .spawn()
+        .unwrap();
+    drop(command);
+    drop(slave);
+    // Once no process holds the slave, reading the master drains what is
+    // buffered and then fails (EIO on Linux), which ends the reader.
+    let (sender, chunks) = mpsc::channel();
+    let mut reader = master.try_clone().unwrap();
+    std::thread::spawn(move || {
+        let mut buf = [0; 4096];
+        while let Ok(n @ 1..) = reader.read(&mut buf) {
+            if sender.send(buf[..n].to_vec()).is_err() {
+                break;
+            }
+        }
+    });
+    let mut shown = Vec::new();
+    if let Some(text) = input {
+        while !shown.contains(&b'\n') {
+            match chunks.recv_timeout(Duration::from_secs(10)) {
+                Ok(chunk) => shown.extend(chunk),
+                Err(_) => break,
+            }
+        }
+        master.write_all(text.as_bytes()).unwrap();
+        master.write_all(b"\x04").unwrap();
+    }
+    let out = wait_or_kill(child, 20);
+    shown.extend(chunks.iter().flatten());
+    (out, String::from_utf8_lossy(&shown).replace("\r\n", "\n"))
+}
+fn hyp_args(project: &Path, args: &[&str]) -> Command {
+    let mut command = hyp(project);
+    command.args(args);
+    command
+}
+
+#[test]
+fn writes_summarise_on_a_terminal_and_hint_at_stdin() {
+    let project = demo();
+    let p = project.path();
+    let h = first(p, "hypothesis");
+    let (out, shown) = on_terminal(
+        hyp_args(p, &["evidence", "add", &h, "Seen twice", "--source", "log"]),
+        None,
+    );
+    assert!(out.status.success(), "{shown}");
+    let ids: Vec<String> = stdout_of(&out).lines().map(str::to_string).collect();
+    assert_eq!(ids.len(), 2, "stdout keeps one ID per line");
+    let (e, l) = (&ids[0][..10], &ids[1][..10]);
+    assert_eq!(
+        shown,
+        format!(
+            "created evidence {e} (+ link {l}: {e} supports {})\n",
+            &h[..10]
+        )
+    );
+    let p_id = first(p, "prediction");
+    let (out, shown) = on_terminal(hyp_args(p, &["archive", &p_id]), None);
+    assert!(out.status.success(), "{shown}");
+    assert_eq!(shown, format!("archived prediction {}\n", &p_id[..10]));
+    // Typing a text argument: a hint first, then the echo of the typing.
+    let (out, shown) = on_terminal(hyp_args(p, &["add", "-"]), Some("Typed claim\n"));
+    assert!(out.status.success(), "{shown}");
+    assert!(
+        shown.starts_with("reading TITLE from stdin; end with Ctrl-D\n"),
+        "{shown:?}"
+    );
+    let new = stdout_of(&out).trim().to_string();
+    assert!(shown.ends_with(&format!("created hypothesis {}\n", &new[..10])));
+    assert_eq!(record(p, &new)["title"], "Typed claim");
+}
+
+/// An editor for `hyp edit` tests: `$DIR/round-N.sh FILE` edits the file the
+/// N-th time it opens (a missing script saves it unchanged); it logs a copy
+/// of what it was shown as `$DIR/seen-N.md`.
+fn scripted_editor(dir: &Path, rounds: &[&str]) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    for (i, script) in rounds.iter().enumerate() {
+        std::fs::write(dir.join(format!("round-{}.sh", i + 1)), script).unwrap();
+    }
+    let editor = dir.join("editor.sh");
+    std::fs::write(
+        &editor,
+        format!(
+            "#!/bin/sh\nset -e\nd='{}'\nn=$(($(cat \"$d/opened\" 2>/dev/null || echo 0) + 1))\n\
+             echo $n > \"$d/opened\"\ncp \"$1\" \"$d/seen-$n.md\"\n\
+             if [ -f \"$d/round-$n.sh\" ]; then sh \"$d/round-$n.sh\" \"$1\"; fi\n",
+            dir.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
+    editor
+}
+/// `hyp edit id` with `editor`, kept copies going to `tmp`: on a terminal
+/// (where a rejected edit reopens the editor) or not. Returns the output and
+/// stderr (with `terminal`, what the terminal showed).
+fn edit_with(p: &Path, editor: &Path, id: &str, tmp: &Path, terminal: bool) -> (Output, String) {
+    let mut command = hyp(p);
+    command
+        .args(["edit", id])
+        .env_remove("VISUAL")
+        .env("EDITOR", editor)
+        .env("TMPDIR", tmp);
+    if terminal {
+        return on_terminal(command, None);
+    }
+    let child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let out = wait_or_kill(child, 20);
+    let stderr = stderr_of(&out);
+    (out, stderr)
+}
+fn kept_path(stderr: &str) -> &str {
+    stderr
+        .trim_end()
+        .split("your text is kept in ")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no kept path in {stderr}"))
+}
+
+#[test]
+fn edit_reopens_with_the_error_and_keeps_the_users_text() {
+    let project = demo();
+    let p = project.path();
+    let h = first(p, "hypothesis");
+    let scratch = TempDir::new().unwrap();
+    let dir = scratch.path();
+    // A YAML error in the first round, fixed in the second.
+    let editor = scripted_editor(
+        dir,
+        &[
+            "sed -i 's/^title: .*/title: Kept edit/; s/^scope: .*/scope: [unclosed/' \"$1\"",
+            "sed -i 's/^scope: .*/scope: Fixed/' \"$1\"",
+        ],
+    );
+    let (out, stderr) = edit_with(p, &editor, &h, dir, true);
+    assert!(out.status.success(), "{stderr}");
+    assert_eq!(stdout_of(&out), format!("{h}\n"));
+    let r = record(p, &h);
+    assert_eq!(
+        (&r["title"], &r["scope"]),
+        (&"Kept edit".into(), &"Fixed".into())
+    );
+    let reopened = read(dir.join("seen-2.md"));
+    let lines: Vec<&str> = reopened.lines().collect();
+    assert_eq!(lines[0], "---");
+    assert!(lines[1].starts_with("# hyp: error: "), "{reopened}");
+    assert!(lines.contains(&"title: Kept edit"), "{reopened}");
+    // The error's line numbers count lines of the file as reopened.
+    let at = lines[1]
+        .split("at line ")
+        .nth(1)
+        .and_then(|s| s.split(' ').next())
+        .and_then(|n| n.parse::<usize>().ok())
+        .unwrap_or_else(|| panic!("no line number in {:?}", lines[1]));
+    let flow = lines[1].rsplit("at line ").next().unwrap();
+    let flow: usize = flow.split(' ').next().unwrap().parse().unwrap();
+    assert_eq!(lines[flow - 1], "scope: [unclosed", "{reopened}");
+    assert!(at >= flow, "{reopened}");
+    // The notes are not part of the record.
+    assert!(!read(p.join(format!("hyp/hypotheses/{h}.md"))).contains("# hyp:"));
+}
+
+#[test]
+fn edit_aborts_keeping_the_text_when_the_reopened_file_is_saved_unchanged() {
+    let project = demo();
+    let p = project.path();
+    let h = first(p, "hypothesis");
+    let before = record_revision(p, &h);
+    let scratch = TempDir::new().unwrap();
+    let dir = scratch.path();
+    let editor = scripted_editor(
+        dir,
+        &["sed -i 's/^title: .*/title: Precious/; s/^kind: .*/kind: prediction/' \"$1\""],
+    );
+    let (out, stderr) = edit_with(p, &editor, &h, dir, true);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        read(dir.join("seen-2.md")).contains(
+            "# hyp: error: cannot change the kind of a record (hypothesis to prediction)"
+        ),
+        "{}",
+        read(dir.join("seen-2.md"))
+    );
+    let kept = kept_path(&stderr);
+    assert!(kept.starts_with(dir.to_str().unwrap()), "{kept}");
+    assert!(read(kept).contains("title: Precious"));
+    // The message says why: the abort and the error the user did not fix.
+    assert!(
+        stderr.contains("saved unchanged")
+            && stderr.contains("Last error: cannot change the kind of a record"),
+        "{stderr}"
+    );
+    assert_eq!(record_revision(p, &h), before, "nothing was written");
+    // Emptying the file aborts too; with no edit in it there is nothing to keep.
+    let empty = TempDir::new().unwrap();
+    let editor = scripted_editor(empty.path(), &[": > \"$1\""]);
+    let (out, stderr) = edit_with(p, &editor, &h, empty.path(), true);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("emptied") && !stderr.contains("kept"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn edit_refuses_assessments_and_runs_before_opening_the_editor() {
+    let project = demo();
+    let p = project.path();
+    for kind in ["assessment", "run"] {
+        let id = first(p, kind);
+        let scratch = TempDir::new().unwrap();
+        let editor = scripted_editor(scratch.path(), &[]);
+        let (out, stderr) = edit_with(p, &editor, &id, scratch.path(), false);
+        assert_eq!(out.status.code(), Some(1), "{stderr}");
+        assert!(stderr.contains("immutable"), "{stderr}");
+        assert!(
+            !scratch.path().join("opened").exists(),
+            "the editor started for the {kind}"
+        );
+    }
+}
+
+/// An editor that is a script, not a person: each time it copies the same
+/// invalid file over the one it is given. Without a terminal hyp must fail
+/// on the first error; on one, the second copy is an unchanged save.
+#[test]
+fn edit_with_a_copying_editor_stops_instead_of_reopening_forever() {
+    use std::os::unix::fs::PermissionsExt;
+    let project = demo();
+    let p = project.path();
+    let h = first(p, "hypothesis");
+    let before = record_revision(p, &h);
+    let invalid = read(p.join(format!("hyp/hypotheses/{h}.md")))
+        .replace("kind: hypothesis", "kind: prediction")
+        .replace("title: DMA timeout", "title: Copied DMA timeout");
+    for terminal in [false, true] {
+        let scratch = TempDir::new().unwrap();
+        let dir = scratch.path();
+        std::fs::write(dir.join("new.md"), &invalid).unwrap();
+        let editor = dir.join("copy.sh");
+        std::fs::write(
+            &editor,
+            format!(
+                "#!/bin/sh\nd='{}'\necho >> \"$d/opened\"\ncp \"$d/new.md\" \"$1\"\n",
+                dir.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (out, stderr) = edit_with(p, &editor, &h, dir, terminal);
+        assert_eq!(out.status.code(), Some(1), "terminal {terminal}: {stderr}");
+        let opened = read(dir.join("opened")).lines().count();
+        assert_eq!(opened, if terminal { 2 } else { 1 }, "{stderr}");
+        assert!(
+            stderr.contains("cannot change the kind of a record (hypothesis to prediction)")
+                && stderr.contains("nothing was written"),
+            "{stderr}"
+        );
+        assert!(read(kept_path(&stderr)).contains("title: Copied DMA timeout"));
+        assert_eq!(record_revision(p, &h), before, "nothing was written");
+    }
+    // With --json the error, kept path included, is the {"error"} object.
+    let scratch = TempDir::new().unwrap();
+    let dir = scratch.path();
+    std::fs::write(dir.join("new.md"), &invalid).unwrap();
+    let out = hyp(p)
+        .args(["--json", "edit", &h])
+        .env_remove("VISUAL")
+        .env("EDITOR", format!("cp '{}'", dir.join("new.md").display()))
+        .env("TMPDIR", dir)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let error: serde_json::Value = serde_json::from_str(&stderr_of(&out)).unwrap();
+    let message = error["error"].as_str().unwrap();
+    assert!(
+        message.contains("cannot change the kind of a record") && message.contains("kept in"),
+        "{message}"
     );
 }

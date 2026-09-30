@@ -11,7 +11,7 @@ use clap::{
     error::ErrorKind,
 };
 use std::{
-    io::{Read, Write},
+    io::{IsTerminal, Read},
     path::PathBuf,
 };
 
@@ -199,18 +199,20 @@ pub enum Command {
     Assess {
         #[arg(help = HYPOTHESIS)]
         hypothesis: String,
-        /// The review token of the hypothesis state you reviewed:
-        /// .state.review_token of `hyp --json show H-…` (or `hyp --json list`).
-        /// If its basis (.basis: claim, criteria, predictions, links, linked
-        /// evidence, runs) or its current assessments changed since, nothing
-        /// is written and the command exits 3: review the change and assess again.
+        /// The review token of the hypothesis state you reviewed: the "review
+        /// token:" line of `hyp show H-…` (.state.review_token with --json);
+        /// its first 12 or more hex digits suffice. If the basis (claim,
+        /// criteria, predictions, links, linked evidence, runs) or the current
+        /// assessments changed since, nothing is written and the command
+        /// exits 3: review the change and assess again.
         #[arg(long, value_name = "TOKEN")]
         reviewed: String,
         /// The judgment.
         #[arg(long, value_enum)]
         status: Judgment,
-        /// Subjective confidence in the judgment, 0.0 to 1.0.
-        #[arg(long)]
+        /// Subjective confidence in the judgment, from 0.0 to 1.0 (not a
+        /// percentage).
+        #[arg(long, value_parser = parse_confidence)]
         confidence: Option<f64>,
         /// Evidence already linked to the hypothesis or its criteria or
         /// predictions (`hyp link` first). Required unless --status untested.
@@ -531,8 +533,74 @@ pub enum ExperimentCommand {
         body: String,
     },
 }
-fn input(s: String) -> Result<String> {
+/// A `--confidence` value: any number here, so that one out of range gets
+/// `confidence_in_range`'s hint.
+fn parse_confidence(value: &str) -> Result<f64, String> {
+    value
+        .parse()
+        .map_err(|_| "expected a number from 0.0 to 1.0".to_string())
+}
+fn confidence_in_range(confidence: Option<f64>) -> Result<()> {
+    let Some(c) = confidence else { return Ok(()) };
+    // 2 to 100 reads as a percentage; 1.5 more likely as a slip.
+    let hint = if (2.0..=100.0).contains(&c) {
+        format!(" (did you mean {}?)", c / 100.0)
+    } else {
+        String::new()
+    };
+    ensure!(
+        c.is_finite() && (0.0..=1.0).contains(&c),
+        "--confidence must be from 0.0 to 1.0, got {c}{hint}"
+    );
+    Ok(())
+}
+/// The text arguments of `command` given as '-', by name. Each reads all of
+/// stdin, so at most one may.
+fn stdin_arguments(command: &Command) -> Vec<&'static str> {
+    const TITLE: &str = "TITLE";
+    let texts: Vec<(&str, Option<&String>)> = match command {
+        Command::Add { title, body, .. }
+        | Command::Run { title, body, .. }
+        | Command::Experiment {
+            command: ExperimentCommand::Add { title, body, .. },
+        } => vec![(TITLE, Some(title)), ("--body", Some(body))],
+        Command::Predict { title, .. }
+        | Command::FalsifyIf { title, .. }
+        | Command::Gap { title, .. } => vec![(TITLE, Some(title))],
+        Command::Evidence {
+            command:
+                EvidenceCommand::Add {
+                    title,
+                    reason,
+                    body,
+                    ..
+                },
+        } => vec![
+            (TITLE, Some(title)),
+            ("--reason", Some(reason)),
+            ("--body", Some(body)),
+        ],
+        Command::Link { reason, .. } | Command::Assess { reason, .. } => {
+            vec![("--reason", Some(reason))]
+        }
+        Command::Set { title, body, .. } => {
+            vec![("--title", title.as_ref()), ("--body", body.as_ref())]
+        }
+        _ => vec![],
+    };
+    texts
+        .into_iter()
+        .filter(|(_, value)| value.is_some_and(|v| v == "-"))
+        .map(|(name, _)| name)
+        .collect()
+}
+/// A text argument (`arg` names it): the text, or with '-' all of stdin. A
+/// person typing it (stdin and stderr are terminals) is told how to end it.
+fn input(arg: &str, s: String) -> Result<String> {
     if s == "-" {
+        if std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
+            eprintln!("reading {arg} from stdin; end with Ctrl-D");
+        }
         let mut text = String::new();
         std::io::stdin().read_to_string(&mut text)?;
         Ok(text.trim_end().to_string())
@@ -557,17 +625,109 @@ fn print_written(written: &[Written], after: &Snapshot, json: bool) -> Result<()
     }
     Ok(())
 }
-fn print_committed(c: &Committed, json: bool) -> Result<()> {
-    print_written(&c.written, &c.snapshot, json)
+/// What a change did, for the human summary of a write.
+#[derive(Clone, Copy, PartialEq)]
+enum Action {
+    Created,
+    Updated,
+    Archived,
+    Restored,
+    Deleted,
+}
+impl Action {
+    fn of(change: &Change) -> Self {
+        match change {
+            Change::Create { .. } => Self::Created,
+            Change::Update { .. } => Self::Updated,
+            Change::Archive { archived: true, .. } => Self::Archived,
+            Change::Archive {
+                archived: false, ..
+            } => Self::Restored,
+            Change::Delete { .. } => Self::Deleted,
+        }
+    }
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::Updated => "updated",
+            Self::Archived => "archived",
+            Self::Restored => "restored",
+            Self::Deleted => "deleted",
+        }
+    }
+}
+/// An ID shortened to its kind letter and 8 hex digits, a prefix hyp accepts.
+fn short(id: &str) -> &str {
+    id.get(..10).unwrap_or(id)
+}
+/// One line for people saying what a write did, `actions[i]` being what its
+/// i-th change was: e.g. "created evidence E-… (+ link L-…: E-… supports
+/// H-…)", or "no changes" when nothing was written.
+fn summary(actions: &[Action], c: &Committed) -> String {
+    let changed: Vec<(Action, &Written)> = actions
+        .iter()
+        .copied()
+        .zip(&c.written)
+        .filter(|(_, w)| w.changed)
+        .collect();
+    if changed.is_empty() {
+        return match (actions, c.written.as_slice()) {
+            ([Action::Restored], [w]) => format!("no changes: {} is not archived", short(&w.id)),
+            ([Action::Archived], [w]) => {
+                format!("no changes: {} is already archived", short(&w.id))
+            }
+            _ => "no changes".into(),
+        };
+    }
+    let what = |w: &Written| match c.snapshot.get(&w.id).map(|e| &e.record.data) {
+        Some(Data::Link { from, to, relation }) => format!(
+            "link {}: {} {relation} {}",
+            short(&w.id),
+            short(from),
+            short(to)
+        ),
+        _ => format!("{} {}", w.kind, short(&w.id)),
+    };
+    let mut groups: Vec<(Action, Vec<String>)> = Vec::new();
+    for (action, w) in changed {
+        match groups.iter_mut().find(|(a, _)| *a == action) {
+            Some((_, items)) => items.push(what(w)),
+            None => groups.push((action, vec![what(w)])),
+        }
+    }
+    let unchanged = c.written.len() - groups.iter().map(|(_, i)| i.len()).sum::<usize>();
+    let mut parts: Vec<String> = groups
+        .iter()
+        .map(|(action, items)| match items.as_slice() {
+            [first] => format!("{} {first}", action.verb()),
+            [first, rest @ ..] => format!("{} {first} (+ {})", action.verb(), rest.join(", ")),
+            [] => unreachable!("a group has an item"),
+        })
+        .collect();
+    if unchanged > 0 {
+        parts.push(format!("{unchanged} unchanged"));
+    }
+    parts.join("; ")
+}
+/// Prints what a write wrote (`print_written`, the contract) and, without
+/// --json, its `summary` on stderr: always when nothing changed, otherwise
+/// only for a person (stderr is a terminal).
+fn report(actions: &[Action], c: &Committed, json: bool) -> Result<()> {
+    print_written(&c.written, &c.snapshot, json)?;
+    let nothing = c.written.iter().all(|w| !w.changed);
+    if !json && (nothing || std::io::stderr().is_terminal()) {
+        eprintln!("{}", summary(actions, c));
+    }
+    Ok(())
 }
 /// A TITLE argument: the text, or with '-' the first line of stdin and the
 /// lines after it, which go to the body. A given text is kept as it is: a
 /// newline in it fails validation.
-fn title_input(title: String) -> Result<(String, String)> {
+fn title_input(arg: &str, title: String) -> Result<(String, String)> {
     if title != "-" {
         return Ok((title, String::new()));
     }
-    let text = input(title)?;
+    let text = input(arg, title)?;
     let text = text.trim_start();
     let (first, rest) = text.split_once('\n').unwrap_or((text, ""));
     Ok((
@@ -585,9 +745,9 @@ fn joined(body: String, more: String) -> String {
 }
 /// A new record from a TITLE argument and a --body argument (or "").
 fn titled(title: String, body: String, data: Data) -> Result<Record> {
-    let (title, more) = title_input(title)?;
+    let (title, more) = title_input("TITLE", title)?;
     let mut r = Record::new(title, data);
-    r.body = joined(input(body)?, more);
+    r.body = joined(input("--body", body)?, more);
     Ok(r)
 }
 /// The full ID of the record that argument `arg` (`<NAME>` or `--flag`)
@@ -637,6 +797,12 @@ fn print_steps(steps: &[agents::Step], json: bool) -> Result<()> {
     Ok(())
 }
 pub async fn run(cli: Cli) -> Result<()> {
+    if let names @ [_, _, ..] = stdin_arguments(&cli.command).as_slice() {
+        anyhow::bail!(
+            "{} are each '-', but stdin can be read only once: give all but one as text",
+            names.join(" and ")
+        );
+    }
     if let Command::Init { demo, agents } = &cli.command {
         let agents = agents.clone().map(|list| list.0).unwrap_or_default();
         // Planned before the project exists, so a blocked skill file fails
@@ -788,12 +954,12 @@ pub async fn run(cli: Cli) -> Result<()> {
                 l.body = if reason.is_empty() {
                     r.title.clone()
                 } else {
-                    input(reason)?
+                    input("--reason", reason)?
                 };
                 changes.extend([create(&s, r), create(&s, l)]);
             }
             EvidenceCommand::Attach { id, path } => {
-                return print_committed(&store.attach(&id, &path)?, cli.json);
+                return report(&[Action::Updated], &store.attach(&id, &path)?, cli.json);
             }
         },
         Command::Experiment {
@@ -860,7 +1026,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     relation,
                 },
             );
-            r.body = input(reason)?;
+            r.body = input("--reason", reason)?;
             changes.push(create(&s, r));
         }
         Command::Assess {
@@ -873,21 +1039,33 @@ pub async fn run(cli: Cli) -> Result<()> {
             reason,
         } => {
             let h = hypothesis(&s, &h)?;
+            // A prefix of 12 hex digits (48 bits) is ample to detect a change.
+            let reviewed = reviewed.to_ascii_lowercase();
             ensure!(
-                reviewed.len() == 64 && reviewed.bytes().all(|b| b.is_ascii_hexdigit()),
-                "--reviewed must be the 64-hex-digit .state.review_token of `hyp --json show {h}`"
+                (12..=64).contains(&reviewed.len())
+                    && reviewed.bytes().all(|b| b.is_ascii_hexdigit()),
+                "--reviewed must be the review token that `hyp show {h}` prints (its \
+                 \"review token:\" line), or its first 12 or more hex digits"
             );
+            confidence_in_range(confidence)?;
             let state = s
                 .hypotheses
                 .get(&h)
                 .with_context(|| format!("no derived state for hypothesis {h}"))?;
             // The token covers the agent's review up to this command's read;
             // the preconditions stated below cover this read up to the write.
-            if !reviewed.eq_ignore_ascii_case(&state.review_token) {
+            if !state
+                .review_token
+                .to_ascii_lowercase()
+                .starts_with(&reviewed)
+            {
                 return Err(Conflict(format!(
-                    "hypothesis {h} changed since you reviewed it (its records or current \
-                     assessments; the review token differs); re-read `hyp --json show {h}`, \
-                     review what changed and retry"
+                    "hypothesis {h} changed since you reviewed it (its basis or its current \
+                     assessments; the review token differs), so nothing was written. \
+                     `hyp show {h}` lists its basis now (criteria, predictions, linked \
+                     evidence, runs, links to other hypotheses) and its current \
+                     assessments: compare them with what you reviewed, then assess again \
+                     with the review token it prints"
                 ))
                 .into());
             }
@@ -905,7 +1083,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     supersedes: vec![],
                 },
             );
-            r.body = input(reason)?;
+            r.body = input("--reason", reason)?;
             changes.push(create(&s, r));
         }
         Command::Set {
@@ -921,10 +1099,10 @@ pub async fn run(cli: Cli) -> Result<()> {
             let e = s.find(&id)?;
             let mut r = e.record.clone();
             if let Some(b) = body {
-                r.body = input(b)?;
+                r.body = input("--body", b)?;
             }
             if let Some(t) = title {
-                let (title, more) = title_input(t)?;
+                let (title, more) = title_input("--title", t)?;
                 r.title = title;
                 r.body = joined(std::mem::take(&mut r.body), more);
             }
@@ -1049,25 +1227,8 @@ pub async fn run(cli: Cli) -> Result<()> {
             return Ok(());
         }
         Command::Edit { id } => {
-            let e = s.find(&id)?;
-            let mut tmp = tempfile::Builder::new().suffix(".md").tempfile()?;
-            tmp.write_all(crate::store::encode(&e.record)?.as_bytes())?;
-            let editor = std::env::var("VISUAL")
-                .or_else(|_| std::env::var("EDITOR"))
-                .unwrap_or("vi".into());
-            let status = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(format!("{editor} \"$1\""))
-                .arg("hyp-edit")
-                .arg(tmp.path())
-                .status()?;
-            ensure!(status.success(), "editor exited unsuccessfully");
-            let r = crate::store::decode(&std::fs::read_to_string(tmp.path())?)?;
-            ensure!(r.id == e.record.id, "cannot change ID");
-            changes.push(Change::Update {
-                record: r,
-                expected_revision: e.revision.clone(),
-            });
+            let committed = crate::edit::edit(&store, s.find(&id)?)?;
+            return report(&[Action::Updated], &committed, cli.json);
         }
         Command::Archive { id } => {
             let e = s.find(&id)?;
@@ -1096,8 +1257,9 @@ pub async fn run(cli: Cli) -> Result<()> {
             let mut raw = String::new();
             std::io::stdin().read_to_string(&mut raw)?;
             let changes: Vec<Change> = serde_json::from_str(&raw)?;
+            let actions: Vec<Action> = changes.iter().map(Action::of).collect();
             let committed = store.commit_written(changes, expected_revision.as_deref())?;
-            return print_committed(&committed, cli.json);
+            return report(&actions, &committed, cli.json);
         }
         Command::Check { strict } => {
             if cli.json {
@@ -1151,7 +1313,8 @@ pub async fn run(cli: Cli) -> Result<()> {
     }
     // Each change states what it depends on; the whole-project revision would
     // turn unrelated concurrent writes into conflicts.
-    print_committed(&store.commit_written(changes, None)?, cli.json)
+    let actions: Vec<Action> = changes.iter().map(Action::of).collect();
+    report(&actions, &store.commit_written(changes, None)?, cli.json)
 }
 /// With `json`, each row is the entry plus, for a hypothesis, its derived
 /// `state`. A plain hypothesis row shows its judgment, lifecycle and, when
