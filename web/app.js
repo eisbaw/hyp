@@ -819,6 +819,8 @@ function buildRecord(form) {
       break;
     case "gap":
       r.resolved = get("resolved") === "true";
+      // Reopening forgets what resolved it, as `hyp set --resolved false`.
+      if (!r.resolved) delete r.resolved_by;
       break;
     case "evidence":
       Object.assign(r, {

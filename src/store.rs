@@ -1,4 +1,7 @@
-use crate::model::*;
+use crate::{
+    error::{Classified, ErrorKind},
+    model::*,
+};
 use anyhow::{Context, Result, bail, ensure};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -20,24 +23,7 @@ pub const DIRECTORIES: &[&str] = &[
     "assessments",
     "gaps",
 ];
-/// A write precondition failed: the project or an object changed since the
-/// caller read it. The CLI exits with code 3 and the API answers 409 when this
-/// type is anywhere in the error chain, so wrapping it in `.context()` does not
-/// change its classification. The message starts with "conflict:", which the
-/// WebUI and agents read.
-#[derive(Debug)]
-pub struct Conflict(pub String);
-impl std::fmt::Display for Conflict {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "conflict: {}", self.0)
-    }
-}
-impl std::error::Error for Conflict {}
-impl Conflict {
-    pub fn in_chain(err: &anyhow::Error) -> bool {
-        err.chain().any(|cause| cause.is::<Conflict>())
-    }
-}
+pub use crate::error::Conflict;
 /// An object a write named, by full ID, with its revision after the write
 /// (None once deleted): what write commands print with `--json`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -45,6 +31,10 @@ pub struct Written {
     pub id: String,
     pub kind: Kind,
     pub revision: Option<String>,
+    /// The batch-local reference (`"@name"`) a create of `hyp apply` gave
+    /// as its ID; left out of the JSON for any other change.
+    #[serde(rename = "ref", skip_serializing_if = "Option::is_none")]
+    pub reference: Option<String>,
     /// False for an update or archive that changed nothing and was not
     /// written. Not part of the JSON: there, an unchanged revision says so.
     #[serde(skip)]
@@ -56,6 +46,7 @@ impl Written {
             id: e.record.id.clone(),
             kind: e.record.data.kind_value(),
             revision: Some(e.revision.clone()),
+            reference: None,
             changed: true,
         }
     }
@@ -86,6 +77,13 @@ pub enum Change {
     Update {
         record: Record,
         expected_revision: String,
+    },
+    /// Sets only the fields in `set` (record fields by name, as `hyp --json
+    /// show` prints them) and keeps the rest as stored; otherwise an update.
+    Patch {
+        id: String,
+        expected_revision: String,
+        set: serde_json::Map<String, serde_json::Value>,
     },
     Archive {
         id: String,
@@ -195,8 +193,16 @@ impl Change {
     }
 }
 /// The record `id` (a full ID or unique prefix) whose revision the caller
-/// stated for an update, archive or delete.
-fn stated<'a>(after: &'a Snapshot, id: &str, expected_revision: &str) -> Result<&'a Entry> {
+/// stated for an update, patch, archive or delete. A record the batch
+/// created (`created`) cannot be changed in it: the caller could not have
+/// read its revision, so that is input to fix, not a conflict to retry.
+fn stated<'a>(
+    after: &'a Snapshot,
+    id: &str,
+    expected_revision: &str,
+    created: &[String],
+    references: &References,
+) -> Result<&'a Entry> {
     ensure!(
         !expected_revision.is_empty(),
         "expected_revision is required: the revision of {id} as you read it"
@@ -207,21 +213,38 @@ fn stated<'a>(after: &'a Snapshot, id: &str, expected_revision: &str) -> Result<
         .iter()
         .any(|e| e.record.id.to_lowercase().starts_with(&prefix))
     {
-        bail!(Conflict(format!(
-            "{id} does not exist (deleted since you read it, or never existed)"
-        )));
+        bail!(Conflict::on(
+            vec![id.to_string()],
+            format!("{id} does not exist (deleted since you read it, or never existed)")
+        ));
     }
     let current = after.find(id)?;
+    let full = &current.record.id;
+    if created.contains(full) {
+        let named = references
+            .name_of(full)
+            .map_or(full.clone(), |name| format!("{name} ({full})"));
+        bail!("{named} is created by this batch; put its values in the create");
+    }
     if current.revision != expected_revision {
-        bail!(Conflict("object changed; reload and retry".into()));
+        bail!(Conflict::on(
+            vec![current.record.id.clone()],
+            "object changed; reload and retry"
+        ));
     }
     Ok(current)
 }
 /// Where the create's statements disagree with `before`, the state the
 /// caller read: stated hypotheses whose review token changed,
-/// stated revisions that changed, and stated records that disappeared.
-/// Incomplete statements are ordinary errors.
-fn stale_statements(before: &Snapshot, expected: &Expected) -> Result<Vec<String>> {
+/// stated revisions that changed, and stated records that disappeared, as
+/// (ID, what changed). Incomplete statements are ordinary errors.
+/// Statements about records the batch created (`created`) are not checked:
+/// the caller could not have read them, and they need none.
+fn stale_statements(
+    before: &Snapshot,
+    expected: &Expected,
+    created: &[String],
+) -> Result<Vec<(String, String)>> {
     let full_id = |id: &str| -> Result<()> {
         if let Ok(e) = before.find(id) {
             ensure!(
@@ -234,6 +257,9 @@ fn stale_statements(before: &Snapshot, expected: &Expected) -> Result<Vec<String
     };
     let mut stale = Vec::new();
     for (id, seen) in &expected.hypotheses {
+        if created.contains(id) {
+            continue;
+        }
         ensure!(
             !seen.review_token.is_empty(),
             "expected.hypotheses[\"{id}\"].review_token is required: \
@@ -247,28 +273,39 @@ fn stale_statements(before: &Snapshot, expected: &Expected) -> Result<Vec<String
         );
         full_id(id)?;
         match before.hypotheses.get(id) {
-            None => stale.push(format!(
-                "hypothesis {id} does not exist (deleted since you read it, or never existed)"
+            None => stale.push((
+                id.clone(),
+                format!(
+                    "hypothesis {id} does not exist (deleted since you read it, or never existed)"
+                ),
             )),
-            Some(now) if !now.review_token.eq_ignore_ascii_case(&seen.review_token) => {
-                stale.push(format!(
-                    "hypothesis {id} changed: its basis or its current assessments (review_token)"
-                ))
-            }
+            Some(now) if !now.review_token.eq_ignore_ascii_case(&seen.review_token) => stale
+                .push((
+                    id.clone(),
+                    format!(
+                        "hypothesis {id} changed: its basis or its current assessments (review_token)"
+                    ),
+                )),
             Some(_) => {}
         }
     }
     for (id, revision) in &expected.revisions {
+        if created.contains(id) {
+            continue;
+        }
         ensure!(
             !revision.is_empty(),
             "expected.revisions[\"{id}\"] is empty: give the revision you read"
         );
         full_id(id)?;
         match before.get(id) {
-            None => stale.push(format!(
-                "{id} does not exist (deleted since you read it, or never existed)"
+            None => stale.push((
+                id.clone(),
+                format!("{id} does not exist (deleted since you read it, or never existed)"),
             )),
-            Some(e) if e.revision != *revision => stale.push(format!("{id} changed (revision)")),
+            Some(e) if e.revision != *revision => {
+                stale.push((id.clone(), format!("{id} changed (revision)")))
+            }
             Some(_) => {}
         }
     }
@@ -295,10 +332,16 @@ fn basis_growth(
 /// before the server derives or freezes content for it from the state
 /// including earlier changes of the batch. Without this, an assessment
 /// would be recorded as based on records its author never saw. Records
-/// created earlier in the batch are the caller's own and need no statement.
+/// created earlier in the batch (`created`) are the caller's own and need no
+/// statement, so a create that depends only on them may omit `expected`.
 /// Missing statements are ordinary errors; stale ones are one `Conflict`
 /// listing them.
-fn check_create(before: &Snapshot, record: &Record, expected: Option<&Expected>) -> Result<()> {
+fn check_create(
+    before: &Snapshot,
+    record: &Record,
+    expected: Option<&Expected>,
+    created: &[String],
+) -> Result<()> {
     let kind = record.data.kind();
     match &record.data {
         Data::Assessment {
@@ -328,51 +371,38 @@ fn check_create(before: &Snapshot, record: &Record, expected: Option<&Expected>)
         _ => {}
     }
     let default = Expected::default();
-    let expected = match expected {
-        Some(e) => e,
-        None => {
-            ensure!(
-                !matches!(
-                    record.data,
-                    Data::Assessment { .. } | Data::Experiment { .. } | Data::Run { .. }
-                ),
-                "creating {} {kind} requires `expected`: what you read of the records it depends on",
-                if kind.starts_with(['a', 'e']) {
-                    "an"
-                } else {
-                    "a"
-                }
-            );
-            &default
+    let stated = expected.is_some();
+    let expected = expected.unwrap_or(&default);
+    // A statement is required, and missing: without `expected` at all, say that first.
+    let required = |ok: bool, detail: String| -> Result<()> {
+        match (ok, stated) {
+            (true, _) => Ok(()),
+            (false, true) => bail!(detail),
+            (false, false) => bail!(
+                "creating {} {kind} requires `expected`: what you read of the records it \
+                 depends on. {detail}",
+                article(kind)
+            ),
         }
     };
     let revision_stated = |id: &str, what: &str| -> Result<()> {
-        if before.get(id).is_some() {
-            ensure!(
-                expected.revisions.contains_key(id),
-                "expected.revisions must give the revision you read of {what} {id}"
-            );
-        }
-        Ok(())
+        required(
+            before.get(id).is_none() || expected.revisions.contains_key(id),
+            format!("expected.revisions must give the revision you read of {what} {id}"),
+        )
     };
-    let problems = stale_statements(before, expected)?;
+    let problems = stale_statements(before, expected, created)?;
     match &record.data {
         Data::Assessment { hypothesis, .. } if before.get(hypothesis).is_some() => {
-            ensure!(
+            required(
                 expected.hypotheses.contains_key(hypothesis),
-                "an assessment of {hypothesis} requires expected.hypotheses[\"{hypothesis}\"]: \
-                 {{review_token}} as you read it (.state of `hyp --json show {hypothesis}`)"
-            );
+                format!(
+                    "an assessment of {hypothesis} requires expected.hypotheses[\"{hypothesis}\"]: \
+                     {{review_token}} as you read it (.state of `hyp --json show {hypothesis}`)"
+                ),
+            )?;
         }
-        Data::Experiment {
-            hypothesis,
-            targets,
-            ..
-        } => {
-            ensure!(
-                targets.iter().any(|t| t.id == *hypothesis),
-                "experiment targets must include its hypothesis {hypothesis}"
-            );
+        Data::Experiment { targets, .. } => {
             for t in targets {
                 revision_stated(&t.id, "experiment target")?;
             }
@@ -390,12 +420,155 @@ fn check_create(before: &Snapshot, record: &Record, expected: Option<&Expected>)
         _ => {}
     }
     if !problems.is_empty() {
-        bail!(Conflict(format!(
-            "since you read the project: {}; re-read, review what changed and retry",
-            problems.join("; ")
-        )));
+        let (ids, what): (Vec<String>, Vec<String>) = problems.into_iter().unzip();
+        bail!(Conflict::on(
+            ids,
+            format!(
+                "since you read the project: {}; re-read, review what changed and retry",
+                what.join("; ")
+            )
+        ));
     }
     Ok(())
+}
+/// Batch-local references (HYPO-0077): a create in a `hyp apply` batch may
+/// give `"id": "@name"`, and later changes of the batch write `"@name"`
+/// wherever an ID is expected. Each is replaced by the full ID generated for
+/// that create, before the change is checked, so the rest of the commit sees
+/// only full IDs.
+#[derive(Default)]
+struct References(BTreeMap<String, String>);
+impl References {
+    fn is_reference(id: &str) -> bool {
+        id.starts_with('@')
+    }
+    /// The reference that named the created record `id`, if one did.
+    fn name_of(&self, id: &str) -> Option<&str> {
+        self.0
+            .iter()
+            .find(|(_, full)| *full == id)
+            .map(|(name, _)| name.as_str())
+    }
+    /// Replaces `id` if it is a reference: to one defined earlier, else an error.
+    fn resolve(&self, id: &mut String) -> Result<()> {
+        if !Self::is_reference(id) {
+            return Ok(());
+        }
+        let full = self.0.get(id.as_str()).with_context(|| {
+            format!("unknown reference {id}: no earlier create in this batch has \"id\": \"{id}\"")
+        })?;
+        id.clone_from(full);
+        Ok(())
+    }
+    fn resolve_record(&self, r: &mut Record) -> Result<()> {
+        r.data
+            .references_mut()
+            .into_iter()
+            .try_for_each(|id| self.resolve(id))
+    }
+    /// The map with its keys resolved; two keys naming one record are an error.
+    fn resolve_keys<V>(&self, map: &mut BTreeMap<String, V>, field: &str) -> Result<()> {
+        for (mut id, value) in std::mem::take(map) {
+            let given = id.clone();
+            self.resolve(&mut id)?;
+            ensure!(!map.contains_key(&id), "{field} names {id} twice ({given})");
+            map.insert(id, value);
+        }
+        Ok(())
+    }
+    /// Resolves the references in `change`, except in a patch's `set`, which
+    /// becomes a record only against the stored one. A create whose ID is a
+    /// new reference gets its full ID here; the reference is returned.
+    fn apply(&mut self, change: &mut Change) -> Result<Option<String>> {
+        match change {
+            Change::Create { record, expected } => {
+                self.resolve_record(record)?;
+                if let Some(e) = expected {
+                    self.resolve_keys(&mut e.hypotheses, "expected.hypotheses")?;
+                    self.resolve_keys(&mut e.revisions, "expected.revisions")?;
+                }
+                if !Self::is_reference(&record.id) {
+                    return Ok(None);
+                }
+                let name = record.id.clone();
+                ensure!(
+                    name.len() > 1
+                        && name[1..]
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+                    "invalid reference {name:?}: write \"@\" and a name of letters, digits, \
+                     '-' or '_'"
+                );
+                ensure!(
+                    !self.0.contains_key(&name),
+                    "reference {name} is defined twice in this batch"
+                );
+                record.id = format!("{}-{}", record.data.prefix(), uuid::Uuid::new_v4());
+                self.0.insert(name.clone(), record.id.clone());
+                Ok(Some(name))
+            }
+            Change::Update { record, .. } => {
+                self.resolve(&mut record.id)?;
+                self.resolve_record(record)?;
+                Ok(None)
+            }
+            Change::Patch { id, .. } | Change::Archive { id, .. } | Change::Delete { id, .. } => {
+                self.resolve(id)?;
+                Ok(None)
+            }
+        }
+    }
+}
+/// Checks that an update from `old` to `new` changes only what may change.
+fn check_update(old: &Record, new: &Record) -> Result<()> {
+    ensure!(
+        old.data.kind() == new.data.kind(),
+        "cannot change object kind"
+    );
+    ensure!(
+        !matches!(old.data, Data::Assessment { .. } | Data::Run { .. }),
+        "assessments and runs are immutable; create a new record"
+    );
+    ensure!(
+        old.created_at == new.created_at,
+        "cannot change creation time"
+    );
+    if let (Data::Experiment { targets: a, .. }, Data::Experiment { targets: b, .. }) =
+        (&old.data, &new.data)
+    {
+        ensure!(
+            serde_json::to_value(a)? == serde_json::to_value(b)?,
+            "frozen targets are immutable; create a new experiment"
+        );
+    }
+    Ok(())
+}
+/// Record `old` with the fields in `set` replaced, as `Change::Patch`
+/// applies it. The ID, kind and creation time cannot change, and
+/// `updated_at` is the server's; assessments and runs are immutable.
+fn patched(old: &Record, set: serde_json::Map<String, serde_json::Value>) -> Result<Record> {
+    let id = &old.id;
+    ensure!(
+        !matches!(old.data, Data::Assessment { .. } | Data::Run { .. }),
+        "{id} is {} {}: assessments and runs are immutable; create a new record",
+        article(old.data.kind()),
+        old.data.kind()
+    );
+    let mut fields = serde_json::to_value(old)?;
+    for (name, value) in set {
+        ensure!(
+            !["id", "kind", "created_at"].contains(&name.as_str()),
+            "patch of {id}: cannot change {name}"
+        );
+        ensure!(
+            name != "updated_at",
+            "patch of {id}: updated_at is set by the server"
+        );
+        fields[name] = value;
+    }
+    serde_json::from_value(fields).with_context(|| {
+        format!("patch of {id} (every record also takes title, body, tags and archived; see hyp apply --help)")
+    })
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -529,9 +702,15 @@ impl Store {
         Ok(store)
     }
     pub fn open(path: &Path) -> Result<Self> {
-        let mut path = path
-            .canonicalize()
-            .with_context(|| format!("cannot open {}", path.display()))?;
+        let mut path = path.canonicalize().map_err(|e| {
+            let message = format!("cannot open {}: {e}", path.display());
+            match e.kind() {
+                std::io::ErrorKind::NotFound => {
+                    anyhow::Error::new(Classified::new(ErrorKind::NotFound, message))
+                }
+                _ => anyhow::Error::new(e).context(format!("cannot open {}", path.display())),
+            }
+        })?;
         if path.is_file() {
             path.pop();
         }
@@ -552,7 +731,12 @@ impl Store {
                 store.ensure_layout()?;
                 return Ok(store);
             }
-            ensure!(path.pop(), "no hyp project found; run hyp init");
+            if !path.pop() {
+                bail!(Classified::new(
+                    ErrorKind::NotFound,
+                    "no hyp project found; run hyp init"
+                ));
+            }
         }
     }
     /// Idempotent: creates missing data directories and `.hyp/` (with a
@@ -766,15 +950,25 @@ impl Store {
         before.assert_writable()?;
         if let Some(expected) = expected_project {
             if expected != before.revision {
-                bail!(Conflict("project changed; reload and retry".into()));
+                bail!(Conflict::new("project changed; reload and retry"));
             }
         }
         let mut after = before.clone();
         let mut writes = BTreeMap::new();
         let mut created = Vec::new();
-        // (ID, kind, file) of the object each change names.
-        let mut named: Vec<(String, Kind, String)> = Vec::new();
-        for change in changes {
+        let mut references = References::default();
+        // The object each change names: ID, kind, file, batch-local reference.
+        let mut named: Vec<(String, Kind, String, Option<String>)> = Vec::new();
+        let name = |r: &Record, reference: Option<String>| {
+            (
+                r.id.clone(),
+                r.data.kind_value(),
+                Self::relative(r),
+                reference,
+            )
+        };
+        for mut change in changes {
+            let reference = references.apply(&mut change)?;
             let record = match change {
                 Change::Create {
                     mut record,
@@ -787,14 +981,27 @@ impl Store {
                         !after.objects.iter().any(|e| e.record.id == record.id),
                         "ID already exists"
                     );
-                    check_create(&before, &record, expected.as_ref())?;
+                    // The hypothesis is always a target, as `hyp experiment add` makes it.
+                    if let Data::Experiment {
+                        hypothesis,
+                        targets,
+                        ..
+                    } = &mut record.data
+                    {
+                        if !targets.iter().any(|t| t.id == *hypothesis) {
+                            targets.insert(
+                                0,
+                                FrozenRef {
+                                    id: hypothesis.clone(),
+                                    ..FrozenRef::default()
+                                },
+                            );
+                        }
+                    }
+                    check_create(&before, &record, expected.as_ref(), &created)?;
                     after.validate_new(&record)?;
                     created.push(record.id.clone());
-                    named.push((
-                        record.id.clone(),
-                        record.data.kind_value(),
-                        Self::relative(&record),
-                    ));
+                    named.push(name(&record, reference));
                     record.created_at = chrono::Utc::now().to_rfc3339();
                     // Derived and frozen content comes from the current state, which
                     // check_create tied to what the caller read.
@@ -810,7 +1017,8 @@ impl Store {
                             ensure!(
                                 unreviewed.is_empty(),
                                 "this batch brings {} into the basis of {hypothesis} (a new or \
-                                 restored link or run), which your review token did not cover; \
+                                 restored link or run to records that existed before the batch), \
+                                 so this assessment would rest on records not stated as read; \
                                  link pre-existing evidence in an earlier write, re-read, then assess",
                                 unreviewed.join(", ")
                             );
@@ -825,8 +1033,11 @@ impl Store {
                             for t in targets.iter_mut() {
                                 *t = after
                                     .get(&t.id)
-                                    .with_context(|| {
-                                        format!("experiment target {} does not exist", t.id)
+                                    .ok_or_else(|| {
+                                        Classified::new(
+                                            ErrorKind::NotFound,
+                                            format!("experiment target {} does not exist", t.id),
+                                        )
                                     })?
                                     .frozen();
                             }
@@ -834,8 +1045,11 @@ impl Store {
                         Data::Run {
                             experiment, plan, ..
                         } => {
-                            let e = after.get(experiment).with_context(|| {
-                                format!("experiment {experiment} does not exist")
+                            let e = after.get(experiment).ok_or_else(|| {
+                                Classified::new(
+                                    ErrorKind::NotFound,
+                                    format!("experiment {experiment} does not exist"),
+                                )
                             })?;
                             *plan = e.frozen();
                             // Include the complete plan metadata as well as prose in the historical snapshot.
@@ -849,34 +1063,27 @@ impl Store {
                     record,
                     expected_revision,
                 } => {
-                    let old = stated(&after, &record.id, &expected_revision)?;
-                    named.push((
-                        old.record.id.clone(),
-                        old.record.data.kind_value(),
-                        Self::relative(&old.record),
-                    ));
-                    ensure!(
-                        old.record.data.kind() == record.data.kind(),
-                        "cannot change object kind"
-                    );
-                    ensure!(
-                        !matches!(old.record.data, Data::Assessment { .. } | Data::Run { .. }),
-                        "assessments and runs are immutable; create a new record"
-                    );
-                    ensure!(
-                        old.record.created_at == record.created_at,
-                        "cannot change creation time"
-                    );
-                    if let (
-                        Data::Experiment { targets: a, .. },
-                        Data::Experiment { targets: b, .. },
-                    ) = (&old.record.data, &record.data)
-                    {
-                        ensure!(
-                            serde_json::to_value(a)? == serde_json::to_value(b)?,
-                            "frozen targets are immutable; create a new experiment"
-                        );
-                    }
+                    let old = stated(
+                        &after,
+                        &record.id,
+                        &expected_revision,
+                        &created,
+                        &references,
+                    )?;
+                    named.push(name(&old.record, None));
+                    check_update(&old.record, &record)?;
+                    record
+                }
+                Change::Patch {
+                    id,
+                    expected_revision,
+                    set,
+                } => {
+                    let old = stated(&after, &id, &expected_revision, &created, &references)?;
+                    named.push(name(&old.record, None));
+                    let mut record = patched(&old.record, set)?;
+                    references.resolve_record(&mut record)?;
+                    check_update(&old.record, &record)?;
                     record
                 }
                 Change::Archive {
@@ -884,12 +1091,8 @@ impl Store {
                     archived,
                     expected_revision,
                 } => {
-                    let old = stated(&after, &id, &expected_revision)?;
-                    named.push((
-                        old.record.id.clone(),
-                        old.record.data.kind_value(),
-                        Self::relative(&old.record),
-                    ));
+                    let old = stated(&after, &id, &expected_revision, &created, &references)?;
+                    named.push(name(&old.record, None));
                     ensure!(
                         !matches!(old.record.data, Data::Assessment { .. } | Data::Run { .. }),
                         "historical assessments and runs cannot be archived"
@@ -902,12 +1105,9 @@ impl Store {
                     id,
                     expected_revision,
                 } => {
-                    let old = stated(&after, &id, &expected_revision)?.clone();
-                    named.push((
-                        old.record.id.clone(),
-                        old.record.data.kind_value(),
-                        Self::relative(&old.record),
-                    ));
+                    let old =
+                        stated(&after, &id, &expected_revision, &created, &references)?.clone();
+                    named.push(name(&old.record, None));
                     let id = &old.record.id;
                     ensure!(
                         !matches!(old.record.data, Data::Assessment { .. } | Data::Run { .. }),
@@ -999,7 +1199,7 @@ impl Store {
         }
         // Verify a second time immediately before writing to detect ordinary editor saves.
         if self.read_unlocked()?.revision != before.revision {
-            bail!(Conflict("files changed during transaction".into()));
+            bail!(Conflict::new("files changed during transaction"));
         }
         atomic(
             &self.root.join(".hyp/transaction.json"),
@@ -1009,11 +1209,12 @@ impl Store {
         let snapshot = self.read_unlocked()?;
         let written = named
             .into_iter()
-            .map(|(id, kind, file)| Written {
+            .map(|(id, kind, file, reference)| Written {
                 revision: snapshot.get(&id).map(|e| e.revision.clone()),
                 changed: writes.contains_key(&file),
                 id,
                 kind,
+                reference,
             })
             .collect();
         Ok(Committed { written, snapshot })

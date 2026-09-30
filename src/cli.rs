@@ -30,7 +30,8 @@ pub struct Cli {
         hide_default_value = true
     )]
     pub project: PathBuf,
-    /// Machine-readable output; errors as {"error": "..."} on stderr.
+    /// Machine-readable output; errors as {"error": "...", "kind": "..."} on
+    /// stderr.
     #[arg(long, global = true)]
     pub json: bool,
     #[command(subcommand)]
@@ -172,7 +173,7 @@ pub enum Command {
         #[arg(help = TITLE)]
         title: String,
         /// How the run went.
-        #[arg(long, value_enum, default_value = "observed")]
+        #[arg(long, value_enum, default_value_t = new_outcome())]
         outcome: Outcome,
         /// Comma-separated E- IDs of the evidence it produced.
         #[arg(long, value_delimiter = ',')]
@@ -234,7 +235,7 @@ pub enum Command {
         #[arg(long)]
         reason: String,
     },
-    /// Change a record's title, body, tags, lifecycle or status.
+    /// Change title, body, tags, lifecycle or status; resolve a gap.
     Set {
         /// The record: an ID or unique prefix.
         id: String,
@@ -258,9 +259,14 @@ pub enum Command {
         /// Comma-separated tags, replacing the old ones (also --tag).
         #[arg(long, alias = "tag", value_delimiter = ',')]
         tags: Option<Vec<String>>,
-        /// Whether a gap is resolved.
+        /// Whether a gap is resolved; false also forgets --by.
         #[arg(long)]
         resolved: Option<bool>,
+        /// The evidence that resolved a gap: E- IDs or unique prefixes,
+        /// comma-separated or repeated, replacing earlier ones. The gap must
+        /// be resolved (with --resolved true, or already).
+        #[arg(long, value_delimiter = ',', value_name = "EVIDENCE")]
+        by: Vec<String>,
     },
     /// Where the investigation stands: start here when resuming work.
     ///
@@ -330,7 +336,8 @@ pub enum Command {
     ///
     /// All or nothing. Each change states what it depends on: its
     /// `expected_revision`, or for creating an assessment, experiment or run
-    /// an `expected` object.
+    /// on records the batch does not create, an `expected` object. A create
+    /// may name its record "@name" for later changes of the batch.
     #[command(after_long_help = APPLY_HELP)]
     Apply {
         /// Apply only if the project is still at this revision (the
@@ -369,20 +376,47 @@ pub enum Command {
 /// The long help of `hyp apply`: enough to write a batch without the README.
 const APPLY_HELP: &str = r#"Changes:
   {"op": "create",  "record": RECORD}
+  {"op": "patch",   "id": ID, "expected_revision": REV, "set": {FIELD: VALUE}}
   {"op": "update",  "record": RECORD, "expected_revision": REV}
   {"op": "archive", "id": ID, "archived": true, "expected_revision": REV}
   {"op": "delete",  "id": ID, "expected_revision": REV}
 
 RECORD is a record as `hyp --json show ID` prints it (.entry.record): "kind",
-"title", optional "body" and "tags", and the fields of its kind. An update
-gives the whole record as read, changed. A create may set "id" to a new full
-<letter>-<UUID> ID, so later changes in the batch can refer to it. REV is
-.entry.revision of `hyp --json show ID`, or a revision a --json write printed.
-"archived": false restores. Use full IDs, not prefixes.
+"title", optional "body" and "tags", and the fields of its kind. A create
+needs what the matching command asks for; the rest gets its defaults (a
+hypothesis is a draft, an experiment is planned and targets its hypothesis, a
+run is observed, a gap open) and the server sets the times. A patch sets only
+the fields in "set" and keeps the others; it cannot change "id", "kind" or
+"created_at". An update gives the whole record as read, changed. Assessments
+and runs cannot be changed. REV is .entry.revision of `hyp --json show ID`,
+or a revision a --json write printed. "archived": false restores. Use full
+IDs, not prefixes, or references.
 
-Create a hypothesis, archive a prediction:
-  [{"op": "create", "record": {"kind": "hypothesis", "lifecycle": "draft",
+References: a create may set "id": "@name" (letters, digits, - and _), and
+later changes in the batch write "@name" in record fields that take an ID
+("hypothesis", "from", "to", "experiment", "evidence", "criterion", target
+"id"s, "resolved_by") and in "expected" keys; hyp replaces it with the full ID
+it generates. With --json, "written" lists the full IDs in change order, a
+create's "ref" with it. Records the batch creates need no statement in
+"expected", and cannot also be patched, updated, archived or deleted in it:
+put their values in the create. A hypothesis, its criterion, an experiment
+and a run with its evidence, in one batch:
+  [{"op": "create", "record": {"id": "@h", "kind": "hypothesis",
      "title": "The cache causes the timeouts"}},
+   {"op": "create", "record": {"id": "@f", "kind": "criterion",
+     "hypothesis": "@h", "title": "Timeouts persist with the cache off"}},
+   {"op": "create", "record": {"id": "@x", "kind": "experiment",
+     "hypothesis": "@h", "title": "Disable the cache", "targets": [{"id": "@f"}]}},
+   {"op": "create", "record": {"id": "@e", "kind": "evidence",
+     "title": "3/500 transfers time out, cache off", "source": "bench.log"}},
+   {"op": "create", "record": {"kind": "link", "title": "Criterion met",
+     "from": "@e", "to": "@f", "relation": "supports", "body": "Why …"}},
+   {"op": "create", "record": {"kind": "run", "title": "Run 1",
+     "experiment": "@x", "evidence": ["@e"]}}]
+
+Retitle a hypothesis, archive a prediction:
+  [{"op": "patch", "id": "H-…", "expected_revision": "…",
+    "set": {"title": "The L2 cache causes the timeouts"}},
    {"op": "archive", "id": "P-…", "archived": true, "expected_revision": "…"}]
 
 Creating an assessment, experiment or run states in "expected" what it was
@@ -672,7 +706,7 @@ impl Action {
     fn of(change: &Change) -> Self {
         match change {
             Change::Create { .. } => Self::Created,
-            Change::Update { .. } => Self::Updated,
+            Change::Update { .. } | Change::Patch { .. } => Self::Updated,
             Change::Archive { archived: true, .. } => Self::Archived,
             Change::Archive {
                 archived: false, ..
@@ -907,7 +941,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 Data::Hypothesis {
                     scope,
                     assumptions: String::new(),
-                    lifecycle: Lifecycle::Draft,
+                    lifecycle: new_lifecycle(),
                     untestable_reason: String::new(),
                 },
             )?;
@@ -953,6 +987,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 Data::Gap {
                     hypothesis: hypothesis(&s, &h)?,
                     resolved: false,
+                    resolved_by: vec![],
                 },
             )?,
         )),
@@ -1023,7 +1058,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 Data::Experiment {
                     hypothesis,
                     targets,
-                    status: ExperimentStatus::Planned,
+                    status: new_experiment_status(),
                 },
             )?;
             changes.push(create(&s, r));
@@ -1101,14 +1136,17 @@ pub async fn run(cli: Cli) -> Result<()> {
                 .to_ascii_lowercase()
                 .starts_with(&reviewed)
             {
-                return Err(Conflict(format!(
-                    "hypothesis {h} changed since you reviewed it (its basis or its current \
+                return Err(Conflict::on(
+                    vec![h.clone()],
+                    format!(
+                        "hypothesis {h} changed since you reviewed it (its basis or its current \
                      assessments; the review token differs), so nothing was written. \
                      `hyp show {h}` lists its basis now (criteria, predictions, linked \
                      evidence, runs, links to other hypotheses) and its current \
                      assessments: compare them with what you reviewed, then assess again \
                      with the review token it prints"
-                ))
+                    ),
+                )
                 .into());
             }
             let mut r = Record::new(
@@ -1137,6 +1175,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             experiment_status,
             tags,
             resolved,
+            by,
         } => {
             let e = s.find(&id)?;
             let mut r = e.record.clone();
@@ -1176,11 +1215,36 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
             }
             if let Some(value) = resolved {
-                if let Data::Gap { resolved, .. } = &mut r.data {
+                if let Data::Gap {
+                    resolved,
+                    resolved_by,
+                    ..
+                } = &mut r.data
+                {
                     *resolved = value;
+                    if !value {
+                        resolved_by.clear();
+                    }
                 } else {
                     anyhow::bail!("resolved only applies to gaps");
                 }
+            }
+            if !by.is_empty() {
+                let Data::Gap {
+                    resolved,
+                    resolved_by,
+                    ..
+                } = &mut r.data
+                else {
+                    anyhow::bail!("--by only applies to gaps");
+                };
+                ensure!(
+                    *resolved,
+                    "--by names the evidence that resolved gap {}, which is open: \
+                     add --resolved true",
+                    e.record.id
+                );
+                *resolved_by = find_all(&s, "--by", &by, &[Kind::Evidence])?;
             }
             changes.push(Change::Update {
                 record: r,
@@ -1323,7 +1387,10 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Apply { expected_revision } => {
             let mut raw = String::new();
             std::io::stdin().read_to_string(&mut raw)?;
-            let changes: Vec<Change> = serde_json::from_str(&raw)?;
+            let changes: Vec<Change> = serde_json::from_str(&raw).context(
+                "invalid changes (besides the fields of its kind, every record takes title, \
+                 body, tags and archived; see hyp apply --help)",
+            )?;
             let actions: Vec<Action> = changes.iter().map(Action::of).collect();
             let committed = store.commit_written(changes, expected_revision.as_deref())?;
             return report(&actions, &committed, cli.json);
@@ -1547,6 +1614,7 @@ pub fn seed_demo(store: &Store) -> Result<()> {
         Data::Gap {
             hypothesis: h.id.clone(),
             resolved: false,
+            resolved_by: vec![],
         },
     );
     let mut alt = Record::new(
@@ -1657,9 +1725,5 @@ pub fn seed_demo(store: &Store) -> Result<()> {
 /// Process exit code for a failed command: 3 when a write lost a race
 /// (a `Conflict`, retry after re-reading), otherwise 1.
 pub fn exit_code(err: &anyhow::Error) -> i32 {
-    if crate::store::Conflict::in_chain(err) {
-        3
-    } else {
-        1
-    }
+    if Conflict::in_chain(err) { 3 } else { 1 }
 }

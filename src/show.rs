@@ -231,11 +231,19 @@ fn hypothesis(out: &mut Vec<String>, s: &Snapshot, h: &str, current: &[String]) 
     let gaps = rows(|d| matches!(d, Data::Gap { .. }))
         .iter()
         .filter_map(|x| match &x.record.data {
-            Data::Gap { resolved, .. } => Some(format!(
+            Data::Gap {
+                resolved,
+                resolved_by,
+                ..
+            } => Some(format!(
                 "  {}  {} [{}]",
                 x.record.id,
                 x.record.title,
-                if *resolved { "resolved" } else { "open" }
+                match (resolved, resolved_by.as_slice()) {
+                    (false, _) => "open".to_string(),
+                    (true, []) => "resolved".to_string(),
+                    (true, by) => format!("resolved by {}", by.join(", ")),
+                }
             )),
             _ => None,
         })

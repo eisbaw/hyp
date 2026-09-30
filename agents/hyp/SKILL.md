@@ -33,14 +33,16 @@ is no `hyp/` directory in the project root, ask the user before `hyp init`.
    invent, extrapolate or paraphrase it into something stronger.
 6. **Assess only with evidence and a reason** (see Assessing). "supported"
    never means proven. Do not delete or rewrite a hypothesis that turned out
-   wrong; assess it. Record gaps (`hyp gap`) you could not close. Archive a
-   duplicate or mistaken record (`hyp archive ID`, undone by `hyp restore`).
+   wrong; assess it. Record gaps (`hyp gap`) you could not close, and cite
+   the evidence that later answers one (`--by`). Archive a duplicate or
+   mistaken record (`hyp archive ID`, undone by `hyp restore`).
 
 ## Commands
 
 IDs look like `H-<uuid>`; the letter gives the kind (H hypothesis, F criterion,
 P prediction, E evidence, L link, X experiment, R run, A assessment, G gap).
-Pass the full ID or an unambiguous prefix.
+Pass the full ID or an unambiguous prefix: the first 10 characters
+(`H-1a2b3c4d`) nearly always are.
 
 ```bash
 hyp status                     # start here: where each hypothesis stands
@@ -61,6 +63,7 @@ hyp link H-... H-... --relation competes-with --reason "..."
 hyp experiment add H-... "Short procedure" --targets F-...,P-... --body "..."
 hyp run X-... "Run 1" --outcome observed --evidence E-...
 hyp gap H-... "Open question"
+hyp set G-... --resolved true --by E-...,E-...             # what answered it
 hyp check                      # validate every file; see Files
 ```
 
@@ -69,34 +72,45 @@ values, and `hyp list` filters the listed kind cannot have, exit 2.
 
 **Evidence on a criterion or prediction counts.** Evidence linked to an
 active criterion or prediction is part of its hypothesis's basis and
-citable in its assessments, like evidence linked to the hypothesis; do not
-add a second link to the hypothesis "just in case". On a criterion the
-relation is to the criterion: `hyp evidence add F-...` (supports) records
-that the refuting observation was made, which counts against the
-hypothesis; `--against` records that it was not. `hyp show H-...` lists
-each observation once, grouped by what it means for the hypothesis
-(`against H`, `for H`, ...), with every link ("meets criterion F-...
-(counts against H)", "matches prediction P-...", "supports H"); with
-`--json`, `.evidence[].stance` and `.evidence[].bearings`.
+citable in its assessments; do not add a second link to the hypothesis. On
+a criterion, `hyp evidence add F-...` (supports) records that the refuting
+observation was made, which counts against the hypothesis; `--against`,
+that it was not. `hyp show H-...` groups each observation by what it means
+for the hypothesis, with every link (`--json`: `.evidence[].stance`,
+`.evidence[].bearings`).
 
 **Titles are one line and short**: the claim, or the observation in a few
-words ("200/200 passes with per-test temp dirs"). Put details, numbers, raw
-output and command lines in `--body`, and whole logs in
-`hyp evidence attach`. A long title makes `hyp list` unreadable. A text
-argument `-` reads stdin, at most one per command; for a title, the first
-line of stdin is the title and the rest goes to the body.
+words ("200/200 passes with per-test temp dirs"); details, numbers, raw
+output and command lines go in `--body`, whole logs in `hyp evidence
+attach`. A text argument `-` reads stdin, at most one per command; for a
+title, the first line of stdin is the title and the rest goes to the body.
 
-**Write output.** A write prints the full ID of each record it wrote, one per
-line, on stdout: capture it with `H1=$(hyp add ...)`, as in the example. With
-`--json` it prints `{"written": [{"id", "kind", "revision"}], "revision"}`;
+**IDs from output.** A write prints the full ID of each record it wrote, one
+per line, on stdout. Read it and pass it, or its first 10 characters, to the
+next command, as in the Example. Do not capture IDs in shell variables:
+agent sandboxes often block commands with `$VAR` or `$(...)`. With `--json`
+a write prints `{"written": [{"id", "kind", "revision"}], "revision"}`;
 `.written[i].revision` is that record's `expected_revision` for a follow-up
-`hyp apply` update, archive or delete, with no `show` in between. A human
-summary goes to stderr only when stderr is a terminal; a write that changes
-nothing exits 0 (`no changes` on stderr without `--json`).
+`hyp apply` patch, archive or delete. A write that changes nothing exits 0.
 
-**Batches.** `hyp apply` takes a JSON array of changes on stdin, all or
-nothing, each stating what it depends on; `hyp apply --help` documents every
-change type with examples.
+**Batches.** For a step of several records, `hyp apply` takes a JSON array of
+changes on stdin (`hyp apply < step.json`, or a quoted heredoc
+`hyp apply <<'EOF'`), all or nothing. A create may name its record
+`"id": "@x"`; later changes write `"@x"` in record fields that take an ID
+(and in `expected` keys). Omitted fields get the commands' defaults:
+
+```json
+[{"op": "create", "record": {"id": "@h", "kind": "hypothesis", "title": "Claim", "scope": "Where"}},
+ {"op": "create", "record": {"id": "@f", "kind": "criterion", "hypothesis": "@h", "title": "What refutes it"}},
+ {"op": "create", "record": {"id": "@x", "kind": "experiment", "hypothesis": "@h", "title": "Check", "targets": [{"id": "@f"}]}},
+ {"op": "create", "record": {"id": "@e", "kind": "evidence", "title": "Seen", "source": "cmd", "locator": "job 7"}},
+ {"op": "create", "record": {"kind": "link", "from": "@e", "to": "@f", "relation": "contradicts", "title": "Not met", "body": "Why"}},
+ {"op": "create", "record": {"kind": "run", "title": "Run 1", "experiment": "@x", "evidence": ["@e"]}}]
+```
+
+`{"op": "patch", "id": "H-...", "expected_revision": "...", "set": {"title":
+"..."}}` changes only the named fields. `hyp apply --help` documents every
+change and what creating an assessment, experiment or run must state.
 
 ## Assessing
 
@@ -118,17 +132,12 @@ hyp assess H-... --reviewed 46d8d8f5c79b --status weakened --confidence 0.3 \
   needs `--criterion F-...` (`hyp assess --help` lists each judgment's
   requirements). `--reason` is always required; `--confidence` is 0.0 to
   1.0.
-- The token covers the basis (`.basis` in `hyp --json show`: the claim,
-  scope and assumptions, criteria, predictions, links and linked evidence
-  with source and locator, runs, and archiving any of them) and the current
-  assessments. Closing, tags, experiment status and gap resolution do not
-  change it. `.state.needs_review` is true when the basis changed after the
-  current assessment: review and assess again. Every assessment changes the
-  token, so read again before the next one.
-- Exit 3 means the state changed since you read it; nothing was written.
-  Run `hyp --json show H-...` again, compare `.basis` with what you reviewed,
-  reconsider the judgment, then assess with the new token. Never copy a new
-  token without reviewing what changed.
+- The token covers the basis (`.basis` in `hyp --json show`: claim, scope,
+  assumptions, criteria, predictions, links, linked evidence with source
+  and locator, runs, archiving any of them) and the current assessments;
+  not closing, tags, experiment status or gaps. `.state.needs_review`: the
+  basis changed since the current assessment; review and assess again.
+  Every assessment changes the token, so read again before the next one.
 
 When the investigation is over, `hyp set H-... --lifecycle closed`; that
 does not mean true, the assessment is the judgment. An untestable hypothesis
@@ -137,17 +146,21 @@ gets `--untestable-reason "..."` instead of a criterion.
 ## Exit codes
 
 - `0` success.
-- `1` the input or project is wrong (unknown or ambiguous ID, invalid value,
-  unlinked or missing evidence, a write that would add a `hyp check` error,
-  files hyp cannot load). Fix the cause; retrying unchanged will not help.
+- `1` the input or project is wrong. Fix the cause; retrying unchanged will
+  not help. `kind`: `invalid_input`, `not_found`, `ambiguous_id` (use a
+  longer prefix), `blocked` (repair files first, see Files) or `io`.
 - `2` invalid command-line arguments: see `hyp <command> --help`.
-- `3` conflict: something the write depended on changed since you read it.
-  Nothing was written. Re-read (the message names what to re-read),
-  reconsider, retry with fresh values.
+- `3` conflict (`kind` `conflict`, `ids` the records that changed, when
+  known): something the write depended on changed since you read it.
+  Nothing was written. Re-read, reconsider, retry with fresh values. For
+  `hyp assess`: run `hyp show H-...` again, compare its basis with what you
+  reviewed, reconsider the judgment, then assess with the new token; never
+  copy a new token without reviewing what changed.
 - `141` stdout was closed early (`| head`). A write may be on disk: check
   before retrying, and never truncate the output of a write.
 
-Errors go to stderr (`--json`: `{"error": "..."}`).
+Errors go to stderr; with `--json` as `{"error": "...", "kind": "..."}`.
+Decide by `kind` and the exit code, not the message text.
 
 ## Files
 
@@ -164,36 +177,22 @@ control. Only `malformed`, `attachment` and `invalid` block writes
 
 ## Example
 
+IDs are illustrative; use those hyp prints. A multi-record step can be one batch.
+
 ```bash
-hyp status                               # where things stand
-hyp search "login"                       # anything recorded already?
-H1=$(hyp add "Flaky login test is caused by a shared temp dir" \
-  --scope "tests/login.rs on CI" --tags ci,flaky)
-F1=$(hyp falsify-if "$H1" "Test still fails with per-test temp dirs")
-hyp set "$H1" --lifecycle investigating
-H2=$(hyp add "Flaky login test is caused by clock skew" --scope "CI")
-hyp link "$H1" "$H2" --relation competes-with --reason "Both explain it"
-X1=$(hyp experiment add "$H1" "Rerun with per-test temp dirs" --targets "$F1" \
-  --body "cargo test login -- --test-threads=8, 200 iterations")
-E1=$(hyp evidence add "$H1" "200/200 passes with per-test temp dirs" \
+hyp status                            # where things stand
+hyp search "login"                    # anything recorded already?
+hyp add "Flaky login test is caused by a shared temp dir" --scope "tests/login.rs on CI"
+# prints H-3f2a9c1e-...: pass it, or its first 10 characters, on
+hyp falsify-if H-3f2a9c1e "Test still fails with per-test temp dirs"   # F-8d0c22b1-...
+hyp set H-3f2a9c1e --lifecycle investigating
+hyp gap H-3f2a9c1e "Does isolation alone stop the failures?"          # G-5c0e2a19-...
+hyp evidence add F-8d0c22b1 "200/200 passes with per-test temp dirs" --against \
   --source "cargo test login -- --test-threads=8" --locator "CI job 4411" \
-  --reason "Isolation alone removed the failures" \
-  --body "Before: 23/200 failed on CI job 4402. Clock not varied." \
-  | sed -n 1p)                           # the E- line; the L- line follows
-hyp run "$X1" "200 iterations" --outcome observed --evidence "$E1"
-hyp set "$X1" --experiment-status completed
-hyp link "$E1" "$H2" --relation contradicts \
-  --reason "Clock unchanged, yet the failures stopped"
-G1=$(hyp gap "$H1" "Which test leaves files behind?")
-SHOW=$(hyp show "$H1"); printf '%s\n' "$SHOW"   # review it all before judging
-TOKEN=$(printf '%s\n' "$SHOW" | sed -n '1s/.*  review //p')   # from line 1
-hyp assess "$H1" --reviewed "$TOKEN" --status supported --confidence 0.7 \
-  --evidence "$E1" --reason "Isolation removed all failures in 200 runs"
-SHOW=$(hyp show "$H2"); printf '%s\n' "$SHOW"   # each judgment its own review
-TOKEN=$(printf '%s\n' "$SHOW" | sed -n '1s/.*  review //p')   # from line 1
-hyp assess "$H2" --reviewed "$TOKEN" --status weakened --confidence 0.3 \
-  --evidence "$E1" --reason "Failures stopped with the clock unchanged"
-hyp set "$G1" --resolved true
-hyp set "$H1" --lifecycle closed         # the assessment still holds
-hyp list --needs-review                  # empty: nothing to review again
+  --body "Before: 23/200 failed on CI job 4402"    # E-7b1d0e44-..., then L-...
+hyp show H-3f2a9c1e                   # review it all; line 1 ends "review 46d8d8f5c79b"
+hyp assess H-3f2a9c1e --reviewed 46d8d8f5c79b --status supported --confidence 0.7 \
+  --evidence E-7b1d0e44 --reason "Isolation removed all failures in 200 runs"
+hyp set G-5c0e2a19 --resolved true --by E-7b1d0e44   # the evidence answered it
+hyp set H-3f2a9c1e --lifecycle closed # the assessment still holds
 ```

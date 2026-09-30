@@ -1,6 +1,7 @@
 pub mod agents;
 pub mod cli;
 pub mod edit;
+pub mod error;
 pub mod model;
 pub mod show;
 pub mod status;

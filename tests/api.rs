@@ -63,6 +63,10 @@ async fn api_and_cli_store_share_state_and_reject_stale_writes() {
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert!(error["error"].as_str().unwrap().starts_with("conflict:"));
+    // The same machine-readable kind as `hyp --json` (HYPO-0078); a
+    // whole-project precondition names no records.
+    assert_eq!(error["kind"], "conflict", "{error}");
+    assert_eq!(error.get("ids"), None, "{error}");
 }
 /// POSTs a transaction and returns the status and the decoded JSON body.
 async fn post(app: &axum::Router, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
@@ -107,6 +111,8 @@ async fn transactions_need_only_the_preconditions_of_their_changes() {
     let (status, body) = post(&app, serde_json::json!({"changes":[update]})).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert!(body["error"].as_str().unwrap().starts_with("conflict:"));
+    assert_eq!(body["kind"], "conflict", "{body}");
+    assert_eq!(body["ids"], serde_json::json!([entry.record.id]), "{body}");
     // A missing precondition is a request to fix (422), not a race to retry (409).
     let assessment = serde_json::json!({"kind":"assessment","title":"Unstated","body":"Why","hypothesis":entry.record.id,"judgment":"inconclusive"});
     let (status, body) = post(
@@ -122,6 +128,7 @@ async fn transactions_need_only_the_preconditions_of_their_changes() {
             .contains("requires `expected`"),
         "{body}"
     );
+    assert_eq!(body["kind"], "invalid_input", "{body}");
 }
 /// Decision-0003 item 4 holds for the WebUI's API as for the CLI: a judgment
 /// other than untested without evidence is input to fix (422).

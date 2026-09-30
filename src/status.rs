@@ -22,10 +22,20 @@ pub struct Row {
     pub missing_criterion: bool,
     /// `Snapshot::linked_evidence`: what an assessment may cite.
     pub linked_evidence: usize,
-    /// Unresolved, active gaps.
-    pub open_gaps: Vec<String>,
+    /// Unresolved, active gaps (without `resolved_by`).
+    pub open_gaps: Vec<GapRow>,
+    /// Resolved, active gaps, with the evidence that resolved each.
+    pub resolved_gaps: Vec<GapRow>,
     /// Active experiments, not cancelled, without an active run.
     pub experiments_without_runs: Vec<String>,
+}
+/// A gap of a `Row`: `{"id"}` while open, `{"id", "resolved_by"}` once
+/// resolved (`resolved_by` empty when it was resolved without evidence).
+#[derive(Debug, Serialize)]
+pub struct GapRow {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_by: Option<Vec<String>>,
 }
 /// Hypotheses `Report` does not list: closed ones that need no review, and
 /// archived ones; `needs_review` counts those of them that need review
@@ -86,18 +96,28 @@ pub fn report(s: &Snapshot) -> Report {
         let criteria = active(|d| matches!(d, Data::Criterion { .. }))
             .filter(owned)
             .count();
-        let open_gaps = active(|d| {
-            matches!(
-                d,
-                Data::Gap {
-                    resolved: false,
-                    ..
+        let (mut open_gaps, mut resolved_gaps) = (Vec::new(), Vec::new());
+        for gap in active(|d| matches!(d, Data::Gap { .. })).filter(owned) {
+            if let Data::Gap {
+                resolved,
+                resolved_by,
+                ..
+            } = &gap.record.data
+            {
+                let id = gap.record.id.clone();
+                if *resolved {
+                    resolved_gaps.push(GapRow {
+                        id,
+                        resolved_by: Some(resolved_by.clone()),
+                    });
+                } else {
+                    open_gaps.push(GapRow {
+                        id,
+                        resolved_by: None,
+                    });
                 }
-            )
-        })
-        .filter(owned)
-        .map(|x| x.record.id.clone())
-        .collect();
+            }
+        }
         let experiments_without_runs = active(|d| {
             matches!(d, Data::Experiment { status, .. } if *status != ExperimentStatus::Cancelled)
         })
@@ -121,6 +141,7 @@ pub fn report(s: &Snapshot) -> Report {
             missing_criterion: criteria == 0 && untestable_reason.trim().is_empty(),
             linked_evidence: s.linked_evidence(&r.id).len(),
             open_gaps,
+            resolved_gaps,
             experiments_without_runs,
         });
     }
@@ -164,6 +185,20 @@ fn counted(name: &str, ids: &[String]) -> String {
     }
     let ids: Vec<&str> = ids.iter().map(|id| short(id)).collect();
     format!("{name} {}: {}", ids.len(), ids.join(", "))
+}
+/// "resolved gaps 2: G-… by E-…, E-…; G-…", only listed when there are some.
+fn resolved(gaps: &[GapRow]) -> String {
+    let items: Vec<String> = gaps
+        .iter()
+        .map(|g| match g.resolved_by.as_deref().unwrap_or_default() {
+            [] => short(&g.id).to_string(),
+            by => {
+                let by: Vec<&str> = by.iter().map(|id| short(id)).collect();
+                format!("{} by {}", short(&g.id), by.join(", "))
+            }
+        })
+        .collect();
+    format!("resolved gaps {}: {}", gaps.len(), items.join("; "))
 }
 fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
@@ -243,12 +278,22 @@ pub fn plain(report: &Report) -> String {
         } else {
             format!("untestable: {}", r.untestable_reason)
         };
-        out.push(format!(
-            "  {criterion} · linked evidence {} · {} · {}",
+        let mut line = format!(
+            "  {criterion} · linked evidence {} · {}",
             r.linked_evidence,
-            counted("open gaps", &r.open_gaps),
-            counted("experiments without runs", &r.experiments_without_runs),
+            counted(
+                "open gaps",
+                &r.open_gaps.iter().map(|g| g.id.clone()).collect::<Vec<_>>()
+            ),
+        );
+        if !r.resolved_gaps.is_empty() {
+            line.push_str(&format!(" · {}", resolved(&r.resolved_gaps)));
+        }
+        line.push_str(&format!(
+            " · {}",
+            counted("experiments without runs", &r.experiments_without_runs)
         ));
+        out.push(line);
     }
     out.join("\n")
 }

@@ -27,7 +27,8 @@ pub struct AppState {
     pub port: u16,
     pub events: watch::Sender<String>,
 }
-/// An error answered as `{"error": message}`. The status comes from the error's
+/// An error answered as `hyp --json` prints it (`error::to_json`: `{"error",
+/// "kind"}`, and `ids` for a conflict). The status comes from the error's
 /// type: 409 for a `Conflict` anywhere in the chain, otherwise 422.
 #[derive(Debug)]
 struct ApiError {
@@ -36,8 +37,7 @@ struct ApiError {
 }
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let message = format!("{:#}", self.error);
-        (self.status, Json(serde_json::json!({"error":message}))).into_response()
+        (self.status, Json(crate::error::to_json(&self.error))).into_response()
     }
 }
 impl From<anyhow::Error> for ApiError {

@@ -486,35 +486,15 @@ fn agents_print_writes_the_embedded_skill_without_a_project() {
     assert!(!dir.path().join("hyp").exists());
 }
 
-/// The ```bash blocks of a Markdown section (`## <heading>` up to the next
-/// `## ` heading), concatenated in order.
-fn bash_blocks(markdown: &str, heading: &str) -> String {
-    let section = markdown
-        .split("\n## ")
-        .find(|s| s.strip_prefix(heading).is_some_and(|r| r.starts_with('\n')))
-        .unwrap_or_else(|| panic!("no section ## {heading}"));
-    let (mut script, mut in_bash) = (String::new(), false);
-    for line in section.lines() {
-        match (in_bash, line.trim_end()) {
-            (false, "```bash") => in_bash = true,
-            (true, "```") => in_bash = false,
-            (true, _) => script.push_str(&format!("{line}\n")),
-            _ => {}
-        }
-    }
-    assert!(!in_bash, "unclosed ```bash block in ## {heading}");
-    assert!(!script.is_empty(), "no ```bash block in ## {heading}");
-    script
-}
-
-/// Drift guard for the skill agents load: its Example runs as written against
-/// this binary, in a fresh project, with `hyp` on PATH. There is no
-/// placeholder substitution: the Example's shell variables ($H1, $E1, $TOKEN, ...)
-/// capture the IDs and the review token that earlier commands print. Under
+/// Drift guard for the method the skill teaches: tests/fixtures/skill_flow.sh
+/// runs against this binary, in a fresh project, with `hyp` on PATH. Its
+/// shell variables ($H1, $E1, $TOKEN, ...) capture the IDs and the review
+/// token that earlier commands print; the skill itself teaches reading them
+/// (agent sandboxes block `$VAR`), so the script lives outside it. Under
 /// `set -euo pipefail`, a renamed flag or value (exit 2), a changed output
 /// (an empty capture a later command rejects) or a rejected write fails it.
 #[test]
-fn skill_example_runs_as_written_and_ends_assessed_and_closed() {
+fn skill_flow_runs_against_this_binary_and_ends_assessed_and_closed() {
     let project = TempDir::new().unwrap();
     ok(project.path(), &["init"]);
     let bin = TempDir::new().unwrap();
@@ -524,17 +504,17 @@ fn skill_example_runs_as_written_and_ends_assessed_and_closed() {
         std::iter::once(bin.path().to_path_buf()).chain(std::env::split_paths(&inherited)),
     )
     .unwrap();
-    let script = bash_blocks(SKILL_SOURCE, "Example");
+    let script = include_str!("fixtures/skill_flow.sh");
     let out = Command::new("bash")
-        .args(["-euo", "pipefail", "-c", &script])
+        .args(["-euo", "pipefail", "-c", script])
         .current_dir(project.path())
         .env("PATH", path)
         .stdin(Stdio::null())
         .output()
-        .expect("bash is needed to run the skill's Example");
+        .expect("bash is needed to run the skill flow");
     assert!(
         out.status.success(),
-        "the skill's Example failed ({}):\n--- stderr\n{}\n--- stdout\n{}\n--- script\n{script}",
+        "the skill flow failed ({}):\n--- stderr\n{}\n--- stdout\n{}\n--- script\n{script}",
         out.status,
         String::from_utf8_lossy(&out.stderr),
         String::from_utf8_lossy(&out.stdout),
@@ -569,7 +549,27 @@ fn skill_example_runs_as_written_and_ends_assessed_and_closed() {
     let experiments = list("experiment");
     assert_eq!(experiments.len(), 1);
     assert_eq!(experiments[0]["record"]["status"], "completed");
+    let gaps = list("gap");
+    assert_eq!(
+        gaps[0]["record"]["resolved_by"],
+        list("evidence")[0]["record"]["id"]
+            .as_str()
+            .map(|e| serde_json::json!([e]))
+            .unwrap()
+    );
     ok(project.path(), &["check"]);
+}
+/// The skill teaches commands an agent sandbox accepts: no shell expansion
+/// (`$VAR`, `$(...)`) in any of its command blocks (HYPO-0077).
+#[test]
+fn skill_commands_use_no_shell_expansion() {
+    for block in SKILL_SOURCE.split("```bash\n").skip(1) {
+        let block = block.split("\n```").next().unwrap();
+        assert!(
+            !block.contains('$'),
+            "shell expansion in the skill:\n{block}"
+        );
+    }
 }
 
 /// Installs in a plain directory (no Git); repeating install or update
@@ -3116,4 +3116,513 @@ fn init_demo_does_not_suggest_starting_from_an_empty_project() {
     let out = ok(dir.path(), &["init", "--demo"]);
     assert!(!out.contains("hyp add"), "{out}");
     assert!(out.contains("hyp status"), "{out}");
+}
+
+/// `--json` error output: `{"error", "kind"}` plus `ids` for a conflict whose
+/// failing records are known (HYPO-0078).
+fn json_error(out: &Output) -> serde_json::Value {
+    let stderr = stderr_of(out);
+    serde_json::from_str(&stderr).unwrap_or_else(|e| panic!("{e}: {stderr}"))
+}
+/// The `record` of `hyp --json show id`.
+fn record_of(p: &Path, id: &str) -> serde_json::Value {
+    let shown: serde_json::Value = serde_json::from_str(&ok(p, &["--json", "show", id])).unwrap();
+    shown["entry"]["record"].clone()
+}
+fn revision_of(p: &Path, id: &str) -> String {
+    let shown: serde_json::Value = serde_json::from_str(&ok(p, &["--json", "show", id])).unwrap();
+    shown["entry"]["revision"].as_str().unwrap().to_string()
+}
+
+/// HYPO-0077: one batch creates a hypothesis, criterion, prediction,
+/// experiment, evidence, a link and a run, naming earlier records only by
+/// batch-local references, with no shell variable and no ID round-trip.
+#[test]
+fn apply_chains_a_whole_step_with_batch_local_references() {
+    let dir = TempDir::new().unwrap();
+    let p = dir.path();
+    ok(p, &["init"]);
+    let batch = serde_json::json!([
+        {"op": "create", "record": {"id": "@h", "kind": "hypothesis",
+            "title": "Timezone bug is caused by naive datetimes"}},
+        {"op": "create", "record": {"id": "@f", "kind": "criterion", "hypothesis": "@h",
+            "title": "Still fails with aware datetimes"}},
+        {"op": "create", "record": {"id": "@p", "kind": "prediction", "hypothesis": "@h",
+            "title": "Aware datetimes pass at 23:30 UTC"}},
+        {"op": "create", "record": {"id": "@x", "kind": "experiment", "hypothesis": "@h",
+            "title": "Rerun with aware datetimes", "targets": [{"id": "@f"}]}},
+        {"op": "create", "record": {"id": "@e", "kind": "evidence",
+            "title": "20/20 passes with aware datetimes", "source": "cargo test tz"}},
+        {"op": "create", "record": {"kind": "link", "title": "Criterion not met",
+            "from": "@e", "to": "@f", "relation": "contradicts",
+            "body": "Aware datetimes removed the failure"}},
+        {"op": "create", "record": {"id": "@r", "kind": "run", "title": "Run 1",
+            "experiment": "@x", "evidence": ["@e"]}}
+    ]);
+    let out = apply(p, true, &[], &batch.to_string());
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    let v: serde_json::Value = serde_json::from_str(&stdout_of(&out)).unwrap();
+    let written = v["written"].as_array().unwrap();
+    let expected = [
+        ("hypothesis", Some("@h"), "H-"),
+        ("criterion", Some("@f"), "F-"),
+        ("prediction", Some("@p"), "P-"),
+        ("experiment", Some("@x"), "X-"),
+        ("evidence", Some("@e"), "E-"),
+        ("link", None, "L-"),
+        ("run", Some("@r"), "R-"),
+    ];
+    assert_eq!(written.len(), expected.len(), "{v}");
+    let mut ids = std::collections::BTreeMap::new();
+    for (w, (kind, reference, prefix)) in written.iter().zip(expected) {
+        assert_eq!(w["kind"], kind, "{w}");
+        assert_eq!(w["ref"].as_str(), reference, "{w}");
+        let id = w["id"].as_str().unwrap();
+        assert!(id.starts_with(prefix) && id.len() == 38, "a full ID: {w}");
+        ids.insert(reference.unwrap_or("link"), id.to_string());
+    }
+    let run = record_of(p, &ids["@r"]);
+    assert_eq!(run["experiment"], ids["@x"].as_str());
+    assert_eq!(run["evidence"], serde_json::json!([ids["@e"]]));
+    let link = record_of(p, &ids["link"]);
+    assert_eq!(
+        (&link["from"], &link["to"]),
+        (&ids["@e"].clone().into(), &ids["@f"].clone().into())
+    );
+    let experiment = record_of(p, &ids["@x"]);
+    let targets: Vec<&str> = experiment["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["id"].as_str().unwrap())
+        .collect();
+    // The hypothesis is always a target, as with `hyp experiment add`.
+    assert_eq!(targets, [ids["@h"].as_str(), ids["@f"].as_str()]);
+    ok(p, &["check", "--strict"]);
+
+    // A statement about a record the batch creates needs no revision; one
+    // given is accepted, with the reference resolved.
+    let stated = serde_json::json!([
+        {"op": "create", "record": {"id": "@h", "kind": "hypothesis", "title": "Second"}},
+        {"op": "create", "record": {"kind": "experiment", "hypothesis": "@h", "title": "Check"},
+         "expected": {"revisions": {"@h": "not knowable yet"}}}
+    ]);
+    let out = apply(p, false, &[], &stated.to_string());
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    assert_eq!(
+        stdout_of(&out).lines().count(),
+        2,
+        "plain: one full ID per line"
+    );
+
+    // Unknown, forward and duplicate references are ordinary errors, and
+    // nothing of the batch is written.
+    let before = ok(p, &["list", "--all"]);
+    for (batch, message) in [
+        (
+            serde_json::json!([{"op": "create", "record": {"kind": "criterion",
+                "hypothesis": "@nope", "title": "Orphan"}}]),
+            "unknown reference @nope",
+        ),
+        (
+            serde_json::json!([
+                {"op": "create", "record": {"kind": "criterion", "hypothesis": "@late", "title": "Too early"}},
+                {"op": "create", "record": {"id": "@late", "kind": "hypothesis", "title": "Late"}}]),
+            "unknown reference @late",
+        ),
+        (
+            serde_json::json!([
+                {"op": "create", "record": {"id": "@twice", "kind": "hypothesis", "title": "One"}},
+                {"op": "create", "record": {"id": "@twice", "kind": "hypothesis", "title": "Two"}}]),
+            "@twice is defined twice",
+        ),
+        (
+            serde_json::json!([{"op": "create", "record": {"kind": "gap", "hypothesis": "@x",
+                "title": "Q", "colour": "blue"}}]),
+            "every record takes title, body, tags and archived",
+        ),
+    ] {
+        let out = apply(p, true, &[], &batch.to_string());
+        assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
+        let error = json_error(&out);
+        assert!(
+            error["error"].as_str().unwrap().contains(message),
+            "{error}"
+        );
+        assert_eq!(error["kind"], "invalid_input", "{error}");
+    }
+    assert_eq!(ok(p, &["list", "--all"]), before, "nothing written");
+}
+
+/// HYPO-0053: a create needs only what the CLI would ask for, and a patch
+/// changes only the fields it names.
+#[test]
+fn apply_creates_with_cli_defaults_and_patches_only_given_fields() {
+    let dir = TempDir::new().unwrap();
+    let p = dir.path();
+    ok(p, &["init"]);
+    let out = apply(
+        p,
+        false,
+        &[],
+        r#"[{"op": "create", "record": {"kind": "hypothesis", "title": "Minimal"}}]"#,
+    );
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    let h = stdout_of(&out).trim().to_string();
+    let r = record_of(p, &h);
+    assert_eq!(r["lifecycle"], "draft");
+    assert_eq!(r["tags"], serde_json::json!([]));
+    assert!(!r["created_at"].as_str().unwrap().is_empty(), "{r}");
+    let out = apply(
+        p,
+        false,
+        &[],
+        &serde_json::json!([
+            {"op": "create", "record": {"kind": "gap", "hypothesis": h, "title": "Open?"}},
+            {"op": "create", "record": {"kind": "criterion", "hypothesis": h, "title": "Refuted if"}},
+            {"op": "create", "record": {"kind": "experiment", "hypothesis": h, "title": "Try"},
+             "expected": {"revisions": {h.clone(): revision_of(p, &h)}}}
+        ])
+        .to_string(),
+    );
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    let ids: Vec<String> = stdout_of(&out).lines().map(str::to_string).collect();
+    assert_eq!(record_of(p, &ids[0])["resolved"], false);
+    assert_eq!(record_of(p, &ids[2])["status"], "planned");
+
+    // A patch names the fields it changes; the rest stays as stored.
+    ok(p, &["set", &h, "--body", "Kept body", "--tags", "keep"]);
+    let before = record_of(p, &h);
+    let patch = |set: serde_json::Value, revision: &str| {
+        serde_json::json!([{"op": "patch", "id": h, "expected_revision": revision, "set": set}])
+            .to_string()
+    };
+    let out = apply(
+        p,
+        true,
+        &[],
+        &patch(
+            serde_json::json!({"title": "Patched", "scope": "CI only"}),
+            &revision_of(p, &h),
+        ),
+    );
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    let after = record_of(p, &h);
+    assert_eq!(after["title"], "Patched");
+    assert_eq!(after["scope"], "CI only");
+    for kept in ["body", "tags", "lifecycle", "created_at"] {
+        assert_eq!(after[kept], before[kept], "{kept} kept");
+    }
+    // A stale revision is a conflict, like an update's.
+    let stale = before_revision_after_write(p, &h);
+    let out = apply(
+        p,
+        true,
+        &[],
+        &patch(serde_json::json!({"title": "Stale"}), &stale),
+    );
+    assert_eq!(out.status.code(), Some(3), "{}", stderr_of(&out));
+    // Fields that cannot change, unknown fields and rule violations are
+    // ordinary errors; immutable kinds are refused.
+    let revision = revision_of(p, &h);
+    for (set, message) in [
+        (serde_json::json!({"kind": "gap"}), "cannot change kind"),
+        (serde_json::json!({"id": "H-x"}), "cannot change id"),
+        (
+            serde_json::json!({"created_at": "2020-01-01T00:00:00Z"}),
+            "cannot change created_at",
+        ),
+        (
+            serde_json::json!({"colour": "blue"}),
+            "unknown field `colour`",
+        ),
+        (
+            serde_json::json!({"colour": "blue"}),
+            "every record also takes title, body, tags and archived",
+        ),
+        (
+            serde_json::json!({"lifecycle": "sideways"}),
+            "unknown variant `sideways`",
+        ),
+    ] {
+        let out = apply(p, true, &[], &patch(set.clone(), &revision));
+        assert_eq!(out.status.code(), Some(1), "{set}: {}", stderr_of(&out));
+        let error = json_error(&out);
+        assert!(
+            error["error"].as_str().unwrap().contains(message),
+            "{set}: {error}"
+        );
+    }
+    let demo = demo();
+    let a = first(demo.path(), "assessment");
+    let out = apply(
+        demo.path(),
+        false,
+        &[],
+        &serde_json::json!([{"op": "patch", "id": a, "expected_revision": revision_of(demo.path(), &a),
+            "set": {"title": "Rewritten"}}])
+        .to_string(),
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr_of(&out).contains("immutable"), "{}", stderr_of(&out));
+}
+/// A revision of `id` that a later write made stale.
+fn before_revision_after_write(p: &Path, id: &str) -> String {
+    let stale = revision_of(p, id);
+    ok(p, &["set", id, "--tags", "moved-on"]);
+    stale
+}
+
+/// HYPO-0078: with --json, every error names its kind; exit codes stay.
+#[test]
+fn json_errors_carry_a_machine_readable_kind() {
+    let project = demo();
+    let p = project.path();
+    let kind_of = |args: &[&str], code: i32| -> serde_json::Value {
+        let mut all = vec!["--json"];
+        all.extend_from_slice(args);
+        let out = run(p, &all);
+        assert_eq!(
+            out.status.code(),
+            Some(code),
+            "{args:?}: {}",
+            stderr_of(&out)
+        );
+        json_error(&out)
+    };
+    assert_eq!(kind_of(&["show", "H-00000000"], 1)["kind"], "not_found");
+    let out = hyp(&p.join("no-such-dir"))
+        .args(["--json", "status"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(json_error(&out)["kind"], "not_found", "a missing --project");
+    assert_eq!(kind_of(&["show", "H"], 1)["kind"], "ambiguous_id");
+    let e = first(p, "evidence");
+    let missing = p.join("no-such-file.log");
+    assert_eq!(
+        kind_of(&["evidence", "attach", &e, missing.to_str().unwrap()], 1)["kind"],
+        "io"
+    );
+    assert_eq!(kind_of(&["add", "Two\nlines"], 1)["kind"], "invalid_input");
+    // A conflict lists the records whose preconditions failed.
+    let h = first(p, "hypothesis");
+    let stale = before_revision_after_write(p, &h);
+    let out = apply(
+        p,
+        true,
+        &[],
+        &serde_json::json!([{"op": "archive", "id": h, "archived": true, "expected_revision": stale}])
+            .to_string(),
+    );
+    assert_eq!(out.status.code(), Some(3));
+    let error = json_error(&out);
+    assert_eq!(error["kind"], "conflict", "{error}");
+    assert_eq!(error["ids"], serde_json::json!([h]), "{error}");
+    let x = first(p, "experiment");
+    let out = apply(
+        p,
+        true,
+        &[],
+        &serde_json::json!([{"op": "create",
+            "record": {"kind": "run", "title": "Stale", "experiment": x},
+            "expected": {"revisions": {x.clone(): "0".repeat(64)}}}])
+        .to_string(),
+    );
+    assert_eq!(out.status.code(), Some(3), "{}", stderr_of(&out));
+    let error = json_error(&out);
+    assert_eq!(
+        (&error["kind"], &error["ids"]),
+        (&"conflict".into(), &serde_json::json!([x])),
+        "{error}"
+    );
+    // A malformed file blocks every write.
+    std::fs::write(p.join("hyp/hypotheses/H-broken.md"), "not front matter").unwrap();
+    assert_eq!(kind_of(&["add", "Blocked"], 1)["kind"], "blocked");
+}
+
+/// HYPO-0076: a gap is resolved by the evidence that answered it, shown by
+/// `hyp show` and `hyp status`, and outside the review basis.
+#[test]
+fn a_gap_is_resolved_by_the_evidence_that_answered_it() {
+    let project = demo();
+    let p = project.path();
+    let (h, g, e1) = (
+        hypothesis_titled(p, "cache"),
+        first(p, "gap"),
+        first(p, "evidence"),
+    );
+    let gap_file = p.join(format!("hyp/gaps/{g}.md"));
+    assert!(
+        !read(&gap_file).contains("resolved_by"),
+        "not written while empty"
+    );
+    let e2 = ok(
+        p,
+        &[
+            "evidence",
+            "add",
+            &h,
+            "Timing unchanged",
+            "--source",
+            "scope trace",
+        ],
+    )
+    .lines()
+    .next()
+    .unwrap()
+    .to_string();
+    let token = |h: &str| record_state(p, h)["review_token"].clone();
+    let reviewed = token(&h);
+    let status: serde_json::Value = serde_json::from_str(&ok(p, &["--json", "status"])).unwrap();
+    let row = |status: &serde_json::Value| {
+        status["hypotheses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == h.as_str())
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(row(&status)["open_gaps"], serde_json::json!([{"id": g}]));
+    assert_eq!(row(&status)["resolved_gaps"], serde_json::json!([]));
+    // --by applies only when the gap ends up resolved, and names evidence.
+    fails(p, &["set", &g, "--by", &e1], "--resolved true");
+    fails(
+        p,
+        &["set", &g, "--resolved", "true", "--by", &h],
+        "expected evidence",
+    );
+    fails(
+        p,
+        &["set", &h, "--resolved", "true", "--by", &e1],
+        "resolved only applies to gaps",
+    );
+    ok(
+        p,
+        &[
+            "set",
+            &g,
+            "--resolved",
+            "true",
+            "--by",
+            &e1[..10],
+            "--by",
+            &e2,
+        ],
+    );
+    assert_eq!(record_of(p, &g)["resolved_by"], serde_json::json!([e1, e2]));
+    ok(p, &["set", &g, "--by", &format!("{e2},{e1}")]);
+    assert_eq!(record_of(p, &g)["resolved_by"], serde_json::json!([e2, e1]));
+    assert_eq!(
+        token(&h),
+        reviewed,
+        "gaps are not part of the basis (decision-0003)"
+    );
+    let shown = ok(p, &["show", &h]);
+    assert!(
+        shown.contains(&format!("[resolved by {e2}, {e1}]")),
+        "{shown}"
+    );
+    let status: serde_json::Value = serde_json::from_str(&ok(p, &["--json", "status"])).unwrap();
+    let row = row(&status);
+    assert_eq!(row["open_gaps"], serde_json::json!([]), "{row}");
+    assert_eq!(
+        row["resolved_gaps"],
+        serde_json::json!([{"id": g, "resolved_by": [e2, e1]}]),
+        "{row}"
+    );
+    let plain = ok(p, &["status"]);
+    assert!(
+        plain.contains(&format!(
+            "resolved gaps 1: {} by {}, {}",
+            &g[..10],
+            &e2[..10],
+            &e1[..10]
+        )),
+        "{plain}"
+    );
+    // Evidence that resolved a gap cannot be deleted from under it.
+    ok(p, &["archive", &e2]);
+    fails(p, &["delete", &e2], &g);
+    // Reopening forgets what resolved it.
+    ok(p, &["set", &g, "--resolved", "false"]);
+    assert_eq!(record_of(p, &g).get("resolved_by"), None);
+    assert!(!read(&gap_file).contains("resolved_by"));
+    ok(p, &["check"]);
+}
+fn record_state(p: &Path, id: &str) -> serde_json::Value {
+    let shown: serde_json::Value = serde_json::from_str(&ok(p, &["--json", "show", id])).unwrap();
+    shown["state"].clone()
+}
+
+/// Drift guard for the skill's `hyp apply` batch example (HYPO-0077): its
+/// ```json block applies as written to a fresh project, references only.
+#[test]
+fn skill_batch_example_applies_as_written() {
+    let block: String = SKILL_SOURCE
+        .split("```json\n")
+        .nth(1)
+        .and_then(|rest| rest.split("\n```").next())
+        .expect("a ```json block in the skill")
+        .to_string();
+    let dir = TempDir::new().unwrap();
+    ok(dir.path(), &["init"]);
+    let out = apply(dir.path(), true, &[], &block);
+    assert!(out.status.success(), "{}\n{block}", stderr_of(&out));
+    let v: serde_json::Value = serde_json::from_str(&stdout_of(&out)).unwrap();
+    assert_eq!(v["written"].as_array().unwrap().len(), 6, "{v}");
+    ok(dir.path(), &["check", "--strict"]);
+}
+
+/// A record the batch creates cannot also be updated, patched, archived or
+/// deleted in it: that is input to fix (put its values in the create), not a
+/// conflict that a retry could resolve.
+#[test]
+fn changing_a_record_created_in_the_same_batch_is_invalid_input() {
+    let dir = TempDir::new().unwrap();
+    let p = dir.path();
+    ok(p, &["init"]);
+    let full = "H-00000000-0000-4000-8000-000000000001";
+    for (id, second) in [
+        (
+            "@h",
+            serde_json::json!({"op": "patch", "id": "@h", "expected_revision": "x", "set": {"title": "Later"}}),
+        ),
+        (
+            "@h",
+            serde_json::json!({"op": "archive", "id": "@h", "archived": true, "expected_revision": "x"}),
+        ),
+        (
+            "@h",
+            serde_json::json!({"op": "delete", "id": "@h", "expected_revision": "x"}),
+        ),
+        (
+            full,
+            serde_json::json!({"op": "update", "expected_revision": "x",
+            "record": {"id": full, "kind": "hypothesis", "title": "Later"}}),
+        ),
+        (
+            full,
+            serde_json::json!({"op": "archive", "id": &full[..10], "archived": true, "expected_revision": "x"}),
+        ),
+    ] {
+        let batch = serde_json::json!([
+            {"op": "create", "record": {"id": id, "kind": "hypothesis", "title": "Now"}},
+            second
+        ]);
+        let out = apply(p, true, &[], &batch.to_string());
+        assert_eq!(out.status.code(), Some(1), "{batch}: {}", stderr_of(&out));
+        let error = json_error(&out);
+        assert_eq!(error["kind"], "invalid_input", "{error}");
+        let message = error["error"].as_str().unwrap();
+        assert!(
+            message.contains("is created by this batch; put its values in the create"),
+            "{message}"
+        );
+        if id == "@h" {
+            assert!(message.contains("@h"), "names the reference: {message}");
+        }
+    }
+    assert_eq!(ok(p, &["list", "--all"]), "", "nothing written");
 }

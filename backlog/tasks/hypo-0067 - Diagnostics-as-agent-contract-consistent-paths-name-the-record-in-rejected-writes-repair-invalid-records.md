@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-09-30 12:59'
-updated_date: '2026-09-30 13:13'
+updated_date: '2026-09-30 18:20'
 labels:
   - agents
   - validation
@@ -32,4 +32,6 @@ From the HYPO-0003 architect review. (1) Diagnostic identity is (path, code), bu
 
 <!-- SECTION:NOTES:BEGIN -->
 From the HYPO-0003 confirmation (architect): wrong-kind superseded assessments or criteria still say 'belongs to another hypothesis' (say 'is not an assessment/criterion'); attachment errors block every write, although a sync still delivering assets/ is the same 'only late' case; conflict copies from sync tools (Syncthing, Dropbox) probably block every write (unverified); Repair.note is always set, so it could be a plain String.
+
+From the agent-UX batch 2 reviews: a gap citing missing evidence is a dangling_reference with a note but empty repair.commands; offer 'hyp set G --resolved false'. A failing 'hyp --json check' ends with {"error":"validation failed","kind":"invalid_input"} (consider a dedicated kind or none). The WebUI's plain-text 4xx rejections (axum) and Host/Origin 403s never carry kind.
 <!-- SECTION:NOTES:END -->

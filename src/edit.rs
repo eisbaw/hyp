@@ -2,6 +2,7 @@
 //! with the error at the top, like `git commit`; the user's text is never
 //! silently dropped.
 use crate::{
+    error::{Classified, kind_of},
     model::*,
     store::{self, Change, Committed, Conflict, FrontMatter, Store},
 };
@@ -74,13 +75,17 @@ pub fn edit(store: &Store, e: &Entry) -> Result<Committed> {
         match save(store, e, &edited) {
             Ok(committed) => return Ok(committed),
             Err(err) => {
-                if let Some(Conflict(message)) = err.chain().find_map(|c| c.downcast_ref()) {
+                if let Some(Conflict { message, ids }) = Conflict::find(&err) {
                     let kept = keep(file, &[&text], &pristine)?;
-                    bail!(Conflict(format!("{message}{kept}")));
+                    bail!(Conflict::on(ids.clone(), format!("{message}{kept}")));
                 }
                 if !interactive {
                     let kept = keep(file, &[&text], &pristine)?;
-                    bail!("{err:#}; nothing was written{kept}");
+                    // Keeps the rejection's kind (blocked, invalid input, ...).
+                    bail!(Classified::new(
+                        kind_of(&err),
+                        format!("{err:#}; nothing was written{kept}")
+                    ));
                 }
                 presented = with_notes(&edited, &err);
                 rejected = Some((edited, format!("{err:#}")));

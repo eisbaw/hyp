@@ -1,3 +1,4 @@
+use crate::error::{Classified, ErrorKind};
 use anyhow::{Result, bail, ensure};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -59,6 +60,18 @@ impl Judgment {
 values!(Relation { Supports => "supports", Contradicts => "contradicts", Qualifies => "qualifies", DependsOn => "depends-on", CompetesWith => "competes-with", Supersedes => "supersedes" });
 values!(ExperimentStatus { Planned => "planned", Running => "running", Completed => "completed", Cancelled => "cancelled" });
 values!(Outcome { Observed => "observed", Inconclusive => "inconclusive", Failed => "failed" });
+/// What a create that omits them gets, as the CLI sets them (HYPO-0053): a
+/// new hypothesis is a draft, a new experiment is planned, a run observed.
+/// Serde defaults, so a stored file without the field reads the same way.
+pub fn new_lifecycle() -> Lifecycle {
+    Lifecycle::Draft
+}
+pub fn new_experiment_status() -> ExperimentStatus {
+    ExperimentStatus::Planned
+}
+pub fn new_outcome() -> Outcome {
+    Outcome::Observed
+}
 values!(Kind { Hypothesis => "hypothesis", Prediction => "prediction", Criterion => "criterion", Evidence => "evidence", Link => "link", Experiment => "experiment", Run => "run", Assessment => "assessment", Gap => "gap" });
 impl Kind {
     pub fn prefix(self) -> &'static str {
@@ -115,6 +128,7 @@ pub enum Data {
         scope: String,
         #[serde(default)]
         assumptions: String,
+        #[serde(default = "new_lifecycle")]
         lifecycle: Lifecycle,
         #[serde(default)]
         untestable_reason: String,
@@ -145,12 +159,14 @@ pub enum Data {
         hypothesis: String,
         #[serde(default)]
         targets: Vec<FrozenRef>,
+        #[serde(default = "new_experiment_status")]
         status: ExperimentStatus,
     },
     Run {
         experiment: String,
         #[serde(default)]
         plan: FrozenRef,
+        #[serde(default = "new_outcome")]
         outcome: Outcome,
         #[serde(default)]
         evidence: Vec<String>,
@@ -173,6 +189,11 @@ pub enum Data {
         hypothesis: String,
         #[serde(default)]
         resolved: bool,
+        /// The evidence that answered the question (HYPO-0076); only on a
+        /// resolved gap. Not written while empty, so that files of gaps
+        /// without it stay readable by hyp versions before the field.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        resolved_by: Vec<String>,
     },
 }
 impl Data {
@@ -245,9 +266,50 @@ impl Data {
                         .map(String::as_str),
                 );
             }
+            Self::Gap { resolved_by, .. } => refs.extend(resolved_by.iter().map(String::as_str)),
             _ => {}
         }
         refs
+    }
+    /// The IDs `references` returns, in the same order, to rewrite them: how
+    /// `hyp apply` replaces batch-local references with full IDs.
+    pub fn references_mut(&mut self) -> Vec<&mut String> {
+        use std::iter::once;
+        match self {
+            Self::Hypothesis { .. } | Self::Evidence { .. } => vec![],
+            Self::Prediction { hypothesis, .. } | Self::Criterion { hypothesis } => {
+                vec![hypothesis]
+            }
+            Self::Link { from, to, .. } => vec![from, to],
+            Self::Experiment {
+                hypothesis,
+                targets,
+                ..
+            } => once(hypothesis)
+                .chain(targets.iter_mut().map(|t| &mut t.id))
+                .collect(),
+            Self::Run {
+                experiment,
+                evidence,
+                ..
+            } => once(experiment).chain(evidence.iter_mut()).collect(),
+            Self::Assessment {
+                hypothesis,
+                evidence,
+                criterion,
+                supersedes,
+                ..
+            } => once(hypothesis)
+                .chain(evidence.iter_mut())
+                .chain(criterion.iter_mut())
+                .chain(supersedes.iter_mut())
+                .collect(),
+            Self::Gap {
+                hypothesis,
+                resolved_by,
+                ..
+            } => once(hypothesis).chain(resolved_by.iter_mut()).collect(),
+        }
     }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -615,13 +677,19 @@ impl Snapshot {
                         letters.join(", ")
                     )
                 };
-                bail!("no record with ID (prefix) {prefix:?}{hint}")
+                bail!(Classified::new(
+                    ErrorKind::NotFound,
+                    format!("no record with ID (prefix) {prefix:?}{hint}")
+                ))
             }
-            _ => bail!(
-                "ID prefix {prefix:?} matches {} records; use a longer prefix:\n{}",
-                hits.len(),
-                listing(&hits)
-            ),
+            _ => bail!(Classified::new(
+                ErrorKind::AmbiguousId,
+                format!(
+                    "ID prefix {prefix:?} matches {} records; use a longer prefix:\n{}",
+                    hits.len(),
+                    listing(&hits)
+                )
+            )),
         }
     }
     /// The hypothesis `id` and its criteria and predictions; with
@@ -1006,6 +1074,16 @@ impl Snapshot {
                 );
                 evidence_check(out, evidence);
             }
+            Data::Gap {
+                resolved,
+                resolved_by,
+                ..
+            } => {
+                evidence_check(out, resolved_by);
+                out.require(*resolved || resolved_by.is_empty(), Invalid, || {
+                    "resolved_by names what answered a resolved gap; an open gap has none".into()
+                });
+            }
             Data::Assessment {
                 judgment,
                 confidence,
@@ -1230,10 +1308,12 @@ impl Snapshot {
             1 => " (1 more does not)".into(),
             m => format!(" ({m} more do not)"),
         };
-        bail!(
-            "{n} writes{more}; run hyp check and repair files before writing: {}: {}",
-            first.path,
-            first.message
-        );
+        bail!(Classified::new(
+            ErrorKind::Blocked,
+            format!(
+                "{n} writes{more}; run hyp check and repair files before writing: {}: {}",
+                first.path, first.message
+            )
+        ));
     }
 }

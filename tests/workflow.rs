@@ -724,6 +724,99 @@ fn conflicts_are_classified_by_type_even_when_wrapped_in_context() {
     assert_eq!(hyp::cli::exit_code(&wrapped), 3);
     let ordinary = anyhow::anyhow!("conflict: looks like one but is only text");
     assert_eq!(hyp::cli::exit_code(&ordinary), 1);
+    // The JSON kind is decided by type too (HYPO-0078).
+    use hyp::error::{ErrorKind, kind_of, to_json};
+    assert_eq!(kind_of(&wrapped), ErrorKind::Conflict);
+    assert_eq!(kind_of(&ordinary), ErrorKind::InvalidInput);
+    let missing = anyhow::anyhow!("no record with ID (prefix) \"H-1\"");
+    assert_eq!(
+        kind_of(&missing),
+        ErrorKind::InvalidInput,
+        "text is not a kind"
+    );
+    let io = anyhow::Error::from(std::io::Error::other("disk")).context("cannot read");
+    assert_eq!(to_json(&io)["kind"], "io");
+    assert_eq!(to_json(&io).get("ids"), None, "ids only for conflicts");
+}
+/// `Data::references_mut` must reach exactly the IDs `references` reads, in
+/// the same order: `hyp apply` resolves batch-local references through it,
+/// and a field it missed would keep an unresolved "@name".
+#[test]
+fn references_mut_reaches_every_reference_in_order() {
+    let id = |n: usize| format!("X-{n:08}");
+    let targets = |ids: &[usize]| {
+        ids.iter()
+            .map(|n| FrozenRef {
+                id: id(*n),
+                ..FrozenRef::default()
+            })
+            .collect()
+    };
+    let every_kind = [
+        Data::Hypothesis {
+            scope: String::new(),
+            assumptions: String::new(),
+            lifecycle: Lifecycle::Draft,
+            untestable_reason: String::new(),
+        },
+        Data::Prediction {
+            hypothesis: id(1),
+            conditions: String::new(),
+        },
+        Data::Criterion { hypothesis: id(1) },
+        Data::Evidence {
+            source: "s".into(),
+            locator: String::new(),
+            observed_at: String::new(),
+            attachments: vec![],
+        },
+        Data::Link {
+            from: id(1),
+            to: id(2),
+            relation: Relation::Supports,
+        },
+        Data::Experiment {
+            hypothesis: id(1),
+            targets: targets(&[2, 3]),
+            status: ExperimentStatus::Planned,
+        },
+        Data::Run {
+            experiment: id(1),
+            plan: FrozenRef {
+                id: id(9),
+                ..FrozenRef::default()
+            },
+            outcome: Outcome::Observed,
+            evidence: vec![id(2), id(3)],
+        },
+        Data::Assessment {
+            hypothesis: id(1),
+            judgment: Judgment::Supported,
+            confidence: None,
+            evidence: vec![id(2)],
+            criterion: Some(id(3)),
+            based_on: String::new(),
+            supersedes: vec![id(4)],
+        },
+        Data::Gap {
+            hypothesis: id(1),
+            resolved: true,
+            resolved_by: vec![id(2), id(3)],
+        },
+    ];
+    assert_eq!(
+        every_kind.len(),
+        <Kind as clap::ValueEnum>::value_variants().len()
+    );
+    for mut data in every_kind {
+        let read: Vec<String> = data.references().into_iter().map(str::to_string).collect();
+        let reached: Vec<String> = data
+            .references_mut()
+            .into_iter()
+            .map(|s| s.clone())
+            .collect();
+        assert_eq!(read, reached, "{}", data.kind());
+    }
 }
 #[test]
 fn missing_data_directories_are_recreated_but_non_directories_rejected() {
@@ -1151,7 +1244,15 @@ fn incomplete_statements_are_clear_errors_not_conflicts() {
             expected: Some(Expected::default()),
         },
     );
-    assert!(err.contains("must include its hypothesis"), "{err}");
+    // The hypothesis is added as a target, as `hyp experiment add` does
+    // (HYPO-0053), so what it lacks is the statement of the hypothesis.
+    assert!(
+        err.contains(&format!(
+            "the revision you read of experiment target {}",
+            i.h.id
+        )),
+        "{err}"
+    );
 }
 
 /// The contract as an agent writes it for `hyp apply`, from `hyp --json show`.
@@ -1258,6 +1359,7 @@ fn stale_archive_and_delete_are_still_conflicts() {
         Data::Gap {
             hypothesis: i.h.id.clone(),
             resolved: false,
+            resolved_by: vec![],
         },
     );
     create(&store, &gap);
@@ -1392,6 +1494,7 @@ fn changes_outside_the_basis_do_not_flag_an_assessment() {
         Data::Gap {
             hypothesis: i.h.id.clone(),
             resolved: false,
+            resolved_by: vec![],
         },
     );
     for r in [

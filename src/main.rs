@@ -7,7 +7,7 @@ async fn main() {
     let json = cli.json;
     if let Err(err) = hyp::cli::run(cli).await {
         if json {
-            eprintln!("{}", serde_json::json!({"error":format!("{err:#}")}));
+            eprintln!("{}", hyp::error::to_json(&err));
         } else {
             eprintln!("hyp: {err:#}");
         }
