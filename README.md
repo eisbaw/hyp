@@ -78,8 +78,8 @@ hyp assess H-… --reviewed <token> --status weakened --confidence 0.2 \
   --evidence E-… --reason "Check the timing confound before rejecting the hypothesis."
 hyp assess H-… --reviewed <token> --status falsified --criterion F-… \
   --evidence E-… --reason "Controlled replication satisfies the rejection criterion."
-hyp show H-…
-hyp list --kind hypothesis --needs-review
+hyp show H-…                 # a summary with the review token; --json for everything
+hyp list --needs-review      # hypotheses by default; --kind KIND or --all for others
 hyp search "cache"
 hyp check
 ```
@@ -104,6 +104,8 @@ hyp delete H-…               # only archived and unreferenced records
 
 Use `-` for a text argument to read stdin. Flags accept literal multiline values. All ordinary commands support `--json`. `hyp apply` accepts a JSON array of create/update/archive/delete changes on stdin, with optional `--expected-revision` for a whole-project precondition.
 
+`hyp list` lists hypotheses, each with its judgment, lifecycle and a `needs-review` marker; `--kind KIND` lists another kind and `--all` every kind. A `--status` or `--needs-review` the listed kind cannot have (`--status planned` without `--kind experiment`) is an argument error (exit `2`), not an empty list.
+
 ### Machine contract
 
 Agents depend on these; they are kept stable.
@@ -115,6 +117,8 @@ Agents depend on these; they are kept stable.
 | `2`           | Invalid command-line arguments.                                                                                                                     |
 | `3`           | Conflict: something the write depended on changed since it was read. Nothing was written. Re-read, review, retry.                                  |
 | `141`         | Killed by SIGPIPE: stdout was closed early (`hyp list \| head`). A write command prints after writing, so its write may already be on disk.           |
+
+Write commands (`add`, `evidence add`, `assess`, `set`, `apply`, `evidence attach` and the rest) print the full ID of each record their changes named, one per line and in order (`evidence add`: the evidence, then its link; `evidence attach`: the evidence). With `--json` they print `{"written": [{"id": "H-…", "kind": "hypothesis", "revision": "…"}], "revision": "…"}`: each record's revision after the write (`null` once deleted), usable as the `expected_revision` of a next change, and the project revision (what `apply --expected-revision` takes). `hyp --json init` prints the same shape, listing every record of the new project.
 
 Errors go to stderr, with `--json` as `{"error": "…"}`. A conflict's message starts with `conflict:`. The WebUI's HTTP API answers `403` for a missing or invalid request token or an untrusted `Host`/`Origin`, `409` for a conflict, `422` for input the domain rules reject, and another `4xx` for other rejected input (malformed JSON, an oversized body, a wrong content type).
 

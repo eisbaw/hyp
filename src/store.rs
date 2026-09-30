@@ -38,6 +38,31 @@ impl Conflict {
         err.chain().any(|cause| cause.is::<Conflict>())
     }
 }
+/// An object a write named, by full ID, with its revision after the write
+/// (None once deleted): what write commands print with `--json`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Written {
+    pub id: String,
+    pub kind: Kind,
+    pub revision: Option<String>,
+}
+impl Written {
+    pub fn of(e: &Entry) -> Self {
+        Self {
+            id: e.record.id.clone(),
+            kind: e.record.data.kind_value(),
+            revision: Some(e.revision.clone()),
+        }
+    }
+}
+/// The result of `Store::commit_written`.
+#[derive(Debug, Clone)]
+pub struct Committed {
+    /// The object each change named, in change order.
+    pub written: Vec<Written>,
+    /// The project after the write.
+    pub snapshot: Snapshot,
+}
 #[derive(Debug, Clone)]
 pub struct Store {
     pub root: PathBuf,
@@ -682,6 +707,17 @@ impl Store {
         Ok(snap)
     }
     pub fn commit(&self, changes: Vec<Change>, expected_project: Option<&str>) -> Result<Snapshot> {
+        self.commit_written(changes, expected_project)
+            .map(|c| c.snapshot)
+    }
+    /// `commit`, also returning the object each change named, by full ID (a
+    /// create's ID may be assigned here). A change that turned out to be a
+    /// no-op is still listed.
+    pub fn commit_written(
+        &self,
+        changes: Vec<Change>,
+        expected_project: Option<&str>,
+    ) -> Result<Committed> {
         let _lock = self.lock()?;
         let before = self.read_unlocked()?;
         before.assert_healthy()?;
@@ -693,6 +729,7 @@ impl Store {
         let mut after = before.clone();
         let mut writes = BTreeMap::new();
         let mut created = Vec::new();
+        let mut named: Vec<(String, Kind)> = Vec::new();
         for change in changes {
             let record = match change {
                 Change::Create {
@@ -709,6 +746,7 @@ impl Store {
                     check_create(&before, &record, expected.as_ref())?;
                     after.validate_new(&record)?;
                     created.push(record.id.clone());
+                    named.push((record.id.clone(), record.data.kind_value()));
                     record.created_at = chrono::Utc::now().to_rfc3339();
                     // Derived and frozen content comes from the current state, which
                     // check_create tied to what the caller read.
@@ -764,6 +802,7 @@ impl Store {
                     expected_revision,
                 } => {
                     let old = stated(&after, &record.id, &expected_revision)?;
+                    named.push((old.record.id.clone(), old.record.data.kind_value()));
                     ensure!(
                         old.record.data.kind() == record.data.kind(),
                         "cannot change object kind"
@@ -794,6 +833,7 @@ impl Store {
                     expected_revision,
                 } => {
                     let old = stated(&after, &id, &expected_revision)?;
+                    named.push((old.record.id.clone(), old.record.data.kind_value()));
                     ensure!(
                         !matches!(old.record.data, Data::Assessment { .. } | Data::Run { .. }),
                         "historical assessments and runs cannot be archived"
@@ -807,6 +847,7 @@ impl Store {
                     expected_revision,
                 } => {
                     let old = stated(&after, &id, &expected_revision)?.clone();
+                    named.push((old.record.id.clone(), old.record.data.kind_value()));
                     ensure!(old.record.archived, "archive before deleting");
                     ensure!(
                         !matches!(old.record.data, Data::Assessment { .. } | Data::Run { .. }),
@@ -878,9 +919,19 @@ impl Store {
             &serde_json::to_vec(&writes)?,
         )?;
         self.recover()?;
-        self.read_unlocked()
+        let snapshot = self.read_unlocked()?;
+        let written = named
+            .into_iter()
+            .map(|(id, kind)| Written {
+                revision: snapshot.get(&id).map(|e| e.revision.clone()),
+                id,
+                kind,
+            })
+            .collect();
+        Ok(Committed { written, snapshot })
     }
-    pub fn attach(&self, id: &str, path: &Path) -> Result<Snapshot> {
+    /// Imports the file as an asset and attaches it to evidence `id`.
+    pub fn attach(&self, id: &str, path: &Path) -> Result<Committed> {
         let bytes = fs::read(path)?;
         ensure!(bytes.len() <= 32 * 1024 * 1024, "attachment exceeds 32 MiB");
         let sha = hash(&bytes);
@@ -906,7 +957,7 @@ impl Store {
             );
         }
         atomic(&dest, &bytes)?;
-        self.commit(
+        self.commit_written(
             vec![Change::Update {
                 record,
                 expected_revision: e.revision.clone(),

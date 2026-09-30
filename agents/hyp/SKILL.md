@@ -41,9 +41,11 @@ running `hyp init`.
 ## Commands
 
 IDs look like `H-<uuid>`. Use the full ID or an unambiguous prefix. Write
-commands print the IDs they create, one per line (`evidence add` prints the
-evidence ID, then the link ID): read that plain output. Use `--json` for
-`show` and `list`; on a write it prints the whole project.
+commands print the IDs they write, one per line (`evidence add` prints the
+evidence ID, then the link ID); with `--json`,
+`{"written": [{"id", "kind", "revision"}], "revision"}`. Use `--json` for
+`show` and `list`.
+`hyp list` lists hypotheses only; add `--kind KIND` or `--all` for others.
 
 ```bash
 hyp add "Title" --scope "where it applies" --tags a,b   # -> H-...
@@ -58,7 +60,7 @@ hyp experiment add H-... "Procedure" --targets F-...,P-...
 hyp run X-... "Run 1" --outcome observed --evidence E-...
 hyp gap H-... "Open question"
 hyp --json show H-...          # .entry .state .related .runs .evidence .basis
-hyp --json list --kind hypothesis [--needs-review]
+hyp --json list [--needs-review]   # hypotheses, each with .state
 hyp search "text"
 hyp check                      # validate all files
 ```

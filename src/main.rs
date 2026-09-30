@@ -1,7 +1,6 @@
-use clap::Parser;
 #[tokio::main]
 async fn main() {
-    let cli = hyp::cli::Cli::parse();
+    let cli = hyp::cli::Cli::parse_checked();
     if !matches!(cli.command, hyp::cli::Command::Web { .. }) {
         restore_default_sigpipe();
     }

@@ -1,11 +1,15 @@
 use crate::{
     agents::{self, Agent, Operation},
     model::*,
-    store::{Change, Conflict, Store},
+    store::{Change, Committed, Conflict, Store, Written},
     web,
 };
 use anyhow::{Context, Result, ensure};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{
+    CommandFactory, Parser, Subcommand, ValueEnum,
+    builder::{PossibleValue, PossibleValuesParser, TypedValueParser},
+    error::ErrorKind,
+};
 use std::{
     io::{Read, Write},
     path::PathBuf,
@@ -23,6 +27,59 @@ pub struct Cli {
     pub json: bool,
     #[command(subcommand)]
     pub command: Command,
+}
+impl Cli {
+    /// `Cli::parse`, plus the argument checks clap cannot express; a failed
+    /// one ends the process like a clap error (usage on stderr, exit 2).
+    pub fn parse_checked() -> Self {
+        let cli = Self::parse();
+        if let Err(err) = cli.check() {
+            err.exit();
+        }
+        cli
+    }
+    /// Filter combinations that could only list nothing: a `--status` or
+    /// `--needs-review` the listed kind cannot have.
+    pub fn check(&self) -> Result<(), clap::Error> {
+        let Command::List {
+            kind,
+            all,
+            status,
+            needs_review,
+            ..
+        } = &self.command
+        else {
+            return Ok(());
+        };
+        let listed = listed_kind(*kind, *all);
+        let conflict = match (listed, status) {
+            (Some(k), Some(st)) if k != st.kind() => Some(format!(
+                "--status applies to {} records, not {k}; add --kind {} or --all",
+                st.kind(),
+                st.kind()
+            )),
+            (Some(k), _) if *needs_review && k != Kind::Hypothesis => Some(format!(
+                "--needs-review applies to hypotheses, not {k}; drop --kind or use --all"
+            )),
+            _ => None,
+        };
+        match conflict {
+            None => Ok(()),
+            Some(message) => {
+                let mut command = Self::command();
+                command.build();
+                let list = command
+                    .find_subcommand_mut("list")
+                    .expect("the list subcommand exists");
+                Err(list.error(ErrorKind::ArgumentConflict, message))
+            }
+        }
+    }
+}
+/// The kind `hyp list` lists: `--kind`, else hypotheses; None (every kind)
+/// with `--all`.
+fn listed_kind(kind: Option<Kind>, all: bool) -> Option<Kind> {
+    (!all).then_some(kind.unwrap_or(Kind::Hypothesis))
 }
 #[derive(Subcommand)]
 pub enum Command {
@@ -133,14 +190,23 @@ pub enum Command {
         #[arg(long)]
         resolved: Option<bool>,
     },
+    /// Show a record. Plain output is a summary for people (for a
+    /// hypothesis with its review token); --json is the complete form.
     Show {
         id: String,
     },
+    /// List hypotheses (by default), or records of another kind.
     List {
-        #[arg(long)]
-        kind: Option<String>,
-        #[arg(long)]
-        status: Option<String>,
+        /// Only records of this kind (default: hypothesis).
+        #[arg(long, value_enum)]
+        kind: Option<Kind>,
+        /// List every kind of record.
+        #[arg(long, conflicts_with = "kind")]
+        all: bool,
+        /// A judgment or lifecycle (hypotheses) or an experiment status
+        /// (experiments: add --kind experiment).
+        #[arg(long, value_parser = PossibleValuesParser::new(status_values()).map(|s| Status::parse(&s)))]
+        status: Option<Status>,
         #[arg(long)]
         tag: Option<String>,
         #[arg(long)]
@@ -189,6 +255,47 @@ pub enum Command {
         #[arg(long)]
         output: Option<PathBuf>,
     },
+}
+/// A `hyp list --status` value: judgments and lifecycles apply to
+/// hypotheses, experiment statuses to experiments.
+#[derive(Clone, Copy)]
+pub enum Status {
+    Judgment(Judgment),
+    Lifecycle(Lifecycle),
+    Experiment(ExperimentStatus),
+}
+fn possible<T: ValueEnum + 'static>() -> impl Iterator<Item = PossibleValue> {
+    T::value_variants().iter().filter_map(T::to_possible_value)
+}
+fn status_values() -> Vec<PossibleValue> {
+    possible::<Judgment>()
+        .chain(possible::<Lifecycle>())
+        .chain(possible::<ExperimentStatus>())
+        .collect()
+}
+impl Status {
+    /// Only called on a value `status_values` accepted.
+    fn parse(value: &str) -> Self {
+        Judgment::from_str(value, false)
+            .map(Self::Judgment)
+            .or_else(|_| Lifecycle::from_str(value, false).map(Self::Lifecycle))
+            .or_else(|_| ExperimentStatus::from_str(value, false).map(Self::Experiment))
+            .expect("a value from status_values")
+    }
+    fn kind(self) -> Kind {
+        match self {
+            Self::Judgment(_) | Self::Lifecycle(_) => Kind::Hypothesis,
+            Self::Experiment(_) => Kind::Experiment,
+        }
+    }
+    fn matches(self, e: &Entry, state: Option<&HypothesisState>) -> bool {
+        match (self, &e.record.data) {
+            (Self::Judgment(j), _) => state.is_some_and(|x| x.judgment == j),
+            (Self::Lifecycle(l), Data::Hypothesis { lifecycle, .. }) => *lifecycle == l,
+            (Self::Experiment(x), Data::Experiment { status, .. }) => *status == x,
+            _ => false,
+        }
+    }
 }
 /// Agents in `Agent::ALL` order, without duplicates.
 #[derive(Clone)]
@@ -292,6 +399,22 @@ fn print_json(value: &impl serde::Serialize) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
 }
+/// What a write command prints: one full ID per line, or with --json
+/// `{"written": [{"id", "kind", "revision"}], "revision"}`, the objects
+/// its changes named with their revisions (null once deleted) and the
+/// project revision, all after the write.
+fn print_written(written: &[Written], after: &Snapshot, json: bool) -> Result<()> {
+    if json {
+        return print_json(&serde_json::json!({"written": written, "revision": after.revision}));
+    }
+    for w in written {
+        println!("{}", w.id);
+    }
+    Ok(())
+}
+fn print_committed(c: &Committed, json: bool) -> Result<()> {
+    print_written(&c.written, &c.snapshot, json)
+}
 fn ids(s: &Snapshot, ids: &[String]) -> Result<Vec<String>> {
     ids.iter()
         .map(|id| s.find(id).map(|e| e.record.id.clone()))
@@ -334,7 +457,10 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
         agents::apply(&steps)?;
         if cli.json {
-            print_json(&store.snapshot()?)?;
+            // A new project: everything in it was written by this command.
+            let s = store.snapshot()?;
+            let written: Vec<Written> = s.objects.iter().map(Written::of).collect();
+            print_written(&written, &s, true)?;
         } else {
             println!("Initialized {}", store.root.display());
             print_steps(&steps, false)?;
@@ -466,13 +592,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 changes.extend([create(&s, r), create(&s, l)]);
             }
             EvidenceCommand::Attach { id, path } => {
-                let result = store.attach(&id, &path)?;
-                if cli.json {
-                    print_json(&result)?;
-                } else {
-                    println!("Attached {}", path.display());
-                }
-                return Ok(());
+                return print_committed(&store.attach(&id, &path)?, cli.json);
             }
         },
         Command::Experiment {
@@ -673,38 +793,20 @@ pub async fn run(cli: Cli) -> Result<()> {
                     "basis": basis,
                 }))?;
             } else {
-                println!("{}", crate::store::encode(&e.record)?);
-                if let Some(state) = s.hypotheses.get(&e.record.id) {
-                    println!(
-                        "\nAssessment: {}{}",
-                        state.judgment,
-                        if state.needs_review {
-                            " (needs review)"
-                        } else {
-                            ""
-                        }
-                    );
-                }
-                for x in &s.objects {
-                    if x.record.data.references().contains(&e.record.id.as_str()) {
-                        println!(
-                            "  {}  {}  {}",
-                            x.record.id,
-                            x.record.data.kind(),
-                            x.record.title
-                        );
-                    }
-                }
+                println!("{}", crate::show::plain(&s, e));
             }
             return Ok(());
         }
         Command::List {
             kind,
+            all,
             status,
             tag,
             needs_review,
             archived,
         } => {
+            // `Cli::check` rejected filters the listed kind cannot match.
+            let kind = listed_kind(kind, all);
             let rows: Vec<_> = s
                 .objects
                 .iter()
@@ -712,19 +814,10 @@ pub async fn run(cli: Cli) -> Result<()> {
                     let r = &e.record;
                     let state = s.hypotheses.get(&r.id);
                     (archived || !r.archived)
-                        && kind.as_ref().is_none_or(|k| r.data.kind() == k)
+                        && kind.is_none_or(|k| r.data.kind_value() == k)
                         && tag.as_ref().is_none_or(|t| r.tags.contains(t))
                         && (!needs_review || state.is_some_and(|x| x.needs_review))
-                        && status.as_ref().is_none_or(|x| {
-                            state.is_some_and(|a| a.judgment.to_string() == *x)
-                                || match &r.data {
-                                    Data::Hypothesis { lifecycle, .. } => {
-                                        lifecycle.to_string() == *x
-                                    }
-                                    Data::Experiment { status, .. } => status.to_string() == *x,
-                                    _ => false,
-                                }
-                        })
+                        && status.is_none_or(|x| x.matches(e, state))
                 })
                 .collect();
             list(&s, &rows, cli.json)?;
@@ -793,9 +886,8 @@ pub async fn run(cli: Cli) -> Result<()> {
             let mut raw = String::new();
             std::io::stdin().read_to_string(&mut raw)?;
             let changes: Vec<Change> = serde_json::from_str(&raw)?;
-            let result = store.commit(changes, expected_revision.as_deref())?;
-            print_json(&result)?;
-            return Ok(());
+            let committed = store.commit_written(changes, expected_revision.as_deref())?;
+            return print_committed(&committed, cli.json);
         }
         Command::Check { strict } => {
             if cli.json {
@@ -836,26 +928,13 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
         Command::Init { .. } | Command::Agents { .. } | Command::Web { .. } => unreachable!(),
     }
-    let affected: Vec<String> = changes
-        .iter()
-        .map(|c| match c {
-            Change::Create { record, .. } | Change::Update { record, .. } => record.id.clone(),
-            Change::Archive { id, .. } | Change::Delete { id, .. } => id.clone(),
-        })
-        .collect();
     // Each change states what it depends on; the whole-project revision would
     // turn unrelated concurrent writes into conflicts.
-    let result = store.commit(changes, None)?;
-    if cli.json {
-        print_json(&serde_json::json!({"ids":affected,"snapshot":result}))?;
-    } else {
-        for id in affected {
-            println!("{id}");
-        }
-    }
-    Ok(())
+    print_committed(&store.commit_written(changes, None)?, cli.json)
 }
-/// With `json`, each row is the entry plus, for a hypothesis, its derived `state`.
+/// With `json`, each row is the entry plus, for a hypothesis, its derived
+/// `state`. A plain hypothesis row shows its judgment, lifecycle and, when
+/// it has one, a `needs-review` marker.
 fn list(s: &Snapshot, rows: &[&Entry], json: bool) -> Result<()> {
     if json {
         let rows: Vec<_> = rows
@@ -871,12 +950,26 @@ fn list(s: &Snapshot, rows: &[&Entry], json: bool) -> Result<()> {
         return print_json(&rows);
     }
     for e in rows {
+        let r = &e.record;
+        let status = match (&r.data, s.hypotheses.get(&r.id)) {
+            (Data::Hypothesis { lifecycle, .. }, Some(state)) => format!(
+                "{:12} {:13} {:12} ",
+                state.judgment.as_str(),
+                lifecycle.as_str(),
+                if state.needs_review {
+                    "needs-review"
+                } else {
+                    ""
+                }
+            ),
+            _ => String::new(),
+        };
         println!(
-            "{}  {:11} {}{}",
-            e.record.id,
-            e.record.data.kind(),
-            e.record.title,
-            if e.record.archived { " [archived]" } else { "" }
+            "{}  {:11} {status}{}{}",
+            r.id,
+            r.data.kind(),
+            r.title,
+            if r.archived { " [archived]" } else { "" }
         );
     }
     Ok(())

@@ -992,3 +992,317 @@ fn check_accepts_an_untestable_reason_instead_of_a_criterion() {
     assert!(!ok(p, &["check"]).contains(&warning));
     ok(p, &["check", "--strict"]);
 }
+
+/// Runs `hyp [--json] apply` with `changes` on stdin.
+fn apply(project: &Path, json: bool, extra: &[&str], changes: &str) -> Output {
+    let mut command = hyp(project);
+    if json {
+        command.arg("--json");
+    }
+    let mut child = command
+        .arg("apply")
+        .args(extra)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(&mut child.stdin.take().unwrap(), changes.as_bytes()).unwrap();
+    child.wait_with_output().unwrap()
+}
+/// `{"written": [{"id", "kind", "revision"}], "revision"}` and nothing else
+/// (HYPO-0028): agents parse it on every write, so it must not grow with the
+/// project.
+struct Written {
+    id: String,
+    kind: String,
+    revision: Option<String>,
+}
+fn written(stdout: &str) -> (Vec<Written>, String) {
+    let v: serde_json::Value = serde_json::from_str(stdout).unwrap();
+    let keys: Vec<&String> = v.as_object().unwrap().keys().collect();
+    assert_eq!(keys, ["revision", "written"], "{stdout}");
+    let written = v["written"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| {
+            let keys: Vec<&String> = x.as_object().unwrap().keys().collect();
+            assert_eq!(keys, ["id", "kind", "revision"], "{x}");
+            Written {
+                id: x["id"].as_str().unwrap().to_string(),
+                kind: x["kind"].as_str().unwrap().to_string(),
+                revision: x["revision"].as_str().map(str::to_string),
+            }
+        })
+        .collect();
+    (written, v["revision"].as_str().unwrap().to_string())
+}
+
+#[test]
+fn json_writes_print_what_they_wrote_and_the_new_revisions() {
+    let project = demo();
+    let p = project.path();
+    let revision_of = |id: &str| -> String {
+        serde_json::from_str::<serde_json::Value>(&ok(p, &["--json", "show", id])).unwrap()["entry"]
+            ["revision"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let (w, _) = written(&ok(p, &["--json", "add", "Lean output"]));
+    let [h] = &w[..] else { panic!("one record") };
+    assert_eq!((h.id.len(), h.kind.as_str()), (38, "hypothesis"));
+    assert_eq!(h.revision.as_deref(), Some(revision_of(&h.id).as_str()));
+    let h = h.id.clone();
+    let (w, _) = written(&ok(
+        p,
+        &["--json", "evidence", "add", &h, "Seen", "--source", "log"],
+    ));
+    let kinds: Vec<&str> = w.iter().map(|x| x.kind.as_str()).collect();
+    assert_eq!(kinds, ["evidence", "link"]);
+    let e = w[0].id.clone();
+    let token = serde_json::from_str::<serde_json::Value>(&ok(p, &["--json", "show", &h])).unwrap()
+        ["state"]["review_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (w, _) = written(&ok(
+        p,
+        &[
+            "--json",
+            "assess",
+            &h,
+            "--reviewed",
+            &token,
+            "--status",
+            "supported",
+            "--evidence",
+            &e,
+            "--reason",
+            "Seen",
+        ],
+    ));
+    assert_eq!(w[0].kind, "assessment");
+    // Attach prints the evidence ID, not the file.
+    let file = p.join("capture.txt");
+    std::fs::write(&file, "timeout").unwrap();
+    assert_eq!(
+        ok(p, &["evidence", "attach", &e[..10], file.to_str().unwrap()]),
+        format!("{e}\n")
+    );
+    let (w, revision) = written(&ok(
+        p,
+        &["--json", "evidence", "attach", &e, file.to_str().unwrap()],
+    ));
+    assert_eq!(
+        (w[0].id.as_str(), w[0].kind.as_str()),
+        (e.as_str(), "evidence")
+    );
+    // apply: the ID the server assigned, and revisions the next apply can
+    // state without a read in between.
+    let create =
+        r#"[{"op":"create","record":{"kind":"hypothesis","title":"Applied","lifecycle":"draft"}}]"#;
+    let out = apply(p, true, &["--expected-revision", &revision], create);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let (w, _) = written(&String::from_utf8(out.stdout).unwrap());
+    let created = &w[0];
+    assert_eq!(created.kind, "hypothesis");
+    let archive = serde_json::json!([{"op": "archive", "id": created.id, "archived": true,
+        "expected_revision": created.revision}]);
+    let out = apply(p, true, &[], &archive.to_string());
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let (w, _) = written(&String::from_utf8(out.stdout).unwrap());
+    let delete = serde_json::json!([{"op": "delete", "id": created.id,
+        "expected_revision": w[0].revision}]);
+    let out = apply(p, true, &[], &delete.to_string());
+    let (w, _) = written(&String::from_utf8(out.stdout).unwrap());
+    assert_eq!(w[0].id, created.id);
+    assert_eq!(w[0].revision, None, "a deleted record has no revision");
+    let out = apply(p, false, &[], create);
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.starts_with("H-") && stdout.lines().count() == 1,
+        "plain apply prints one ID per line: {stdout}"
+    );
+    // init: everything in the new project.
+    let fresh = TempDir::new().unwrap();
+    let (w, _) = written(&ok(fresh.path(), &["--json", "init", "--demo"]));
+    let listed: serde_json::Value =
+        serde_json::from_str(&ok(fresh.path(), &["--json", "list", "--all"])).unwrap();
+    assert_eq!(w.len(), listed.as_array().unwrap().len());
+}
+
+#[test]
+fn list_rejects_an_unknown_kind_or_status_instead_of_listing_nothing() {
+    let project = demo();
+    let p = project.path();
+    for args in [
+        &["list", "--kind", "hypotheses"][..],
+        &["list", "--status", "open"],
+    ] {
+        let out = run(p, args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {stderr}");
+        assert!(stderr.contains("possible values"), "{stderr}");
+    }
+    // Filters the listed kind cannot have are usage errors too.
+    for (args, hint) in [
+        (&["list", "--status", "planned"][..], "--kind experiment"),
+        (&["list", "--kind", "gap", "--needs-review"], "--all"),
+    ] {
+        let out = run(p, args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {stderr}");
+        assert!(stderr.contains(hint), "{stderr}");
+    }
+    assert_eq!(
+        ok(
+            p,
+            &["list", "--kind", "experiment", "--status", "completed"]
+        )
+        .lines()
+        .count(),
+        1
+    );
+}
+
+#[test]
+fn list_shows_hypotheses_by_default_and_every_kind_with_all() {
+    let project = demo();
+    let p = project.path();
+    let kinds = |text: &str| -> std::collections::BTreeSet<String> {
+        text.lines()
+            .map(|l| l.split_whitespace().nth(1).unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(kinds(&ok(p, &["list"])), ["hypothesis".to_string()].into());
+    let all = kinds(&ok(p, &["list", "--all"]));
+    for kind in ["hypothesis", "evidence", "link", "assessment", "run"] {
+        assert!(all.contains(kind), "{kind} in {all:?}");
+    }
+    let rows: serde_json::Value = serde_json::from_str(&ok(p, &["--json", "list"])).unwrap();
+    assert!(
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["record"]["kind"] == "hypothesis")
+    );
+}
+
+#[test]
+fn list_rows_show_judgment_lifecycle_and_needs_review() {
+    let project = demo();
+    let p = project.path();
+    let row = |h: &str| -> String {
+        ok(p, &["list"])
+            .lines()
+            .find(|l| l.starts_with(h))
+            .unwrap()
+            .to_string()
+    };
+    let assessed = ok(p, &["list"])
+        .lines()
+        .find(|l| l.contains("cache coherency"))
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string();
+    let columns: Vec<String> = row(&assessed)
+        .split_whitespace()
+        .take(4)
+        .map(str::to_string)
+        .collect();
+    assert_eq!(columns[1..], ["hypothesis", "weakened", "draft"]);
+    assert!(!row(&assessed).contains("needs-review"));
+    ok(
+        p,
+        &[
+            "evidence",
+            "add",
+            &assessed,
+            "New",
+            "--source",
+            "log",
+            "--against",
+        ],
+    );
+    assert!(
+        row(&assessed).contains("needs-review"),
+        "{}",
+        row(&assessed)
+    );
+    assert!(ok(p, &["list", "--needs-review"]).contains(&assessed));
+    let rows: serde_json::Value = serde_json::from_str(&ok(p, &["--json", "list"])).unwrap();
+    let json_row = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["record"]["id"] == assessed.as_str())
+        .unwrap();
+    assert_eq!(json_row["state"]["judgment"], "weakened");
+    assert_eq!(json_row["state"]["needs_review"], true);
+    assert_eq!(json_row["record"]["lifecycle"], "draft");
+}
+
+#[test]
+fn plain_show_summarises_a_hypothesis_for_people() {
+    let project = demo();
+    let p = project.path();
+    let rows: serde_json::Value = serde_json::from_str(&ok(p, &["--json", "list"])).unwrap();
+    let cache = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["record"]["title"].as_str().unwrap().contains("cache"))
+        .unwrap();
+    let h = cache["record"]["id"].as_str().unwrap();
+    let text = ok(p, &["show", h]);
+    let token = cache["state"]["review_token"].as_str().unwrap();
+    assert!(text.contains(&format!("review token: {token}")), "{text}");
+    for part in [
+        "judgment: weakened · confidence 0.2",
+        "Timeout reproduced at transfer 8,142",
+        "source: demo:run-142 (illustrative data)",
+        "Timeout reproduces with D-cache disabled",
+        "Cache-disabled run #142: observed",
+        "Does disabling cache change DMA timing? [open]",
+        "Current assessment",
+        // The observation itself, and relations as `hyp link` spells them.
+        "one timeout occurred with cache disabled",
+        "competes-with H-",
+    ] {
+        assert!(text.contains(part), "{part:?} in\n{text}");
+    }
+    for raw in [
+        "untestable_reason",
+        "archived: false",
+        "tags: []",
+        "created_at",
+    ] {
+        assert!(!text.contains(raw), "{raw:?} in\n{text}");
+    }
+    // Timestamps to the second.
+    let created = text.lines().find(|l| l.starts_with("created ")).unwrap();
+    assert!(
+        created.ends_with('Z') && !created.contains('.'),
+        "{created}"
+    );
+    // An archived criterion is still in the review basis: listed, marked.
+    let f = first(p, "criterion");
+    ok(p, &["archive", &f]);
+    let text = ok(p, &["show", h]);
+    assert!(
+        text.contains("Timeout reproduces with D-cache disabled [archived]"),
+        "{text}"
+    );
+}

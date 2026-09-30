@@ -3,10 +3,11 @@ id: HYPO-0022
 title: >-
   Paper cuts from cycle-2 QA: unnamed search path, dangling .gitignore symlink,
   CLI object-conflict test
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - '@claude'
 created_date: '2026-09-29 23:15'
-updated_date: '2026-09-30 11:49'
+updated_date: '2026-09-30 12:11'
 labels:
   - cli
   - ux
@@ -36,4 +37,8 @@ HYPO-0002 added tests/cli.rs unrelated_write_between_read_and_commit_does_not_fa
 From the HYPO-0016 QA: `hyp evidence attach E FILE` prints 'Attached ./FILE' instead of an ID, unlike the other write commands (the skill says write commands print IDs). Print the evidence ID (and asset hash).
 
 Filed from the review basis v2 deep gate (2026-09-30): vague errors for agents. "falsified requires a criterion and evidence" does not say which is missing; an unknown ID gives "ID \"X\" matches 0 objects; use a longer prefix", which suggests the ID is too short rather than unknown. Say "no object with ID X" for zero matches.
+
+2026-09-30: taking only the 'evidence attach prints the evidence ID' note as part of the HYPO-0028 batch.
+
+2026-09-30: the `evidence attach` note is done in the HYPO-0028 batch: it prints the evidence full ID (plain) or the lean write JSON. The asset hash is not printed (it is in `hyp --json show E`, attachments[].sha256); the ACs above are untouched.
 <!-- SECTION:NOTES:END -->

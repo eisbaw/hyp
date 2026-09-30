@@ -8,9 +8,14 @@ macro_rules! values {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
         #[serde(rename_all = "snake_case")]
         pub enum $name { $($variant),+ }
+        impl $name {
+            pub fn as_str(self) -> &'static str {
+                match self { $(Self::$variant => $text),+ }
+            }
+        }
         impl std::fmt::Display for $name {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str(match self { $(Self::$variant => $text),+ })
+                f.write_str(self.as_str())
             }
         }
     }
@@ -20,6 +25,7 @@ values!(Judgment { Untested => "untested", Inconclusive => "inconclusive", Suppo
 values!(Relation { Supports => "supports", Contradicts => "contradicts", Qualifies => "qualifies", DependsOn => "depends_on", CompetesWith => "competes_with", Supersedes => "supersedes" });
 values!(ExperimentStatus { Planned => "planned", Running => "running", Completed => "completed", Cancelled => "cancelled" });
 values!(Outcome { Observed => "observed", Inconclusive => "inconclusive", Failed => "failed" });
+values!(Kind { Hypothesis => "hypothesis", Prediction => "prediction", Criterion => "criterion", Evidence => "evidence", Link => "link", Experiment => "experiment", Run => "run", Assessment => "assessment", Gap => "gap" });
 
 /// A copy of a record as it was when an experiment or run was created. On a
 /// create only `id` is input (an experiment target); the server fills in the
@@ -112,16 +118,19 @@ pub enum Data {
 }
 impl Data {
     pub fn kind(&self) -> &'static str {
+        self.kind_value().as_str()
+    }
+    pub fn kind_value(&self) -> Kind {
         match self {
-            Self::Hypothesis { .. } => "hypothesis",
-            Self::Prediction { .. } => "prediction",
-            Self::Criterion { .. } => "criterion",
-            Self::Evidence { .. } => "evidence",
-            Self::Link { .. } => "link",
-            Self::Experiment { .. } => "experiment",
-            Self::Run { .. } => "run",
-            Self::Assessment { .. } => "assessment",
-            Self::Gap { .. } => "gap",
+            Self::Hypothesis { .. } => Kind::Hypothesis,
+            Self::Prediction { .. } => Kind::Prediction,
+            Self::Criterion { .. } => Kind::Criterion,
+            Self::Evidence { .. } => Kind::Evidence,
+            Self::Link { .. } => Kind::Link,
+            Self::Experiment { .. } => Kind::Experiment,
+            Self::Run { .. } => Kind::Run,
+            Self::Assessment { .. } => Kind::Assessment,
+            Self::Gap { .. } => Kind::Gap,
         }
     }
     pub fn directory(&self) -> &'static str {
@@ -328,19 +337,29 @@ impl Snapshot {
         );
         own
     }
-    /// Evidence with an active link to hypothesis `id` or one of its active
-    /// criteria or predictions: what an assessment of `id` may cite.
-    pub fn linked_evidence<'a>(&'a self, id: &'a str) -> BTreeSet<&'a str> {
+    /// The active evidence links (supports, contradicts, qualifies) to
+    /// hypothesis `id` or one of its active criteria or predictions.
+    pub fn evidence_links<'a>(&'a self, id: &'a str) -> Vec<&'a Entry> {
         let targets = self.claim_records(id, true);
         self.objects
             .iter()
-            .filter(|e| !e.record.archived)
+            .filter(|e| {
+                !e.record.archived
+                    && matches!(&e.record.data, Data::Link {
+                        to,
+                        relation: Relation::Supports | Relation::Contradicts | Relation::Qualifies,
+                        ..
+                    } if targets.contains(to.as_str()))
+            })
+            .collect()
+    }
+    /// The evidence `evidence_links` start at: what an assessment of `id`
+    /// may cite.
+    pub fn linked_evidence<'a>(&'a self, id: &'a str) -> BTreeSet<&'a str> {
+        self.evidence_links(id)
+            .into_iter()
             .filter_map(|e| match &e.record.data {
-                Data::Link {
-                    from,
-                    to,
-                    relation: Relation::Supports | Relation::Contradicts | Relation::Qualifies,
-                } if targets.contains(to.as_str()) => Some(from.as_str()),
+                Data::Link { from, .. } => Some(from.as_str()),
                 _ => None,
             })
             .collect()

@@ -543,7 +543,7 @@ fn archive_restore_delete_and_attachment_integrity() {
     create(&store, &e);
     let attachment = dir.path().join("log.txt");
     std::fs::write(&attachment, "timeout").unwrap();
-    let s = store.attach(&e.id, &attachment).unwrap();
+    let s = store.attach(&e.id, &attachment).unwrap().snapshot;
     s.assert_healthy().unwrap();
     let entry = s.find(&e.id).unwrap();
     let dest = if let Data::Evidence { attachments, .. } = &entry.record.data {

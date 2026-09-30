@@ -3,10 +3,11 @@ id: HYPO-0024
 title: >-
   Precondition contract polish: prefix IDs in values, clones, duplicated lists,
   apply output size
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - '@claude'
 created_date: '2026-09-30 00:28'
-updated_date: '2026-09-30 11:49'
+updated_date: '2026-09-30 12:22'
 labels:
   - hardening
   - cli
@@ -33,7 +34,7 @@ Non-blocking findings from the HYPO-0002 round-2 deep gate:
 <!-- AC:BEGIN -->
 - [ ] #1 Full IDs required in all create inputs, with ordinary errors
 - [ ] #2 relevant_with no longer clones the snapshot; the duplicated needs_expected list is unified
-- [ ] #3 hyp --json apply output is compact (decide the shape, document it)
+- [x] #3 hyp --json apply output is compact (decide the shape, document it)
 <!-- AC:END -->
 
 ## Implementation Notes
@@ -44,4 +45,10 @@ From the HYPO-0002 round-3 QA: the same assessment race yields two messages depe
 2026-09-30, review basis v2 (HYPO-0009/0031/0026/0040, uncommitted): obsolete bullets: relevant_with (deleted, so its clone is gone), 'let relevant = after.relevant_with' in commit (deleted), the prefix ID in expected.hypotheses[H].assessment_ids (the field is gone; it is now {review_token}), and 'omitting a closure record is exit 3' (no closure). AC #2's relevant_with half is obsolete; the needs_expected duplication (create_seen vs check_create) still stands. The two conflict wordings for the same race are now 'changed since you reviewed it ... the review token differs' (CLI pre-check) and 'hypothesis H changed: its basis or its current assessments (review_token)' (commit): closer, still two.
 
 Filed from the review basis v2 deep gate (2026-09-30): the README fingerprint recipe ("SHA-256 of basis as compact JSON with sorted keys") should say the bytes are UTF-8 with serde_json's escaping (non-ASCII kept literal, no spaces), so an agent recomputing it outside Rust (e.g. Python json.dumps needs separators=(",", ":"), ensure_ascii=False, sort_keys=True) gets the same hash.
+
+2026-09-30: taking only AC #3 (hyp --json apply compact output) as part of the HYPO-0028 batch.
+
+2026-09-30: AC #3 done in the HYPO-0028 batch: `hyp apply` prints `{"ids":[{"id","kind"}],"revision"}` with --json and one ID per line without (it used to print the snapshot either way). Documented in the README machine contract. Other ACs and bullets untouched.
+
+2026-09-30 review fix: the apply --json shape is now `{"written":[{"id","kind","revision"}],"revision"}` (see HYPO-0028).
 <!-- SECTION:NOTES:END -->

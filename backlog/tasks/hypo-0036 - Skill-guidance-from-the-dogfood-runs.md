@@ -4,7 +4,7 @@ title: Skill guidance from the dogfood runs
 status: To Do
 assignee: []
 created_date: '2026-09-30 02:26'
-updated_date: '2026-09-30 05:54'
+updated_date: '2026-09-30 12:22'
 labels:
   - agents
   - docs
@@ -31,4 +31,8 @@ Test-drive 2026-09-30: fresh Claude Code and Codex sessions, given only the inst
 
 <!-- SECTION:NOTES:BEGIN -->
 Per decision-0003, rewrite the skill's Assessing section once, after HYPO-0009 and the evidence-rule task: linked-only citations, and evidence enforced for all judgments except untested.
+
+Carried from HYPO-0028/0033/0034 (2026-09-30): write commands with --json now print `{"ids":[{"id","kind"}],"revision"}` (no snapshot; `.ids[0].id`, not `.ids[0]`); plain `hyp apply` prints IDs, not JSON; `evidence attach` prints the evidence ID. `hyp list` lists hypotheses only by default (`--kind K` or `--all` for others) and rows show judgment, lifecycle and needs-review; unknown --kind/--status exit 2. Plain `hyp show H` now shows the review token and a readable summary, so a skill example may use it for humans, but agents should still parse `hyp --json show`. SKILL.md Commands was minimally updated for the shapes; the rewrite is this task.
+
+Correction to the note above (2026-09-30 review fix): the write JSON is `{"written":[{"id","kind","revision"}],"revision"}` (not `ids`); read `.written[0].id`, and `.written[i].revision` is the record's revision to state in a follow-up update/archive/delete. `hyp --json init` prints the same shape. Impossible `hyp list` filter combinations exit 2.
 <!-- SECTION:NOTES:END -->
