@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-09-29 23:15'
-updated_date: '2026-09-30 12:11'
+updated_date: '2026-09-30 12:37'
 labels:
   - cli
   - ux
@@ -41,4 +41,6 @@ Filed from the review basis v2 deep gate (2026-09-30): vague errors for agents. 
 2026-09-30: taking only the 'evidence attach prints the evidence ID' note as part of the HYPO-0028 batch.
 
 2026-09-30: the `evidence attach` note is done in the HYPO-0028 batch: it prints the evidence full ID (plain) or the lean write JSON. The asset hash is not printed (it is in `hyp --json show E`, attachments[].sha256); the ACs above are untouched.
+
+Interactive terminal test-drive 2026-09-30 (xterm+tmux, first-time user, release build of fda0faa). hyp check warns 'no active falsification criterion' for an archived hypothesis.
 <!-- SECTION:NOTES:END -->
