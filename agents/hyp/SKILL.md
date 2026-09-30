@@ -129,9 +129,9 @@ hyp assess H-... --reviewed 46d8d8f5c79b --status weakened --confidence 0.3 \
 - Cite only evidence linked to the hypothesis or its criteria or predictions.
   For other evidence, `hyp link E-... H-...` first, then review again.
 - Every judgment except `untested` needs `--evidence`; `falsified` also
-  needs `--criterion F-...` (`hyp assess --help` lists each judgment's
-  requirements). `--reason` is always required; `--confidence` is 0.0 to
-  1.0.
+  needs `--criterion F-...` and a cited observation that meets it (recorded
+  with `hyp evidence add F-...`; evidence against H alone does not). See
+  `hyp assess --help`. `--reason` is always required; `--confidence` 0.0-1.0.
 - The token covers the basis (`.basis` in `hyp --json show`: claim, scope,
   assumptions, criteria, predictions, links, linked evidence with source
   and locator, runs, archiving any of them) and the current assessments;
@@ -147,8 +147,9 @@ gets `--untestable-reason "..."` instead of a criterion.
 
 - `0` success.
 - `1` the input or project is wrong. Fix the cause; retrying unchanged will
-  not help. `kind`: `invalid_input`, `not_found`, `ambiguous_id` (use a
-  longer prefix), `blocked` (repair files first, see Files) or `io`.
+  not help. `kind`: `invalid_input`, `not_found` (`ids` those that match
+  nothing), `ambiguous_id` (use a longer prefix), `blocked` (repair files
+  first, see Files), `unsupported_schema` (ask the user to upgrade hyp) or `io`.
 - `2` invalid command-line arguments: see `hyp <command> --help`.
 - `3` conflict (`kind` `conflict`, `ids` the records that changed, when
   known): something the write depended on changed since you read it.

@@ -301,16 +301,49 @@ async function main() {
       w.document.body.textContent.includes("Agent saw the failure again"),
     "discarded, and the counter-evidence shown for review",
   );
-  click(w, '[data-action="create:assessment"]');
-  field(w, "title", "Reviewed the output");
-  field(w, "body", "The criterion is satisfied by the observation.");
-  field(w, "judgment", "falsified");
-  field(w, "confidence", "0.05");
-  field(w, "evidence", ev.record.id);
   const f = JSON.parse(cli("--json", "list", "--kind", "criterion")).find(
     (e) => e.record.title === "Reject if output is zero",
   );
-  field(w, "criterion", f.record.id);
+  const falsify = () => {
+    click(w, '[data-action="create:assessment"]');
+    field(w, "title", "Reviewed the output");
+    field(w, "body", "The criterion is satisfied by the observation.");
+    field(w, "judgment", "falsified");
+    field(w, "confidence", "0.05");
+    field(w, "evidence", ev.record.id);
+    field(w, "criterion", f.record.id);
+  };
+  // The observation contradicts the hypothesis but was not recorded as
+  // meeting the criterion: falsified is input to fix (422), not a conflict.
+  falsify();
+  assert.ok(
+    w.document
+      .querySelector("#editor-fields")
+      .textContent.includes("one cited observation must meet it"),
+  );
+  click(w, 'button[type="submit"]');
+  await wait(
+    () => formError(w).includes("must cite evidence that meets its criterion"),
+    "falsified without evidence meeting the criterion",
+  );
+  assert.ok(!formError(w).includes(DRAFT_HINT), formError(w));
+  click(w, "#cancel-editor");
+  cli(
+    "link",
+    ev.record.id,
+    f.record.id,
+    "--relation",
+    "supports",
+    "--reason",
+    "Zero output is what the criterion describes",
+  );
+  await wait(
+    () =>
+      !w.document.querySelector("#editor").open &&
+      w.document.body.textContent.includes("meets criterion"),
+    "the observation shown as meeting the criterion",
+  );
+  falsify();
   await save(w);
   await wait(() => h1(w) === "Reviewed the output", "assessment");
   const assessed = JSON.parse(cli("--json", "show", h.record.id)).state;

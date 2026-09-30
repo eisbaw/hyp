@@ -1,5 +1,5 @@
 use crate::{
-    error::{Classified, ErrorKind},
+    error::{Classified, ErrorKind, kind_of},
     model::*,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -96,7 +96,8 @@ pub enum Change {
     },
 }
 /// What the caller read, as the preconditions of a create. Any stated entry
-/// that changed or disappeared since is a `Conflict`. Keys are full IDs.
+/// that changed since is a `Conflict`; one that does not exist is
+/// `ErrorKind::NotFound` (HYPO-0087). Keys are full IDs.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Expected {
@@ -192,11 +193,49 @@ impl Change {
         }
     }
 }
+/// The error for a stated `id` that matches no record before the batch
+/// (HYPO-0087): `NotFound`, not a conflict. Without tombstones hyp cannot
+/// tell a record deleted since the caller read it from a mistyped ID, and a
+/// conflict would have the caller re-read and retry a typo forever. Either
+/// way the record is not there to change; re-reading shows that.
+fn absent(id: &str) -> anyhow::Error {
+    Classified::not_found(
+        id,
+        format!(
+            "{id} does not exist: no record has this ID or prefix (if you read it before, \
+             it has been deleted since)"
+        ),
+    )
+    .into()
+}
+/// Whether `id`, as a full ID or prefix, matches a record of `s`.
+fn matches_any(s: &Snapshot, id: &str) -> bool {
+    let prefix = id.to_lowercase();
+    s.objects
+        .iter()
+        .any(|e| e.record.id.to_lowercase().starts_with(&prefix))
+}
+/// A create naming, in any reference field, an ID that matches no record
+/// before or within the batch is `absent`, as the same ID given to the CLI
+/// is `NotFound` (HYPO-0087). Anything else wrong with a reference (the
+/// wrong kind, a prefix, a record the batch deleted) `validate` reports.
+fn references_exist(before: &Snapshot, after: &Snapshot, r: &Record) -> Result<()> {
+    for id in r.data.references() {
+        if !matches_any(before, id) && !matches_any(after, id) {
+            return Err(absent(id).context(format!("the new {} references {id}", r.data.kind())));
+        }
+    }
+    Ok(())
+}
 /// The record `id` (a full ID or unique prefix) whose revision the caller
-/// stated for an update, patch, archive or delete. A record the batch
-/// created (`created`) cannot be changed in it: the caller could not have
-/// read its revision, so that is input to fix, not a conflict to retry.
+/// stated for an update, patch, archive or delete, in `after`, the state
+/// the batch has reached. A record the batch created (`created`) cannot be
+/// changed in it: the caller could not have read its revision, so that is
+/// input to fix, not a conflict to retry. Neither is naming a record an
+/// earlier change of the batch deleted. A record that did not exist
+/// before the batch either is `absent`.
 fn stated<'a>(
+    before: &Snapshot,
     after: &'a Snapshot,
     id: &str,
     expected_revision: &str,
@@ -207,16 +246,11 @@ fn stated<'a>(
         !expected_revision.is_empty(),
         "expected_revision is required: the revision of {id} as you read it"
     );
-    let prefix = id.to_lowercase();
-    if !after
-        .objects
-        .iter()
-        .any(|e| e.record.id.to_lowercase().starts_with(&prefix))
-    {
-        bail!(Conflict::on(
-            vec![id.to_string()],
-            format!("{id} does not exist (deleted since you read it, or never existed)")
-        ));
+    if !matches_any(after, id) {
+        if matches_any(before, id) {
+            bail!("{id} is deleted by an earlier change of this batch");
+        }
+        return Err(absent(id));
     }
     let current = after.find(id)?;
     let full = &current.record.id;
@@ -235,9 +269,9 @@ fn stated<'a>(
     Ok(current)
 }
 /// Where the create's statements disagree with `before`, the state the
-/// caller read: stated hypotheses whose review token changed,
-/// stated revisions that changed, and stated records that disappeared, as
-/// (ID, what changed). Incomplete statements are ordinary errors.
+/// caller read: stated hypotheses whose review token changed and stated
+/// revisions that changed, as (ID, what changed). Incomplete statements are
+/// ordinary errors, and a stated record that does not exist is `absent`.
 /// Statements about records the batch created (`created`) are not checked:
 /// the caller could not have read them, and they need none.
 fn stale_statements(
@@ -245,14 +279,18 @@ fn stale_statements(
     expected: &Expected,
     created: &[String],
 ) -> Result<Vec<(String, String)>> {
-    let full_id = |id: &str| -> Result<()> {
-        if let Ok(e) = before.find(id) {
-            ensure!(
-                e.record.id == id,
-                "expected names {id}; use the full ID {}",
-                e.record.id
-            );
-        }
+    // A stated record existed before the batch, named by its full ID; one
+    // that did not is `absent`, whatever the ID looks like (HYPO-0087).
+    let full_id = |id: &str, field: &str| -> Result<()> {
+        let e = before.find(id).map_err(|err| match kind_of(&err) {
+            ErrorKind::NotFound => absent(id).context(format!("{field}[\"{id}\"]")),
+            _ => err,
+        })?;
+        ensure!(
+            e.record.id == id,
+            "expected names {id}; use the full ID {}",
+            e.record.id
+        );
         Ok(())
     };
     let mut stale = Vec::new();
@@ -271,14 +309,9 @@ fn stale_statements(
             "expected.hypotheses[\"{id}\"].review_token must be the 64-hex-digit \
              .state.review_token of `hyp --json show {id}`"
         );
-        full_id(id)?;
+        full_id(id, "expected.hypotheses")?;
         match before.hypotheses.get(id) {
-            None => stale.push((
-                id.clone(),
-                format!(
-                    "hypothesis {id} does not exist (deleted since you read it, or never existed)"
-                ),
-            )),
+            None => bail!("expected.hypotheses names {id}, which is not a hypothesis"),
             Some(now) if !now.review_token.eq_ignore_ascii_case(&seen.review_token) => stale
                 .push((
                     id.clone(),
@@ -297,16 +330,9 @@ fn stale_statements(
             !revision.is_empty(),
             "expected.revisions[\"{id}\"] is empty: give the revision you read"
         );
-        full_id(id)?;
-        match before.get(id) {
-            None => stale.push((
-                id.clone(),
-                format!("{id} does not exist (deleted since you read it, or never existed)"),
-            )),
-            Some(e) if e.revision != *revision => {
-                stale.push((id.clone(), format!("{id} changed (revision)")))
-            }
-            Some(_) => {}
+        full_id(id, "expected.revisions")?;
+        if before.get(id).is_some_and(|e| e.revision != *revision) {
+            stale.push((id.clone(), format!("{id} changed (revision)")));
         }
     }
     Ok(stale)
@@ -570,11 +596,98 @@ fn patched(old: &Record, set: serde_json::Map<String, serde_json::Value>) -> Res
         format!("patch of {id} (every record also takes title, body, tags and archived; see hyp apply --help)")
     })
 }
-#[derive(Serialize, Deserialize)]
+/// The notebook schemas (decision-0004), oldest first, each with the first
+/// hyp version that reads it. This hyp reads and writes all of them. A new
+/// notebook starts at the first; a write raises it when it first stores
+/// something only a later schema holds (`Data::schema`), and reading never
+/// does. The README's schema table lists the same rows. From schema 3 on
+/// a raise also writes the row's version to config.toml (`raised`).
+pub const SCHEMAS: &[(u32, &str)] = &[
+    (1, "0.1.0"), // the record fields of hyp 0.1.0
+    (2, "0.2.0"), // + a gap's `resolved_by` (HYPO-0076)
+];
+/// The schema file, relative to `hyp/`; also its key in the journal.
+const CONFIG: &str = "config.toml";
+/// The first schema whose config.toml names the hyp version that reads it
+/// (`Config::min_hyp_version`). Earlier ones leave it out, so hyp 0.1.0,
+/// which rejects unknown keys, still says "unsupported schema version".
+const FIRST_SCHEMA_NAMING_ITS_HYP: u32 = 3;
+/// `hyp/config.toml`. Parsed strictly, like records: an unknown key is an
+/// error. `read_config` first checks the schema, so a newer notebook, which
+/// may have keys this hyp does not know, gets the upgrade message instead.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
     schema_version: u32,
     name: String,
+    /// The first hyp that reads `schema_version`, from
+    /// `FIRST_SCHEMA_NAMING_ITS_HYP` on: what an older hyp tells its user
+    /// to upgrade to. Set only by `raised`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    min_hyp_version: Option<String>,
+}
+/// `config` raised to schema `needed`, with the `min_hyp_version` that
+/// `schemas` (`SCHEMAS`, a parameter for tests) gives it from
+/// `FIRST_SCHEMA_NAMING_ITS_HYP` on, and none before.
+fn raised(config: Config, needed: u32, schemas: &[(u32, &str)]) -> Result<Config> {
+    let min_hyp_version = if needed >= FIRST_SCHEMA_NAMING_ITS_HYP {
+        let (_, version) = schemas
+            .iter()
+            .find(|(schema, _)| *schema == needed)
+            .with_context(|| format!("schema {needed} has no row in SCHEMAS"))?;
+        Some((*version).to_string())
+    } else {
+        None
+    };
+    Ok(Config {
+        schema_version: needed,
+        min_hyp_version,
+        ..config
+    })
+}
+/// The config of the notebook whose `hyp/` directory is `dir`. A schema
+/// newer than `SCHEMAS` knows is `ErrorKind::UnsupportedSchema`, naming the
+/// hyp version to upgrade to: the config's `min_hyp_version` when it has
+/// one (notebooks of schema 3 and later carry it, as only the hyp that wrote
+/// them knows it), otherwise any version newer than this one.
+fn read_config(dir: &Path) -> Result<Config> {
+    let path = dir.join(CONFIG);
+    let text =
+        fs::read_to_string(&path).with_context(|| format!("cannot read {}", path.display()))?;
+    let invalid = || format!("invalid {}", path.display());
+    let table: toml::Table = toml::from_str(&text).with_context(invalid)?;
+    let (first, last) = (SCHEMAS[0], SCHEMAS[SCHEMAS.len() - 1]);
+    let version = env!("CARGO_PKG_VERSION");
+    if let Some(schema) = table
+        .get("schema_version")
+        .and_then(toml::Value::as_integer)
+        .filter(|&n| n > i64::from(last.0))
+    {
+        let upgrade = match table.get("min_hyp_version").and_then(toml::Value::as_str) {
+            Some(min) => format!("upgrade hyp to >= {min}"),
+            None => format!("upgrade hyp to a version newer than {version}"),
+        };
+        bail!(Classified::new(
+            ErrorKind::UnsupportedSchema,
+            format!(
+                "this notebook uses schema {schema} ({}), but this hyp {version} reads \
+                 schemas {} to {}: {upgrade} (`hyp --version` shows yours). Nothing was \
+                 read or written",
+                path.display(),
+                first.0,
+                last.0
+            )
+        ));
+    }
+    let config: Config = toml::from_str(&text).with_context(invalid)?;
+    ensure!(
+        config.schema_version >= first.0,
+        "{}: schema_version {} does not exist; the first is {}",
+        invalid(),
+        config.schema_version,
+        first.0
+    );
+    Ok(config)
 }
 
 pub fn encode(r: &Record) -> Result<String> {
@@ -686,12 +799,13 @@ impl Store {
         fs::create_dir(root.join("hyp"))
             .with_context(|| format!("cannot create {}", root.join("hyp").display()))?;
         let config = Config {
-            schema_version: 1,
+            schema_version: SCHEMAS[0].0,
             name: root
                 .file_name()
                 .unwrap_or_default()
                 .to_string_lossy()
                 .into_owned(),
+            min_hyp_version: None,
         };
         atomic(
             &root.join("hyp/config.toml"),
@@ -715,18 +829,9 @@ impl Store {
             path.pop();
         }
         loop {
-            let config = path.join("hyp/config.toml");
-            if config.is_file() {
+            if path.join("hyp").join(CONFIG).is_file() {
                 safe_dir(&path.join("hyp"))?;
-                let text = fs::read_to_string(&config)
-                    .with_context(|| format!("cannot read {}", config.display()))?;
-                let cfg: Config = toml::from_str(&text)
-                    .with_context(|| format!("invalid {}", config.display()))?;
-                ensure!(
-                    cfg.schema_version == 1,
-                    "unsupported schema version {}",
-                    cfg.schema_version
-                );
+                read_config(&path.join("hyp"))?;
                 let store = Self { root: path };
                 store.ensure_layout()?;
                 return Ok(store);
@@ -783,18 +888,28 @@ impl Store {
     fn path_of(r: &Record) -> String {
         format!("hyp/{}", Self::relative(r))
     }
+    /// The file a journal entry writes: a record file, or `config.toml` when
+    /// the write raises the schema.
     fn target(&self, relative: &str) -> Result<PathBuf> {
         let components: Vec<_> = relative.split('/').collect();
-        ensure!(
-            components.len() == 2 && DIRECTORIES.contains(&components[0]),
-            "invalid journal path"
-        );
-        ensure!(
-            components[1].ends_with(".md")
-                && !components[1].contains("..")
-                && !components[1].contains('\\'),
-            "invalid journal filename"
-        );
+        // Accepting config.toml here is new in hyp 0.2.0: an older hyp that
+        // finds a journal left by a crashed schema raise rejects this entry
+        // as an invalid journal path and cannot recover it. That needs a
+        // crash mid-raise and then a hyp downgrade on the same machine (the
+        // journal is local, under .hyp/), so it is accepted, not handled;
+        // this hyp rolls such a journal forward.
+        if relative != CONFIG {
+            ensure!(
+                components.len() == 2 && DIRECTORIES.contains(&components[0]),
+                "invalid journal path"
+            );
+            ensure!(
+                components[1].ends_with(".md")
+                    && !components[1].contains("..")
+                    && !components[1].contains('\\'),
+                "invalid journal filename"
+            );
+        }
         let path = self.root.join("hyp").join(relative);
         if let Ok(meta) = path.symlink_metadata() {
             ensure!(
@@ -838,7 +953,14 @@ impl Store {
         let _lock = self.lock()?;
         self.read_unlocked()
     }
+    /// The notebook's config; fails for a schema this hyp does not read.
+    fn config(&self) -> Result<Config> {
+        read_config(&self.root.join("hyp"))
+    }
     fn read_unlocked(&self) -> Result<Snapshot> {
+        // Another hyp may have raised the schema since `open` (a long-running
+        // `hyp web`): refuse rather than report its records as malformed.
+        self.config()?;
         let mut snap = Snapshot::default();
         for dir in DIRECTORIES {
             let path = self.root.join("hyp").join(dir);
@@ -998,6 +1120,7 @@ impl Store {
                             );
                         }
                     }
+                    references_exist(&before, &after, &record)?;
                     check_create(&before, &record, expected.as_ref(), &created)?;
                     after.validate_new(&record)?;
                     created.push(record.id.clone());
@@ -1034,8 +1157,8 @@ impl Store {
                                 *t = after
                                     .get(&t.id)
                                     .ok_or_else(|| {
-                                        Classified::new(
-                                            ErrorKind::NotFound,
+                                        Classified::not_found(
+                                            &t.id,
                                             format!("experiment target {} does not exist", t.id),
                                         )
                                     })?
@@ -1046,8 +1169,8 @@ impl Store {
                             experiment, plan, ..
                         } => {
                             let e = after.get(experiment).ok_or_else(|| {
-                                Classified::new(
-                                    ErrorKind::NotFound,
+                                Classified::not_found(
+                                    experiment,
                                     format!("experiment {experiment} does not exist"),
                                 )
                             })?;
@@ -1064,6 +1187,7 @@ impl Store {
                     expected_revision,
                 } => {
                     let old = stated(
+                        &before,
                         &after,
                         &record.id,
                         &expected_revision,
@@ -1079,7 +1203,14 @@ impl Store {
                     expected_revision,
                     set,
                 } => {
-                    let old = stated(&after, &id, &expected_revision, &created, &references)?;
+                    let old = stated(
+                        &before,
+                        &after,
+                        &id,
+                        &expected_revision,
+                        &created,
+                        &references,
+                    )?;
                     named.push(name(&old.record, None));
                     let mut record = patched(&old.record, set)?;
                     references.resolve_record(&mut record)?;
@@ -1091,7 +1222,14 @@ impl Store {
                     archived,
                     expected_revision,
                 } => {
-                    let old = stated(&after, &id, &expected_revision, &created, &references)?;
+                    let old = stated(
+                        &before,
+                        &after,
+                        &id,
+                        &expected_revision,
+                        &created,
+                        &references,
+                    )?;
                     named.push(name(&old.record, None));
                     ensure!(
                         !matches!(old.record.data, Data::Assessment { .. } | Data::Run { .. }),
@@ -1105,8 +1243,15 @@ impl Store {
                     id,
                     expected_revision,
                 } => {
-                    let old =
-                        stated(&after, &id, &expected_revision, &created, &references)?.clone();
+                    let old = stated(
+                        &before,
+                        &after,
+                        &id,
+                        &expected_revision,
+                        &created,
+                        &references,
+                    )?
+                    .clone();
                     named.push(name(&old.record, None));
                     let id = &old.record.id;
                     ensure!(
@@ -1197,6 +1342,22 @@ impl Store {
                 }
             }
         }
+        // Raise the schema to what the records need (decision-0004), in the
+        // same journal as the records, so a crash leaves both or neither.
+        // Only a write raises it, and never lowers it.
+        if !writes.is_empty() {
+            let config = self.config()?;
+            let needed = after
+                .objects
+                .iter()
+                .map(|e| e.record.data.schema())
+                .max()
+                .unwrap_or(config.schema_version);
+            if needed > config.schema_version {
+                let config = raised(config, needed, SCHEMAS)?;
+                writes.insert(CONFIG.to_string(), Some(toml::to_string_pretty(&config)?));
+            }
+        }
         // Verify a second time immediately before writing to detect ordinary editor saves.
         if self.read_unlocked()?.revision != before.revision {
             bail!(Conflict::new("files changed during transaction"));
@@ -1253,5 +1414,38 @@ impl Store {
             }],
             None,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(schema_version: u32) -> Config {
+        Config {
+            schema_version,
+            name: "n".into(),
+            min_hyp_version: None,
+        }
+    }
+    /// decision-0004: from schema 3 on, a raise names the hyp that reads the
+    /// schema, and before it does not, so hyp 0.1.0 keeps its message.
+    #[test]
+    fn a_raise_names_the_hyp_version_from_schema_3_on() {
+        let schemas = [(1, "0.1.0"), (2, "0.2.0"), (3, "0.3.0"), (4, "0.5.0")];
+        assert_eq!(raised(config(1), 2, &schemas).unwrap(), config(2));
+        let three = raised(config(2), 3, &schemas).unwrap();
+        assert_eq!(three.min_hyp_version.as_deref(), Some("0.3.0"));
+        let four = raised(three, 4, &schemas).unwrap();
+        assert_eq!(four.min_hyp_version.as_deref(), Some("0.5.0"));
+        assert!(raised(config(1), 5, &schemas).is_err());
+        // It is left out of config.toml while absent, and read back when present.
+        assert!(
+            !toml::to_string_pretty(&config(2))
+                .unwrap()
+                .contains("min_hyp_version")
+        );
+        let text = toml::to_string_pretty(&four).unwrap();
+        assert_eq!(toml::from_str::<Config>(&text).unwrap(), four);
     }
 }

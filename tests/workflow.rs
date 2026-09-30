@@ -37,20 +37,38 @@ fn evidence() -> Record {
         },
     )
 }
+/// A weakened assessment of `h` citing `e`; `f` is the criterion it names
+/// (any judgment may name one).
 fn assess(h: &Record, e: &Record, f: &Record) -> Record {
     let mut r = Record::new(
-        "Falsified",
+        "Weakened",
         Data::Assessment {
             hypothesis: h.id.clone(),
-            judgment: Judgment::Falsified,
-            confidence: Some(0.1),
+            judgment: Judgment::Weakened,
+            confidence: Some(0.2),
             evidence: vec![e.id.clone()],
             criterion: Some(f.id.clone()),
             based_on: String::new(),
             supersedes: vec![],
         },
     );
+    r.body = "The observation counts against the hypothesis.".into();
+    r
+}
+/// `assess` as falsified: `e` must meet criterion `f` (a supports link to it).
+fn falsify(h: &Record, e: &Record, f: &Record) -> Record {
+    let mut r = assess(h, e, f);
+    r.title = "Falsified".into();
     r.body = "The failure satisfies the stated rejection criterion.".into();
+    if let Data::Assessment {
+        judgment,
+        confidence,
+        ..
+    } = &mut r.data
+    {
+        *judgment = Judgment::Falsified;
+        *confidence = Some(0.1);
+    }
     r
 }
 fn link(from: &Record, to: &Record, relation: Relation) -> Record {
@@ -88,8 +106,8 @@ fn complete_workflow_preserves_assessment_and_detects_new_evidence() {
     create(&store, &f);
     let e = evidence();
     create(&store, &e);
-    create(&store, &link(&e, &h, Relation::Contradicts));
-    let a = assess(&h, &e, &f);
+    create(&store, &link(&e, &f, Relation::Supports));
+    let a = falsify(&h, &e, &f);
     create(&store, &a);
     let s = store.snapshot().unwrap();
     assert_eq!(s.hypotheses[&h.id].judgment, Judgment::Falsified);
@@ -100,10 +118,7 @@ fn complete_workflow_preserves_assessment_and_detects_new_evidence() {
     let s = store.snapshot().unwrap();
     assert!(s.hypotheses[&h.id].needs_review);
     assert_eq!(s.hypotheses[&h.id].judgment, Judgment::Falsified);
-    let mut a2 = assess(&h, &e2, &f);
-    if let Data::Assessment { judgment, .. } = &mut a2.data {
-        *judgment = Judgment::Weakened;
-    }
+    let a2 = assess(&h, &e2, &f);
     create(&store, &a2);
     let s = store.snapshot().unwrap();
     assert!(!s.hypotheses[&h.id].needs_review);
@@ -140,6 +155,17 @@ fn assessment_may_cite_only_evidence_already_linked() {
         .unwrap_err();
     assert_eq!(hyp::cli::exit_code(&err), 1, "{err:#}");
     assert!(format!("{err:#}").contains("earlier write"), "{err:#}");
+    // Nor an archived criterion.
+    update(&store, &i.f.id, |r| r.archived = true);
+    let err = rejected(
+        &store,
+        Change::create_seen(falsify(&i.h, &i.e, &i.f), &store.snapshot().unwrap()),
+    );
+    assert!(
+        err.contains(&format!("criterion {} is archived", i.f.id)),
+        "{err}"
+    );
+    update(&store, &i.f.id, |r| r.archived = false);
     // An archived link does not count.
     let criterion_link = link(&unlinked, &i.f, Relation::Supports);
     create(&store, &criterion_link);
@@ -445,7 +471,7 @@ fn investigation_requires_criterion_and_referenced_objects_cannot_disappear() {
 fn falsification_requires_evidence_and_criterion() {
     let (_d, store) = project();
     let i = investigation(&store);
-    let mut a = assess(&i.h, &i.e, &i.f);
+    let mut a = falsify(&i.h, &i.e, &i.f);
     if let Data::Assessment { criterion, .. } = &mut a.data {
         *criterion = None;
     }
@@ -454,6 +480,76 @@ fn falsification_requires_evidence_and_criterion() {
         err.contains("a falsified assessment must name the falsification criterion"),
         "{err}"
     );
+}
+/// HYPO-0082: falsified rests on an observation that meets the criterion
+/// it names: cited evidence with an active supports link to that criterion.
+/// Evidence against the hypothesis itself, or against the criterion (it was
+/// not met), does not count. Checked on creation only, like the other
+/// judgment rules: a stored falsified assessment stays valid when the link
+/// is archived later.
+#[test]
+fn falsified_must_cite_evidence_that_meets_its_criterion() {
+    let (_d, store) = project();
+    let i = investigation(&store);
+    let refused = |store: &Store| {
+        let err = rejected(
+            store,
+            Change::create_seen(falsify(&i.h, &i.e, &i.f), &store.snapshot().unwrap()),
+        );
+        assert!(
+            err.contains(&format!(
+                "a falsified assessment must cite evidence that meets its criterion {}",
+                i.f.id
+            )) && err.contains("The rule: "),
+            "{err}"
+        );
+    };
+    // i.e contradicts the hypothesis directly: against it, but not the criterion.
+    refused(&store);
+    let not_met = link(&i.e, &i.f, Relation::Contradicts);
+    create(&store, &not_met);
+    refused(&store);
+    // Another observation meets it, but is not cited.
+    let other = evidence();
+    create(&store, &other);
+    create(&store, &link(&other, &i.f, Relation::Supports));
+    refused(&store);
+    // Nor an archived criterion.
+    update(&store, &i.f.id, |r| r.archived = true);
+    let err = rejected(
+        &store,
+        Change::create_seen(falsify(&i.h, &i.e, &i.f), &store.snapshot().unwrap()),
+    );
+    assert!(
+        err.contains(&format!("criterion {} is archived", i.f.id)),
+        "{err}"
+    );
+    update(&store, &i.f.id, |r| r.archived = false);
+    // An archived link does not count.
+    let meets = link(&i.e, &i.f, Relation::Supports);
+    create(&store, &meets);
+    update(&store, &meets.id, |r| r.archived = true);
+    refused(&store);
+    // Restoring the link may come earlier in the same batch.
+    let seen = store.snapshot().unwrap();
+    let restore = Change::Archive {
+        id: meets.id.clone(),
+        archived: false,
+        expected_revision: seen.get(&meets.id).unwrap().revision.clone(),
+    };
+    let falsified = falsify(&i.h, &i.e, &i.f);
+    let s = store
+        .commit(
+            vec![restore, Change::create_seen(falsified.clone(), &seen)],
+            None,
+        )
+        .unwrap();
+    assert_eq!(s.hypotheses[&i.h.id].judgment, Judgment::Falsified);
+    // Stored, it stays valid without the link.
+    update(&store, &meets.id, |r| r.archived = true);
+    let s = store.snapshot().unwrap();
+    assert!(s.diagnostics.is_empty(), "{:?}", s.diagnostics);
+    assert!(s.get(&falsified.id).is_some());
 }
 #[test]
 fn dependency_cycles_rejected_but_competing_hypotheses_allowed() {
@@ -1109,7 +1205,7 @@ fn own_earlier_changes_in_the_batch_are_not_conflicts() {
 }
 
 #[test]
-fn stated_records_deleted_after_the_read_are_conflicts() {
+fn stated_records_that_do_not_exist_are_not_found() {
     let (_d, store) = project();
     let i = investigation(&store);
     let archive_and_delete = |id: &str| {
@@ -1127,12 +1223,50 @@ fn stated_records_deleted_after_the_read_are_conflicts() {
             .unwrap();
     };
     let seen = store.snapshot().unwrap();
+    // HYPO-0087: a typo'd ID never existed. As a conflict, a caller following
+    // the contract would re-read and retry it forever.
+    let h = seen.get(&i.h.id).unwrap();
+    let typo = format!("H-{}", uuid::Uuid::new_v4());
+    for change in [
+        Change::Patch {
+            id: typo.clone(),
+            expected_revision: h.revision.clone(),
+            set: serde_json::Map::from_iter([("title".to_string(), "Retitled".into())]),
+        },
+        Change::Archive {
+            id: "H-0000".into(),
+            archived: true,
+            expected_revision: h.revision.clone(),
+        },
+        Change::Delete {
+            id: typo.clone(),
+            expected_revision: h.revision.clone(),
+        },
+    ] {
+        let err = not_found(&store, change);
+        assert!(err.contains("does not exist"), "{err}");
+    }
+    let mut typoed = Change::create_seen(run(&i), &seen);
+    if let Change::Create {
+        expected: Some(e), ..
+    } = &mut typoed
+    {
+        let revision = e.revisions.remove(&i.x.id).unwrap();
+        e.revisions.insert(typo.clone(), revision);
+    }
+    let err = not_found(&store, typoed);
+    assert!(
+        err.contains(&format!("expected.revisions[\"{typo}\"]")),
+        "{err}"
+    );
+    // Deleted since the read: without tombstones indistinguishable from a
+    // typo, and equally not there to change.
     let run = Change::create_seen(run(&i), &seen);
     let gap = seen.get(&i.x.id).unwrap().clone();
     archive_and_delete(&i.x.id);
-    let err = conflict(&store, run);
+    let err = not_found(&store, run);
     assert!(err.contains(&format!("{} does not exist", i.x.id)), "{err}");
-    let err = conflict(
+    let err = not_found(
         &store,
         Change::Update {
             record: gap.record,
@@ -1140,6 +1274,20 @@ fn stated_records_deleted_after_the_read_are_conflicts() {
         },
     );
     assert!(err.contains("does not exist"), "{err}");
+}
+/// Commits `change` alone and returns the error, asserting it is kind
+/// not_found (exit code 1) and that nothing was written.
+fn not_found(store: &Store, change: Change) -> String {
+    let before = store.snapshot().unwrap().revision;
+    let err = store.commit(vec![change], None).unwrap_err();
+    assert_eq!(hyp::cli::exit_code(&err), 1, "{err:#}");
+    assert_eq!(
+        hyp::error::kind_of(&err),
+        hyp::error::ErrorKind::NotFound,
+        "{err:#}"
+    );
+    assert_eq!(store.snapshot().unwrap().revision, before);
+    format!("{err:#}")
 }
 
 #[test]
@@ -1469,7 +1617,8 @@ fn run_is_a_conflict_when_cited_evidence_changed_after_it_was_read() {
             None,
         )
         .unwrap();
-    let err = conflict(&store, stale);
+    // Gone since the read: not found (HYPO-0087), not a conflict to retry.
+    let err = not_found(&store, stale);
     assert!(
         err.contains(&format!("{} does not exist", observed.id)),
         "{err}"

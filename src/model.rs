@@ -37,7 +37,10 @@ impl Judgment {
                 "at least one evidence ID linked to the hypothesis or its active criteria \
                  or predictions"
             }
-            Self::Falsified => "linked evidence and the falsification criterion it meets",
+            Self::Falsified => {
+                "a falsification criterion of the hypothesis and linked evidence that \
+                 meets it (an active supports link from the evidence to that criterion)"
+            }
         }
     }
     /// Every judgment's `requirement`, judgments with the same one together:
@@ -190,8 +193,8 @@ pub enum Data {
         #[serde(default)]
         resolved: bool,
         /// The evidence that answered the question (HYPO-0076); only on a
-        /// resolved gap. Not written while empty, so that files of gaps
-        /// without it stay readable by hyp versions before the field.
+        /// resolved gap. Needs schema 2 (`Data::schema`); not written while
+        /// empty, so a notebook without it stays schema 1.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         resolved_by: Vec<String>,
     },
@@ -228,6 +231,14 @@ impl Data {
     }
     pub fn prefix(&self) -> &'static str {
         self.kind_value().prefix()
+    }
+    /// The first notebook schema (`store::SCHEMAS`) whose readers can load
+    /// this record's file: 2 for a gap with `resolved_by`, otherwise 1.
+    pub fn schema(&self) -> u32 {
+        match self {
+            Self::Gap { resolved_by, .. } if !resolved_by.is_empty() => 2,
+            _ => 1,
+        }
     }
     pub fn owner(&self) -> Option<&str> {
         match self {
@@ -605,7 +616,8 @@ pub struct Snapshot {
     pub objects: Vec<Entry>,
     pub diagnostics: Vec<Diagnostic>,
     pub hypotheses: BTreeMap<String, HypothesisState>,
-    /// Hypothesis ID -> `Snapshot::evidence_bearings`, for the WebUI.
+    /// Hypothesis ID -> `Snapshot::evidence_bearings`, for the WebUI and
+    /// in `hyp export --format json`.
     #[serde(default)]
     pub bearings: BTreeMap<String, Vec<EvidenceBearing>>,
     pub revision: String,
@@ -677,8 +689,8 @@ impl Snapshot {
                         letters.join(", ")
                     )
                 };
-                bail!(Classified::new(
-                    ErrorKind::NotFound,
+                bail!(Classified::not_found(
+                    prefix,
                     format!("no record with ID (prefix) {prefix:?}{hint}")
                 ))
             }
@@ -1105,9 +1117,11 @@ impl Snapshot {
                 out.require(based_on.len() == 64, Invalid, || {
                     "assessment requires a state fingerprint".into()
                 });
+                // Only presence: whether the evidence meets the criterion
+                // depends on links, which may change later (`validate_new`).
                 if *judgment == Judgment::Falsified {
                     out.require(criterion.is_some() && !evidence.is_empty(), Invalid, || {
-                        "falsified requires a criterion and evidence".into()
+                        format!("falsified requires {}", Judgment::Falsified.requirement())
                     });
                 }
                 if let Some(c) = criterion {
@@ -1250,7 +1264,9 @@ impl Snapshot {
     /// Rules for creating record `r` in this state, on top of `validate`.
     /// They are not checked on stored records: assessments are immutable
     /// history, and archiving a link later must not invalidate one. Every
-    /// judgment except untested cites evidence, and only `linked_evidence`.
+    /// judgment except untested cites evidence, and only `linked_evidence`;
+    /// falsified cites evidence that meets its criterion (HYPO-0082). Each
+    /// error quotes `Judgment::rule`.
     pub fn validate_new(&self, r: &Record) -> Result<()> {
         let Data::Assessment {
             hypothesis,
@@ -1284,6 +1300,35 @@ impl Snapshot {
                      and an assessment may cite only linked evidence. Link it first \
                      (hyp link {id} {hypothesis} --relation supports|contradicts|qualifies \
                      --reason \"...\"), then re-read and assess"
+                );
+            }
+        }
+        // A missing criterion or cited evidence, or a criterion of another
+        // hypothesis, is reported by `validate`, which names the actual
+        // problem; whether the evidence meets the criterion is not a question yet.
+        let all_cited_exist = evidence.iter().all(|id| self.get(id).is_some());
+        if let (Judgment::Falsified, Some(criterion), true) = (judgment, criterion, all_cited_exist)
+        {
+            if let Some(c) = self
+                .get(criterion)
+                .filter(|c| c.record.data.owner() == Some(hypothesis))
+            {
+                ensure!(
+                    !c.record.archived,
+                    "criterion {criterion} is archived, and a falsified assessment rests on an \
+                     active criterion (hyp restore {criterion}). The rule: {rule}"
+                );
+                let meets = |b: &Bearing| b.via == *criterion && b.stance == Stance::Against;
+                ensure!(
+                    self.evidence_bearings(hypothesis).iter().any(|e| {
+                        evidence.contains(&e.evidence) && e.bearings.iter().any(meets)
+                    }),
+                    "a falsified assessment must cite evidence that meets its criterion \
+                     {criterion}: none of the cited evidence has an active supports link to it \
+                     (evidence linked to the hypothesis, or against the criterion, does not \
+                     meet it). Link the observation that meets it (hyp link E-… {criterion} \
+                     --relation supports --reason \"...\"), then re-read and assess. \
+                     The rule: {rule}"
                 );
             }
         }

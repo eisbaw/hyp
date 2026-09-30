@@ -756,7 +756,8 @@ function formFields(kind, owner, r = {}) {
         "",
         false,
         true,
-      );
+      ) +
+      '<p class="small">Required for falsified, and one cited observation must meet it: evidence recorded on the criterion (linked to it as supports). Evidence merely against the hypothesis does not.</p>';
   f +=
     field(
       "body",

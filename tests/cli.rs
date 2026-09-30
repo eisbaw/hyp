@@ -1108,6 +1108,127 @@ fn apply(project: &Path, json: bool, extra: &[&str], changes: &str) -> Output {
     std::io::Write::write_all(&mut child.stdin.take().unwrap(), changes.as_bytes()).unwrap();
     child.wait_with_output().unwrap()
 }
+/// HYPO-0087: an ID in `hyp apply` that names no record is kind not_found
+/// (exit 1), not a conflict (exit 3) that an agent would re-read and retry
+/// forever.
+#[test]
+fn apply_with_a_mistyped_id_is_not_found_not_a_conflict() {
+    let project = demo();
+    let p = project.path();
+    let h = first(p, "hypothesis");
+    let revision = serde_json::from_str::<serde_json::Value>(&ok(p, &["--json", "show", &h]))
+        .unwrap()["entry"]["revision"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // The last hex digit changed: the shape of a real ID, but no record.
+    let last = h.chars().last().unwrap();
+    let typo = format!(
+        "{}{}",
+        &h[..h.len() - 1],
+        if last == '0' { '1' } else { '0' }
+    );
+    let batch = serde_json::json!([{"op": "patch", "id": typo, "expected_revision": revision,
+                                    "set": {"title": "Retitled"}}]);
+    let out = apply(p, true, &[], &batch.to_string());
+    let stderr = stderr_of(&out);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    let error: serde_json::Value = serde_json::from_str(&stderr).unwrap();
+    assert_eq!(error["kind"], "not_found", "{stderr}");
+    assert!(
+        error["error"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("{typo} does not exist")),
+        "{stderr}"
+    );
+    assert_eq!(error["ids"], serde_json::json!([typo]), "{stderr}");
+}
+/// The demo hypothesis with a criterion, with its criterion, its linked
+/// evidence and its review token, as `hyp --json status` and `show` give them.
+fn demo_claim(p: &Path) -> (String, String, String, String) {
+    let status: serde_json::Value = serde_json::from_str(&ok(p, &["--json", "status"])).unwrap();
+    let row = status["hypotheses"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| !h["criteria"].as_array().unwrap().is_empty())
+        .unwrap();
+    let text = |v: &serde_json::Value| v.as_str().unwrap().to_string();
+    let h = text(&row["id"]);
+    let shown: serde_json::Value = serde_json::from_str(&ok(p, &["--json", "show", &h])).unwrap();
+    (
+        h,
+        text(&row["criteria"][0]),
+        text(&row["linked_evidence"][0]),
+        text(&shown["state"]["review_token"]),
+    )
+}
+/// A falsified assessment of `h` by `criterion`, citing `evidence`, stating `token`.
+fn falsified(h: &str, criterion: &str, evidence: &[&str], token: &str) -> String {
+    serde_json::json!([{"op": "create",
+        "record": {"kind": "assessment", "title": "Falsified", "body": "Why", "hypothesis": h,
+                   "judgment": "falsified", "evidence": evidence, "criterion": criterion},
+        "expected": {"hypotheses": {h: {"review_token": token}}}}])
+    .to_string()
+}
+/// `ID` with its last hex digit changed: the shape of a real ID, but no record.
+fn mistyped(id: &str) -> String {
+    let last = if id.ends_with('0') { '1' } else { '0' };
+    format!("{}{last}", &id[..id.len() - 1])
+}
+/// HYPO-0087: a create whose reference fields name an ID that matches no
+/// record, before or within the batch, is not_found with that ID in `ids`,
+/// as the CLI answers for the same ID; a falsified assessment citing it is
+/// told so, not that its evidence does not meet the criterion.
+#[test]
+fn a_create_naming_an_id_that_matches_nothing_is_not_found_with_its_ids() {
+    let project = demo();
+    let p = project.path();
+    let (h, f, e, token) = demo_claim(p);
+    let typo = mistyped(&e);
+    let not_found = |out: Output, id: &str| {
+        let stderr = stderr_of(&out);
+        assert_eq!(out.status.code(), Some(1), "{stderr}");
+        let error: serde_json::Value = serde_json::from_str(&stderr).unwrap();
+        assert_eq!(error["kind"], "not_found", "{stderr}");
+        assert_eq!(error["ids"], serde_json::json!([id]), "{stderr}");
+        let message = error["error"].as_str().unwrap();
+        assert!(message.contains(id), "{message}");
+        assert!(!message.contains("meets its criterion"), "{message}");
+    };
+    not_found(
+        apply(p, true, &[], &falsified(&h, &f, &[&e, &typo], &token)),
+        &typo,
+    );
+    let link = serde_json::json!([{"op": "create",
+        "record": {"kind": "link", "title": "Meets", "body": "Why", "from": e,
+                   "to": "F-nope", "relation": "supports"}}]);
+    not_found(apply(p, true, &[], &link.to_string()), "F-nope");
+    // Named within the batch, by a batch-local reference, it exists.
+    let batch = serde_json::json!([
+        {"op": "create", "record": {"kind": "evidence", "id": "@seen", "title": "Seen",
+                                    "body": "Observed", "source": "log"}},
+        {"op": "create", "record": {"kind": "link", "title": "Meets", "body": "Why",
+                                    "from": "@seen", "to": f, "relation": "supports"}}]);
+    let out = apply(p, true, &[], &batch.to_string());
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    // The CLI answers the same.
+    not_found(run(p, &["--json", "show", &typo]), &typo);
+}
+/// HYPO-0082: whether cited evidence meets the criterion is asked only of
+/// evidence that exists; a prefix gets the rule it breaks.
+#[test]
+fn a_falsified_citing_evidence_by_prefix_is_told_to_use_full_ids() {
+    let project = demo();
+    let p = project.path();
+    let (h, f, e, token) = demo_claim(p);
+    let out = apply(p, true, &[], &falsified(&h, &f, &[&e[..6]], &token));
+    let stderr = stderr_of(&out);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("must use full IDs"), "{stderr}");
+    assert!(!stderr.contains("meets its criterion"), "{stderr}");
+}
 /// `{"written": [{"id", "kind", "revision"}], "revision"}` and nothing else
 /// (HYPO-0028): agents parse it on every write, so it must not grow with the
 /// project.
@@ -2916,9 +3037,18 @@ fn status_shows_where_each_active_hypothesis_stands() {
     assert_eq!(rows[0]["id"], cache, "needs review first: {json}");
     assert_eq!(rows[0]["needs_review"], true);
     assert_eq!(rows[0]["judgment"], "weakened");
-    assert_eq!(rows[0]["criteria"], 1);
+    // HYPO-0082: what a row has is listed by ID, never counted.
+    let ids = |v: &serde_json::Value, prefix: &str| -> Vec<String> {
+        let list = v.as_array().unwrap_or_else(|| panic!("a list: {v}"));
+        list.iter()
+            .map(|id| id.as_str().unwrap().to_string())
+            .inspect(|id| assert!(id.starts_with(prefix) && id.len() == 38, "{id}"))
+            .collect()
+    };
+    assert_eq!(ids(&rows[0]["criteria"], "F-").len(), 1);
     assert_eq!(rows[0]["missing_criterion"], false);
-    assert_eq!(rows[0]["linked_evidence"], 1);
+    assert_eq!(ids(&rows[0]["linked_evidence"], "E-").len(), 1);
+    assert_eq!(rows[1]["criteria"], serde_json::json!([]));
     assert_eq!(rows[0]["open_gaps"], serde_json::json!([]));
     assert_eq!(rows[1]["id"], bus);
     assert_eq!(rows[1]["missing_criterion"], true);
@@ -3057,6 +3187,59 @@ fn qualifying_links_do_not_make_an_observation_mixed() {
     assert!(groups["against H"].contains("Meets the criterion, with a caveat"));
     assert!(groups["qualifies H"].contains("Only a caveat"));
     assert!(groups["mixed: its links disagree"].contains("Matches the prediction"));
+}
+
+/// HYPO-0082: an investigation is not "finished" while an archived
+/// hypothesis still needs review, and linked evidence counts only records
+/// that loaded (a malformed evidence file is `hyp check`'s to report).
+#[test]
+fn status_is_not_finished_with_an_archived_review_and_skips_unloaded_evidence() {
+    let project = demo();
+    let p = project.path();
+    let (cache, bus) = (hypothesis_titled(p, "cache"), hypothesis_titled(p, "bus"));
+    let json: serde_json::Value = serde_json::from_str(&ok(p, &["--json", "status"])).unwrap();
+    let row = |json: &serde_json::Value, id: &str| -> serde_json::Value {
+        json["hypotheses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == id)
+            .unwrap_or_else(|| panic!("{id} in {json}"))
+            .clone()
+    };
+    let e = row(&json, &bus)["linked_evidence"][0]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let file = p.join(format!("hyp/evidence/{e}.md"));
+    let original = read(&file);
+    std::fs::write(&file, "broken").unwrap();
+    let json: serde_json::Value = serde_json::from_str(&ok(p, &["--json", "status"])).unwrap();
+    assert_eq!(row(&json, &bus)["linked_evidence"], serde_json::json!([]));
+    let text = ok(p, &["status"]);
+    let line = text
+        .lines()
+        .skip_while(|l| !l.starts_with(&bus[..10]))
+        .nth(1);
+    assert!(line.unwrap().contains("linked evidence 0"), "{text}");
+    std::fs::write(&file, original).unwrap();
+
+    // Archiving the assessed hypothesis changes its basis: it needs review.
+    ok(p, &["archive", &cache]);
+    ok(p, &["set", &bus, "--lifecycle", "closed"]);
+    let json: serde_json::Value = serde_json::from_str(&ok(p, &["--json", "status"])).unwrap();
+    assert_eq!(json["hypotheses"], serde_json::json!([]));
+    assert_eq!(
+        json["not_shown"],
+        serde_json::json!({"closed": 1, "archived": 1, "needs_review": 1})
+    );
+    let header = ok(p, &["status"]).lines().next().unwrap().to_string();
+    assert!(header.contains("1 archived needs review"), "{header}");
+    assert!(!header.contains("finished"), "{header}");
+    ok(p, &["restore", &cache]);
+    ok(p, &["set", &cache, "--lifecycle", "closed"]);
+    let header = ok(p, &["status"]).lines().next().unwrap().to_string();
+    assert!(header.contains("investigation finished"), "{header}");
 }
 
 /// A closed hypothesis whose basis changed after its assessment still needs
@@ -3625,4 +3808,153 @@ fn changing_a_record_created_in_the_same_batch_is_invalid_input() {
         }
     }
     assert_eq!(ok(p, &["list", "--all"]), "", "nothing written");
+}
+
+/// decision-0004 / HYPO-0085: the notebook's schema, from `hyp/config.toml`.
+fn schema_of(p: &Path) -> i64 {
+    let config: toml::Table = toml::from_str(&read(p.join("hyp/config.toml"))).unwrap();
+    config["schema_version"].as_integer().unwrap()
+}
+/// A schema-1 notebook stays byte-for-byte schema 1 through reads and
+/// writes, until a write first stores something only schema 2 holds (a
+/// gap's `resolved_by`); then config.toml says 2, and it never goes back.
+#[test]
+fn a_schema_1_notebook_is_raised_to_2_only_by_the_first_resolved_by() {
+    let project = demo();
+    let p = project.path();
+    let config = || read(p.join("hyp/config.toml"));
+    let original = config();
+    assert_eq!(schema_of(p), 1, "{original}");
+    let h = first(p, "hypothesis");
+    let gap = ok(p, &["gap", &h, "Is the clock involved?"]);
+    let gap = gap.trim();
+    ok(p, &["set", gap, "--resolved", "true"]);
+    ok(p, &["status"]);
+    ok(p, &["--json", "export", "--format", "json"]);
+    ok(p, &["check"]);
+    assert_eq!(config(), original, "reads and schema-1 writes keep it");
+    let e = first(p, "evidence");
+    ok(p, &["set", gap, "--resolved", "true", "--by", &e]);
+    assert_eq!(schema_of(p), 2, "{}", config());
+    assert_eq!(
+        config().replace("schema_version = 2", "schema_version = 1"),
+        original,
+        "only the schema changes"
+    );
+    ok(p, &["set", gap, "--resolved", "false"]);
+    assert_eq!(schema_of(p), 2, "never lowered");
+    ok(p, &["check"]);
+}
+/// The raise is part of the write's journal: a write interrupted after the
+/// journal was saved is rolled forward, config.toml included, by the next
+/// hyp that takes the lock.
+#[test]
+fn an_interrupted_schema_raise_is_rolled_forward_with_the_records() {
+    let project = demo();
+    let p = project.path();
+    let raised =
+        read(p.join("hyp/config.toml")).replace("schema_version = 1", "schema_version = 2");
+    let journal = serde_json::json!({ "config.toml": raised });
+    std::fs::write(p.join(".hyp/transaction.json"), journal.to_string()).unwrap();
+    ok(p, &["list"]);
+    assert_eq!(schema_of(p), 2);
+    assert!(!p.join(".hyp/transaction.json").exists());
+}
+/// A notebook of a schema this hyp does not know is refused up front, with
+/// one error naming the version to upgrade to, not one "unknown field" per
+/// file; new config keys of that schema do not get in the way.
+#[test]
+fn a_notebook_of_a_newer_schema_is_refused_with_the_version_to_upgrade_to() {
+    let project = demo();
+    let p = project.path();
+    let before = ok(p, &["--json", "export", "--format", "json"]);
+    let refused = |config: &str, upgrade: &str| {
+        std::fs::write(p.join("hyp/config.toml"), config).unwrap();
+        for args in [
+            &["--json", "list"][..],
+            &["--json", "status"],
+            &["--json", "add", "Written by an older hyp"],
+        ] {
+            let out = run(p, args);
+            let stderr = stderr_of(&out);
+            assert_eq!(out.status.code(), Some(1), "{args:?}: {stderr}");
+            let error: serde_json::Value = serde_json::from_str(&stderr).unwrap();
+            assert_eq!(error["kind"], "unsupported_schema", "{stderr}");
+            let message = error["error"].as_str().unwrap();
+            for part in ["uses schema 3", "reads schemas 1 to 2", upgrade] {
+                assert!(message.contains(part), "{part:?} in {message}");
+            }
+        }
+    };
+    refused(
+        "schema_version = 3\nname = \"demo\"\nmin_hyp_version = \"0.3.0\"\nnew_setting = true\n",
+        "upgrade hyp to >= 0.3.0",
+    );
+    refused(
+        "schema_version = 3\nname = \"demo\"\n",
+        &format!("newer than {}", env!("CARGO_PKG_VERSION")),
+    );
+    std::fs::write(
+        p.join("hyp/config.toml"),
+        "schema_version = 2\nname = \"demo\"\n",
+    )
+    .unwrap();
+    assert_eq!(
+        ok(p, &["--json", "export", "--format", "json"]),
+        before,
+        "nothing written"
+    );
+}
+/// Strict as before for the schemas this hyp reads: an unknown key, a
+/// schema that never existed, or text that is not TOML is invalid input.
+#[test]
+fn a_config_with_an_unknown_key_or_garbage_is_invalid() {
+    let project = demo();
+    let p = project.path();
+    for (config, part) in [
+        (
+            "schema_version = 2\nname = \"demo\"\ncolour = \"red\"\n",
+            "unknown field `colour`",
+        ),
+        (
+            "schema_version = 0\nname = \"demo\"\n",
+            "schema_version 0 does not exist",
+        ),
+        ("schema_version = [\n", "invalid"),
+        ("name = \"demo\"\n", "missing field `schema_version`"),
+    ] {
+        std::fs::write(p.join("hyp/config.toml"), config).unwrap();
+        let out = run(p, &["--json", "list"]);
+        let stderr = stderr_of(&out);
+        assert_eq!(out.status.code(), Some(1), "{config}: {stderr}");
+        let error: serde_json::Value = serde_json::from_str(&stderr).unwrap();
+        assert_eq!(error["kind"], "invalid_input", "{config}: {stderr}");
+        let message = error["error"].as_str().unwrap();
+        assert!(message.contains("hyp/config.toml"), "{message}");
+        assert!(message.contains(part), "{part:?} in {message}");
+    }
+}
+/// The schema table in code names released hyp versions no newer than
+/// this one, and the README lists the same rows.
+#[test]
+fn the_schema_table_matches_this_version_and_the_readme() {
+    let parse = |v: &str| -> Vec<u64> { v.split('.').map(|n| n.parse().unwrap()).collect() };
+    let schemas = hyp::store::SCHEMAS;
+    let (_, newest) = schemas[schemas.len() - 1];
+    assert!(parse(newest) <= parse(env!("CARGO_PKG_VERSION")));
+    let readme = include_str!("../README.md");
+    let rows: Vec<Vec<&str>> = readme
+        .lines()
+        .filter(|l| l.starts_with('|'))
+        .map(|l| l.split('|').map(str::trim).collect())
+        .collect();
+    for (i, (schema, version)) in schemas.iter().enumerate() {
+        assert_eq!(*schema, i as u32 + 1, "consecutive from 1");
+        let (schema, version) = (schema.to_string(), format!("`{version}`"));
+        assert!(
+            rows.iter()
+                .any(|r| r.len() > 3 && r[1] == schema && r[2] == version),
+            "README schema table lacks | {schema} | {version} |"
+        );
+    }
 }

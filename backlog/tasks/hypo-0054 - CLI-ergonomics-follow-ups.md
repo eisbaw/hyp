@@ -4,7 +4,7 @@ title: CLI ergonomics follow-ups
 status: To Do
 assignee: []
 created_date: '2026-09-30 12:18'
-updated_date: '2026-09-30 16:36'
+updated_date: '2026-09-30 21:10'
 labels:
   - cli
   - ux
@@ -35,4 +35,6 @@ From the human CLI batch 1 review: 'hyp set --title -' is not idempotent (re-run
 From the human CLI batch 2 review: an agent using --json cannot detect a no-op write without comparing revisions (consider exposing Written.changed in JSON); summary() pairs actions with written records by position, so extra records from attach would silently drop; nothing keeps the list of stdin-capable text arguments in sync when a new one is added; --confidence -0.5 without '=' is parsed by clap as a flag (misleading tip); the stdin hint names positional args TITLE but flags --body; kept edit copies live in $TMPDIR (mode 0600, may be wiped at reboot) — document.
 
 From the batch-2 confirmation (QA): an empty VISUAL (set but empty) counts as set, so EDITOR is ignored and sh -c ' "$1"' tries to execute the temp file (exit 126, confusing message); treat empty VISUAL/EDITOR as unset like git. Kept /tmp/hyp-edit-*.md copies accumulate. YAML syntax errors in hyp edit are not labelled as front-matter errors.
+
+From the schema batch confirmation: on an empty notebook a create whose reference field is an empty string fails as not_found with ids [""] (skip empty IDs in references_exist); the not_found message '(if you read it before, it has been deleted since)' reads oddly for a create or a typo.
 <!-- SECTION:NOTES:END -->

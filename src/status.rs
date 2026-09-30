@@ -6,7 +6,8 @@ use crate::model::*;
 use serde::Serialize;
 
 /// A listed hypothesis: an open one (not archived, not closed), or a
-/// closed one that needs review.
+/// closed one that needs review. What it has is listed by full ID, never
+/// counted: an agent acts on IDs, and a count is the list's length.
 #[derive(Debug, Serialize)]
 pub struct Row {
     pub id: String,
@@ -16,12 +17,14 @@ pub struct Row {
     pub confidence: Option<f64>,
     pub needs_review: bool,
     /// Active falsification criteria.
-    pub criteria: usize,
+    pub criteria: Vec<String>,
     pub untestable_reason: String,
     /// No active criterion and no untestable reason.
     pub missing_criterion: bool,
-    /// `Snapshot::linked_evidence`: what an assessment may cite.
-    pub linked_evidence: usize,
+    /// `Snapshot::linked_evidence` that loaded: what an assessment may
+    /// cite. Evidence whose file is missing or malformed is left out; `hyp
+    /// check` reports it.
+    pub linked_evidence: Vec<String>,
     /// Unresolved, active gaps (without `resolved_by`).
     pub open_gaps: Vec<GapRow>,
     /// Resolved, active gaps, with the evidence that resolved each.
@@ -93,9 +96,10 @@ pub fn report(s: &Snapshot) -> Report {
             continue;
         }
         let owned = |x: &&Entry| x.record.data.owner() == Some(r.id.as_str());
-        let criteria = active(|d| matches!(d, Data::Criterion { .. }))
+        let criteria: Vec<String> = active(|d| matches!(d, Data::Criterion { .. }))
             .filter(owned)
-            .count();
+            .map(|x| x.record.id.clone())
+            .collect();
         let (mut open_gaps, mut resolved_gaps) = (Vec::new(), Vec::new());
         for gap in active(|d| matches!(d, Data::Gap { .. })).filter(owned) {
             if let Data::Gap {
@@ -136,10 +140,18 @@ pub fn report(s: &Snapshot) -> Report {
             judgment: state.judgment,
             confidence: state.confidence,
             needs_review: state.needs_review,
-            criteria,
             untestable_reason: untestable_reason.trim().to_string(),
-            missing_criterion: criteria == 0 && untestable_reason.trim().is_empty(),
-            linked_evidence: s.linked_evidence(&r.id).len(),
+            missing_criterion: criteria.is_empty() && untestable_reason.trim().is_empty(),
+            criteria,
+            linked_evidence: s
+                .linked_evidence(&r.id)
+                .into_iter()
+                .filter(|id| {
+                    s.get(id)
+                        .is_some_and(|e| matches!(e.record.data, Data::Evidence { .. }))
+                })
+                .map(str::to_string)
+                .collect(),
             open_gaps,
             resolved_gaps,
             experiments_without_runs,
@@ -231,7 +243,8 @@ pub fn plain(report: &Report) -> String {
     if needs_review > 0 {
         header.push(format!("{needs_review} archived needs review"));
     }
-    if report.hypotheses.is_empty() && closed > 0 {
+    // Not finished while an archived hypothesis still needs review.
+    if report.hypotheses.is_empty() && closed > 0 && needs_review == 0 {
         header.push("investigation finished: hyp list shows the conclusions".into());
     }
     header.push(if report.writes_blocked {
@@ -271,8 +284,8 @@ pub fn plain(report: &Report) -> String {
             r.lifecycle,
             r.title
         ));
-        let criterion = if r.criteria > 0 {
-            format!("criteria {}", r.criteria)
+        let criterion = if !r.criteria.is_empty() {
+            format!("criteria {}", r.criteria.len())
         } else if r.missing_criterion {
             "no criterion".into()
         } else {
@@ -280,7 +293,7 @@ pub fn plain(report: &Report) -> String {
         };
         let mut line = format!(
             "  {criterion} · linked evidence {} · {}",
-            r.linked_evidence,
+            r.linked_evidence.len(),
             counted(
                 "open gaps",
                 &r.open_gaps.iter().map(|g| g.id.clone()).collect::<Vec<_>>()

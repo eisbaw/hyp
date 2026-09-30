@@ -228,7 +228,8 @@ pub enum Command {
         /// predictions (`hyp link` first). Required unless --status untested.
         #[arg(long, value_delimiter = ',')]
         evidence: Vec<String>,
-        /// The F- criterion the evidence meets (required for falsified).
+        /// The F- criterion the evidence meets (required for falsified: a
+        /// cited evidence must have a supports link to it).
         #[arg(long)]
         criterion: Option<String>,
         /// The rationale ('-' reads stdin).
@@ -424,7 +425,7 @@ based on; if that changed since, nothing is written and hyp exits 3. An
 assessment states its hypothesis's .state.review_token (`hyp --json show H-…`)
 and cites only evidence linked to the hypothesis or its criteria or
 predictions; every judgment except untested cites some, and falsified also a
-"criterion": "F-…":
+"criterion": "F-…" that one of them meets (links to with "supports"):
   [{"op": "create",
     "record": {"kind": "assessment", "title": "Weakened", "body": "Why …",
                "hypothesis": "H-…", "judgment": "weakened",

@@ -1,13 +1,15 @@
 //! The error kinds of the machine contract (decision-0002, HYPO-0078).
 //! `hyp --json` prints a failed command's error as `{"error", "kind"}`, plus
-//! `ids` for a conflict whose failing records are known, and the WebUI API
+//! `ids` for a conflict whose failing records are known or a `not_found`
+//! naming the IDs that matched nothing, and the WebUI API
 //! answers with the same body. The kind comes from the error's type anywhere
 //! in its chain, decided where the error arises, never from message text.
 use serde::Serialize;
 
 /// What an agent does next: re-read and retry (`Conflict`), fix the input
 /// (`InvalidInput`, `NotFound`, `AmbiguousId`), repair files first
-/// (`Blocked`), or look at the file system (`Io`).
+/// (`Blocked`), upgrade hyp (`UnsupportedSchema`), or look at the file
+/// system (`Io`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorKind {
@@ -22,23 +24,40 @@ pub enum ErrorKind {
     AmbiguousId,
     /// A diagnostic blocks every write (`Code::blocks_writes`).
     Blocked,
+    /// The notebook uses a schema newer than this hyp reads (decision-0004):
+    /// nothing is read or written until hyp is upgraded.
+    UnsupportedSchema,
     /// Reading or writing a file failed.
     Io,
 }
 
-/// An error whose kind its source decided. `Conflict` has its own type,
-/// which also carries the IDs.
+/// An error whose kind its source decided, with the IDs it is about when
+/// known (`not_found`: the given IDs that matched nothing). `Conflict` has
+/// its own type.
 #[derive(Debug)]
 pub struct Classified {
     pub kind: ErrorKind,
     pub message: String,
+    pub ids: Vec<String>,
 }
 impl Classified {
     pub fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
         Self {
             kind,
             message: message.into(),
+            ids: vec![],
         }
+    }
+    /// A `NotFound` for `id`, which matched no record.
+    pub fn not_found(id: &str, message: impl Into<String>) -> Self {
+        Self {
+            ids: vec![id.to_string()],
+            ..Self::new(ErrorKind::NotFound, message)
+        }
+    }
+    /// The outermost `Classified` in `err`'s chain: the one that decides its kind.
+    pub fn find(err: &anyhow::Error) -> Option<&Self> {
+        err.chain().find_map(|cause| cause.downcast_ref())
     }
 }
 impl std::fmt::Display for Classified {
@@ -95,10 +114,7 @@ pub fn kind_of(err: &anyhow::Error) -> ErrorKind {
     if Conflict::in_chain(err) {
         return ErrorKind::Conflict;
     }
-    if let Some(c) = err
-        .chain()
-        .find_map(|cause| cause.downcast_ref::<Classified>())
-    {
+    if let Some(c) = Classified::find(err) {
         return c.kind;
     }
     if err.chain().any(|cause| cause.is::<std::io::Error>()) {
@@ -107,12 +123,18 @@ pub fn kind_of(err: &anyhow::Error) -> ErrorKind {
     ErrorKind::InvalidInput
 }
 
-/// `{"error": message, "kind": kind}`, with `"ids"` for a conflict over
-/// known records: what `hyp --json` prints on stderr and the API answers.
+/// `{"error": message, "kind": kind}`, with `"ids"` when the error that
+/// decided the kind names records (a conflict's failed statements, a
+/// `not_found`'s unmatched IDs): what `hyp --json` prints on stderr and the
+/// API answers.
 pub fn to_json(err: &anyhow::Error) -> serde_json::Value {
     let mut body = serde_json::json!({"error": format!("{err:#}"), "kind": kind_of(err)});
-    if let Some(conflict) = Conflict::find(err).filter(|c| !c.ids.is_empty()) {
-        body["ids"] = serde_json::json!(conflict.ids);
+    let ids = match Conflict::find(err) {
+        Some(conflict) => &conflict.ids,
+        None => Classified::find(err).map_or(&[][..], |c| &c.ids),
+    };
+    if !ids.is_empty() {
+        body["ids"] = serde_json::json!(ids);
     }
     body
 }
