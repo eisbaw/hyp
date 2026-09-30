@@ -1,11 +1,11 @@
 ---
 id: HYPO-0036
 title: Skill guidance from the dogfood runs
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-09-30 02:26'
-updated_date: '2026-09-30 16:54'
+updated_date: '2026-09-30 17:08'
 labels:
   - agents
   - docs
@@ -25,7 +25,7 @@ Test-drive 2026-09-30: fresh Claude Code and Codex sessions, given only the inst
 <!-- AC:BEGIN -->
 - [x] #1 The skill says: short observation as the title (one line), details and raw output in --body or `hyp evidence attach`
 - [x] #2 The skill tells agents to search existing hypotheses first and to reuse evidence with `hyp link`
-- [ ] #3 A second dogfood run shows short evidence titles
+- [x] #3 A second dogfood run shows short evidence titles
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -68,3 +68,9 @@ Carried from human CLI batch 2 (HYPO-0058, 0059, 0063, 0068), 2026-09-30:
 
 - Review round 2: Example also marks the experiment completed and assesses H2 weakened with its own show and token (citing the contradicting link of E1); Commands shows evidence add on H-|P-|F-; Method says to archive a duplicate or mistaken record (hyp archive, undone by hyp restore); README says the Example commands are tested, prose and Commands block reviewed by hand. Drift test now asserts H1 closed/supported and H2 draft/weakened (one assessment each), none needs review, `hyp list --needs-review` prints nothing, and the experiment is completed. Red check: renaming --experiment-status to --exp-status failed the test; reverted.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Skill rewritten to the current contract with a drift test (8939ff2). Dogfood v2: Claude Code and Codex, given only the skill, resumed yesterday's notebook, continued the existing hypothesis instead of duplicating it, falsified it against its criterion, supported the timezone hypothesis, fixed and verified the bug, closed both, nothing needs review; evidence titles 42-65 chars with details in --body (AC #3). Friction filed as HYPO-0071..0077.
+<!-- SECTION:FINAL_SUMMARY:END -->
