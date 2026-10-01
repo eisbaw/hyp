@@ -172,12 +172,12 @@ Errors go to stderr (`--json`: `{"error", "kind"}`); decide by `kind`, not text.
 
 Never edit files under `hyp/` directly; use `hyp set ID` (`--title`, `--body`,
 `--tags`, ...); leave `hyp edit` to people. After an editor, merge or sync
-touched `hyp/`, run `hyp check`. A diagnostic's `path` and `code` identify it;
-its repair: `.repair.note`, then `.repair.commands` (argv, in the project dir).
-Prefer restoring a missing record (a sync may bring it) over deleting what
-refers to it. `malformed`, `attachment` block every write: fix them by hand;
-`invalid` all but `hyp set ID ...` making it valid. `changed_bytes` blocks
-writes relying on its bytes. A write adding a problem is refused (`.diagnostics`).
+touched `hyp/`, run `hyp check`; run a repair right after the check that printed
+it: `.repair.note`, then `.repair.commands` (argv, in the project dir). Prefer
+restoring a missing record (a sync may bring it) over deleting what refers to
+it. `malformed`, `attachment` block every write: fix them by hand; `invalid`
+all but `hyp set ID ...` making it valid; `changed_bytes`, writes relying on
+it. A refused write's `.diagnostics[]`: `change` (index), `path`, `code`.
 
 ## Example
 

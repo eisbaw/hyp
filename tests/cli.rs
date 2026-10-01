@@ -3828,6 +3828,29 @@ fn an_invalid_record_can_be_repaired_through_hyp() {
         {"op": "create", "record": {"kind": "hypothesis", "title": "Unrelated"}}]);
     let out = apply(p, true, &[], &changes.to_string());
     assert_eq!(json_error(&out)["kind"], "blocked", "{}", stderr_of(&out));
+    // The blocking diagnostics mark the change that names their record,
+    // whatever its position.
+    let change_of = |out: &Output, path: &str| {
+        let error = json_error(out);
+        let d = error["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["path"] == path)
+            .cloned()
+            .unwrap_or_else(|| panic!("{path}: {error}"));
+        d["change"].clone()
+    };
+    assert_eq!(change_of(&out, &h_path), 0);
+    assert_eq!(change_of(&out, &e_path), serde_json::Value::Null);
+    let changes = serde_json::json!([
+        {"op": "patch", "id": valid, "expected_revision": revision_of(p, &valid),
+         "set": {"tags": ["x"]}},
+        {"op": "patch", "id": h, "expected_revision": revision_of(p, &h),
+         "set": {"title": "Cron starts two backups"}}]);
+    let out = apply(p, true, &[], &changes.to_string());
+    assert_eq!(json_error(&out)["kind"], "blocked", "{}", stderr_of(&out));
+    assert_eq!(change_of(&out, &h_path), 1);
     // A write to the invalid record that leaves it invalid is refused,
     // naming what is still wrong.
     let out = run(p, &["--json", "set", &h, "--body", "Seen twice in ps"]);
@@ -4006,6 +4029,9 @@ fn an_unreadable_stored_observed_at_warns_and_does_not_block() {
     let dir = TempDir::new().unwrap();
     let p = dir.path();
     ok(p, &["init"]);
+    // A body a shell would misread: a leading dash, a newline, a command
+    // substitution, backticks, a semicolon and quotes.
+    let body = "-n Two PIDs; echo injected\nsaid 'twice' \"twice\" $(echo x) `id` \\ end";
     let e = ok(
         p,
         &[
@@ -4013,8 +4039,7 @@ fn an_unreadable_stored_observed_at_warns_and_does_not_block() {
             "Backup ran twice",
             "--source",
             "cron.log",
-            "--body",
-            "Two PIDs",
+            &format!("--body={body}"),
         ],
     )
     .trim()
@@ -4029,9 +4054,18 @@ fn an_unreadable_stored_observed_at_warns_and_does_not_block() {
         .to_string();
     std::fs::write(&file, raw.replace(&at, "observed_at: last tuesday night")).unwrap();
 
-    // Writable: other records, and other fields of this one.
+    // Writable: other records, and other fields of this one, also by an
+    // update that carries the stored value through unchanged.
     ok(p, &["observe", "Backup log rotated", "--source", "ls"]);
     ok(p, &["set", &e, "--tags", "cron"]);
+    let mut record = record_of(p, &e);
+    assert_eq!(record["observed_at"], "last tuesday night");
+    record["locator"] = "02:00".into();
+    let update = serde_json::json!([{"op": "update", "record": record,
+        "expected_revision": revision_of(p, &e)}]);
+    let out = apply(p, false, &[], &update.to_string());
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    assert_eq!(record_of(p, &e)["locator"], "02:00");
     // hyp check warns; only --strict fails on it.
     let d = diagnostics_of(p, &path);
     assert_eq!(codes(&d), ["bad_observed_at"], "{d:?}");
@@ -4056,15 +4090,53 @@ fn an_unreadable_stored_observed_at_warns_and_does_not_block() {
         json_error(&out)["diagnostics"][0]["code"],
         "bad_observed_at"
     );
+    // The plain repair line is one shell command on one line that a shell
+    // parses back into exactly the argv `--json` gives.
+    let argv = diagnostics_of(p, &path)[0]["repair"]["commands"][0].clone();
+    let plain = ok(p, &["check"]);
+    let lines: Vec<&str> = plain
+        .lines()
+        .skip_while(|l| !l.contains(&path))
+        .skip(1)
+        .take_while(|l| l.starts_with("  "))
+        .filter_map(|l| l.strip_prefix("  repair: "))
+        .collect();
+    assert_eq!(lines.len(), 1, "{plain}");
+    let parsed = Command::new("bash")
+        .current_dir(p)
+        .arg("-c")
+        .arg(format!("printf '%s\\0' {}", lines[0]))
+        .output()
+        .unwrap();
+    assert!(parsed.status.success(), "{}", stderr_of(&parsed));
+    let words: Vec<String> = String::from_utf8(parsed.stdout)
+        .unwrap()
+        .split_terminator('\0')
+        .map(str::to_string)
+        .collect();
+    assert_eq!(serde_json::json!(words), argv, "{}", lines[0]);
     // The repair command keeps the text and clears the field.
     apply_repair(p, &path);
     let r = record_of(p, &e);
     assert_eq!(r["observed_at"], "");
     assert_eq!(
         r["body"],
-        "Two PIDs\n\nObserved at (as recorded): last tuesday night"
+        format!("{body}\n\nObserved at (as recorded): last tuesday night")
     );
     ok(p, &["check", "--strict"]);
+}
+
+/// `hyp check`'s plain repair lines quote only what needs it: IDs and flags
+/// print as they are.
+#[test]
+fn shell_words_quote_only_what_needs_it() {
+    use hyp::cli::shell_word;
+    assert_eq!(shell_word("hyp"), "hyp");
+    assert_eq!(shell_word("L-0c3447a5-cd8e"), "L-0c3447a5-cd8e");
+    assert_eq!(shell_word("--by=E-1,E-2"), "--by=E-1,E-2");
+    assert_eq!(shell_word(""), "''");
+    assert_eq!(shell_word("it's $(x)"), r"'it'\''s $(x)'");
+    assert_eq!(shell_word("a\nb'c\\"), r"$'a\nb\'c\\'");
 }
 
 /// HYPO-0025: `hyp run --reviewed` takes the revision of the experiment as

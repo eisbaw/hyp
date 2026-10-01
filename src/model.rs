@@ -723,7 +723,9 @@ pub fn observed_at_warning(r: &Record, path: String) -> Option<Diagnostic> {
     );
     d.repair = Some(Repair {
         note: Some(format!(
-            "The command moves the text into the body and clears observed_at (unknown). If \
+            "The command moves the text into the body and clears observed_at (unknown). It \
+             holds the whole body as this check read it and states no revision, so run hyp \
+             check again right before running it, or a body changed in between is lost. If \
              you know when it was observed, set that instead: hyp set {id} --observed-at \
              YYYY-MM-DD (keep the text with --body first if it says more).",
             id = r.id

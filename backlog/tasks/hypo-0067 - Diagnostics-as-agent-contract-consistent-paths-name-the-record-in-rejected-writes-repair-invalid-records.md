@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@implementer-B'
 created_date: '2026-09-30 12:59'
-updated_date: '2026-10-01 09:31'
+updated_date: '2026-10-01 10:23'
 labels:
   - agents
   - validation
@@ -47,4 +47,6 @@ From the agent-UX batch 2 reviews: a gap citing missing evidence is a dangling_r
 Review follow-up (mped-architect): repair scope is now decided from the changes right after planning (Store::repair_scope), so a blocked write is reported as blocked before preconditions or other checks; a no-op or still-invalid repair is blocked naming what is wrong; deleting an archived invalid record counts as a repair; migration-converted records are not limited. Diagnostics of a rejected write carry repair null (nothing stored). The blocked hint about repair appears only when a blocking record is changeable.
 
 Review round 2: rejected/blocked write diagnostics about a record a change names carry change (its index) and ref (batch-local reference); delete while blocked says to repair instead of archive; assert_writable runs on one path (commit_planned before planning; repair_scope assumes only invalid records block).
+
+Review round 3: plain hyp check prints repair commands shell-quoted (cli::shell_word; $'...' for control characters), one line per command; tested by parsing the line back with bash. Blocked-by-invalid diagnostics carry change too (store::locate_changes, shared). The bad_observed_at repair note says to run hyp check again right before running it (hyp set has no expected-revision flag: follow-up). README: severity/blocks_writes describe the code, not the refused write; decide by kind and code.
 <!-- SECTION:NOTES:END -->

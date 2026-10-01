@@ -218,6 +218,22 @@ fn until_restored(code: Code) -> &'static str {
         _ => "",
     }
 }
+/// Marks each of `diagnostics` that is about a record one of a write's
+/// changes names with that change's index (`Diagnostic::change`) and its
+/// batch-local reference. `changed` holds, in change order, the full ID each
+/// change names and its reference; when several name one record, the last
+/// wins.
+fn locate_changes(diagnostics: &mut [Diagnostic], changed: &[(&str, Option<&str>)]) {
+    for d in diagnostics {
+        let file = d.path.rsplit('/').next().unwrap_or_default();
+        let id = file.strip_suffix(".md").unwrap_or(file);
+        if let Some((i, (_, reference))) = changed.iter().enumerate().rfind(|(_, (c, _))| *c == id)
+        {
+            d.change = Some(i);
+            d.reference = reference.map(str::to_string);
+        }
+    }
+}
 /// Errors for an error message: how many, then each as `path (code):
 /// message`, its identity first.
 fn listed(errors: &[Diagnostic]) -> String {
@@ -1265,13 +1281,14 @@ impl Store {
     }
     /// The records `changes` repair, by full ID; empty when nothing blocks
     /// writes. Only invalid records may block here (`Code::Invalid`,
-    /// `Snapshot::blocking` of `before`): `commit_planned` refused the others.
-    /// Fails as blocked (`Snapshot::assert_writable`) unless every change
-    /// updates, patches, archives or deletes one of them. Decided from the changes alone, before any of them is
-    /// checked, so a blocked write is told so first; `assert_repaired` then
-    /// requires each repaired record to be valid (or deleted). Records a
-    /// migration of legacy attachments converts on the way are not changes,
-    /// and not limited.
+    /// `Snapshot::blocking` of `before`): `commit_planned` refused the
+    /// others. Fails as blocked (`Snapshot::assert_writable`, its diagnostics
+    /// marked with the changes that name them) unless every change updates,
+    /// patches, archives or deletes one of them. Decided from the changes
+    /// alone, before any of them is checked, so a blocked write is told so
+    /// first; `assert_repaired` then requires each repaired record to be
+    /// valid (or deleted). Records a migration of legacy attachments converts
+    /// on the way are not changes, and not limited.
     fn repair_scope(before: &Snapshot, changes: &[Change]) -> Result<Vec<String>> {
         let blocking = before.blocking();
         if blocking.is_empty() {
@@ -1287,20 +1304,38 @@ impl Store {
                 .filter(|e| invalid.contains(Self::path_of(&e.record).as_str()))
                 .map(|e| e.record.id.clone())
         };
-        let ids: Option<Vec<String>> = changes
+        // The full ID each change names, if it names an existing record.
+        let named: Vec<Option<String>> = changes
             .iter()
-            .map(|change| match change {
-                Change::Create { .. } => None,
-                Change::Update { record, .. } => repaired(&record.id),
-                Change::Patch { id, .. }
-                | Change::Archive { id, .. }
-                | Change::Delete { id, .. } => repaired(id),
+            .map(|change| {
+                let id = match change {
+                    Change::Create { .. } => return None,
+                    Change::Update { record, .. } => &record.id,
+                    Change::Patch { id, .. }
+                    | Change::Archive { id, .. }
+                    | Change::Delete { id, .. } => id,
+                };
+                before.find(id).ok().map(|e| e.record.id.clone())
             })
             .collect();
-        match ids {
-            Some(ids) if !ids.is_empty() => Ok(ids),
-            _ => before.assert_writable().map(|()| vec![]),
+        let ids: Option<Vec<String>> = named
+            .iter()
+            .map(|id| id.as_deref().and_then(repaired))
+            .collect();
+        if let Some(ids) = ids.filter(|ids| !ids.is_empty()) {
+            return Ok(ids);
         }
+        let mut err = before
+            .assert_writable()
+            .expect_err("invalid records block writes");
+        if let Some(blocked) = err.downcast_mut::<Classified>() {
+            let changed: Vec<(&str, Option<&str>)> = named
+                .iter()
+                .map(|id| (id.as_deref().unwrap_or_default(), None))
+                .collect();
+            locate_changes(&mut blocked.diagnostics, &changed);
+        }
+        Err(err)
     }
     /// Fails, as blocked, while `still` lists rules that records a repair
     /// changed still break.
@@ -2094,19 +2129,12 @@ impl Store {
             }
         }
         // Which change named each record, for diagnostics of a rejected write.
-        let changed: BTreeMap<&str, (usize, Option<&String>)> = named
+        let changed: Vec<(&str, Option<&str>)> = named
             .iter()
-            .enumerate()
-            .map(|(i, (id, _, _, reference))| (id.as_str(), (i, reference.as_ref())))
+            .map(|(id, _, _, reference)| (id.as_str(), reference.as_deref()))
             .collect();
         let locate = |mut diagnostics: Vec<Diagnostic>| -> Vec<Diagnostic> {
-            for d in &mut diagnostics {
-                let id = d.path.rsplit('/').next().unwrap_or_default();
-                if let Some((i, reference)) = changed.get(id.strip_suffix(".md").unwrap_or(id)) {
-                    d.change = Some(*i);
-                    d.reference = reference.cloned();
-                }
-            }
+            locate_changes(&mut diagnostics, &changed);
             diagnostics
         };
         if !refused.is_empty() {

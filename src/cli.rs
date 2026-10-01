@@ -774,6 +774,40 @@ fn parse_observed_at(value: &str) -> Result<String, String> {
         )
     }
 }
+/// `arg` as one shell word on one line, for the plain `repair:` lines of
+/// `hyp check`, whose commands may carry record text (a body). A word of
+/// only safe characters (IDs, flags) stays as it is; others are
+/// single-quoted, and text with control characters (a newline) uses
+/// `$'…'` (POSIX.1-2024; bash, zsh, ksh, dash 0.5.12+) so the command stays
+/// on its line. `--json` gives the argv itself.
+pub fn shell_word(arg: &str) -> String {
+    let safe = |c: char| c.is_ascii_alphanumeric() || "-_./=:,@%+".contains(c);
+    if !arg.is_empty() && arg.chars().all(safe) {
+        return arg.to_string();
+    }
+    if !arg.chars().any(char::is_control) {
+        return format!("'{}'", arg.replace('\'', r"'\''"));
+    }
+    let mut quoted = String::from("$'");
+    for c in arg.chars() {
+        match c {
+            '\n' => quoted.push_str(r"\n"),
+            '\t' => quoted.push_str(r"\t"),
+            '\r' => quoted.push_str(r"\r"),
+            '\\' => quoted.push_str(r"\\"),
+            '\'' => quoted.push_str(r"\'"),
+            c if c.is_control() => {
+                let mut buf = [0u8; 4];
+                for b in c.encode_utf8(&mut buf).bytes() {
+                    quoted.push_str(&format!(r"\x{b:02x}"));
+                }
+            }
+            c => quoted.push(c),
+        }
+    }
+    quoted.push('\'');
+    quoted
+}
 /// A `--reviewed` value: 12 to 64 hex digits, lowercased, or an error
 /// saying it must be `what`. A prefix of 12 hex digits (48 bits) is ample to
 /// detect a change.
@@ -1875,7 +1909,9 @@ pub async fn run(cli: Cli) -> Result<()> {
                             println!("  note: {note}");
                         }
                         for command in &repair.commands {
-                            println!("  repair: {}", command.join(" "));
+                            let words: Vec<String> =
+                                command.iter().map(|a| shell_word(a)).collect();
+                            println!("  repair: {}", words.join(" "));
                         }
                     }
                 }
