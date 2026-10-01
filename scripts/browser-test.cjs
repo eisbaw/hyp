@@ -29,12 +29,8 @@ async function main() {
     });
     server.on("exit", (code) => reject(new Error("server exited " + code)));
   });
-  browser = await chromium.launch({
-    headless: true,
-    ...(process.env.CHROMIUM_PATH
-      ? { executablePath: process.env.CHROMIUM_PATH }
-      : {}),
-  });
+  // The browser comes from PLAYWRIGHT_BROWSERS_PATH, which the flake sets.
+  browser = await chromium.launch({ headless: true });
   const page = await browser.newPage({
     viewport: { width: 1440, height: 1050 },
   });
@@ -150,13 +146,30 @@ async function main() {
     cli("--json", "list", "--kind", "criterion"),
   ).find((e) => e.record.title === "Reject if the observed output is zero");
   assert.equal(criterion.record.hypothesis, created.record.id);
+  // Any judgment but untested cites evidence linked to the hypothesis
+  // (decision-0003): link some first, then cite it in the form.
+  const evidence = JSON.parse(
+    cli(
+      "--json",
+      "evidence",
+      "add",
+      created.record.id,
+      "First measurement is ambiguous",
+      "--source",
+      "bench.log",
+      "--qualifies",
+    ),
+  ).written.find((w) => w.kind === "evidence").id;
   await page.goto(url + "/#record/" + created.record.id);
+  // The form offers what the page has seen: wait for the live update.
+  await page.getByText("First measurement is ambiguous").first().waitFor();
   await page
     .getByRole("button", { name: "Review hypothesis", exact: true })
     .click();
   await page
     .getByLabel("Statement / title")
     .fill("Inconclusive after first review");
+  await page.getByLabel("Evidence considered").selectOption(evidence);
   await page
     .getByLabel("Assessment rationale")
     .fill("No measurement has been recorded yet.");

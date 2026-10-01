@@ -42,6 +42,28 @@ test:
 e2e: test build
     HYP_BIN=target/debug/hyp node scripts/dom-test.cjs
 
+# Playwright UI test in headless Chromium from nixpkgs (the dev shell sets PLAYWRIGHT_BROWSERS_PATH).
+[group('test')]
+browser-test: build
+    @test -n "${PLAYWRIGHT_BROWSERS_PATH:-}" || { echo "PLAYWRIGHT_BROWSERS_PATH is not set: run this inside nix develop" >&2; exit 1; }
+    HYP_BIN=target/debug/hyp node scripts/browser-test.cjs
+
+# Property tests (tests/properties) in rounds of `cases` per property, each with a fresh seed, until `seconds` pass (at least one round; a round started finishes). Failures are kept in tests/proptest-regressions/.
+[group('test')]
+fuzz seconds="300" cases="200":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo test --locked --test properties --no-run
+    end=$((SECONDS + {{ seconds }}))
+    round=0
+    while ((round == 0 || SECONDS < end)); do
+        round=$((round + 1))
+        seed=$(od -An -N8 -tu8 /dev/urandom | tr -d ' ')
+        echo "fuzz round $round: {{ cases }} cases per property, PROPTEST_RNG_SEED=$seed"
+        PROPTEST_CASES={{ cases }} PROPTEST_RNG_SEED=$seed cargo test --locked --test properties --quiet
+    done
+    echo "fuzz: $round rounds in $SECONDS s, no failures"
+
 # Format Rust sources in place.
 [group('quality')]
 fmt:
@@ -57,7 +79,7 @@ fmt-check:
 lint:
     cargo clippy --locked --all-targets -- -D warnings
 
-# Run every flake check (package tests, clippy, formatting, e2e-dom) on the Git-tracked tree.
+# Run every flake check (package tests, clippy, formatting, e2e-dom, e2e-browser) on the Git-tracked tree.
 [group('quality')]
 check:
     nix flake check -L

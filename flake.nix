@@ -11,6 +11,28 @@
         npmRoot = ./scripts;
         nodejs = pkgs.nodejs;
       };
+      # The npm `playwright` that scripts/browser-test.cjs runs, an exact version.
+      npmPlaywright = (builtins.fromJSON (builtins.readFile ./scripts/package.json)).dependencies.playwright;
+      # Browsers for scripts/browser-test.cjs, from the nixpkgs Playwright build: the
+      # Chromium headless shell only (what a headless launch uses; withChromium =
+      # false leaves out full Chromium). Each Playwright release looks for its own
+      # browser revisions under PLAYWRIGHT_BROWSERS_PATH, so the npm version must be
+      # pkgs.playwright-driver's; evaluation fails otherwise. After a nixpkgs update,
+      # pin the new version in scripts/package.json and regenerate the lockfile.
+      playwrightBrowsers = pkgs:
+        assert pkgs.lib.assertMsg (pkgs.playwright-driver.version == npmPlaywright)
+          "scripts/package.json pins playwright ${npmPlaywright}, but nixpkgs has playwright-driver ${pkgs.playwright-driver.version}: pin that exact version and regenerate scripts/package-lock.json";
+        pkgs.playwright-driver.browsers.override {
+          withChromium = false;
+          withFirefox = false;
+          withWebkit = false;
+        };
+      # What scripts/browser-test.cjs needs besides node: the browser, and no
+      # check of host libraries, which nix provides.
+      playwrightEnv = pkgs: {
+        PLAYWRIGHT_BROWSERS_PATH = "${playwrightBrowsers pkgs}";
+        PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS = "true";
+      };
     in {
       packages = eachSystem (system:
         let pkgs = import nixpkgs { inherit system; };
@@ -38,11 +60,11 @@
       devShells = eachSystem (system:
         let pkgs = import nixpkgs { inherit system; };
         in {
-          default = pkgs.mkShell {
+          default = pkgs.mkShell ({
             packages = with pkgs; [ cargo rustc rustfmt clippy rust-analyzer git nodejs just ];
             RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
             NODE_PATH = "${jsTestDeps pkgs}/node_modules";
-          };
+          } // playwrightEnv pkgs);
         });
       checks = eachSystem (system:
         let pkgs = import nixpkgs { inherit system; };
@@ -50,7 +72,8 @@
           package = self.packages.${system}.default;
           formatting = pkgs.runCommand "hyp-formatting" { nativeBuildInputs = [ pkgs.rustfmt ]; } ''
             cd ${self}
-            rustfmt --edition 2024 --check src/*.rs tests/*.rs
+            # A tests/<name>/main.rs brings its modules along.
+            rustfmt --edition 2024 --check src/*.rs tests/*.rs tests/*/main.rs
             touch $out
           '';
           clippy = self.packages.${system}.default.overrideAttrs (old: {
@@ -69,6 +92,16 @@
             export HYP_BIN=${self.packages.${system}.default}/bin/hyp
             export NODE_PATH=${jsTestDeps pkgs}/node_modules
             node ${./scripts/dom-test.cjs}
+            touch $out
+          '';
+          # Playwright test in headless Chromium, as `just browser-test` runs it.
+          e2e-browser = pkgs.runCommand "hyp-e2e-browser" ({ nativeBuildInputs = [ pkgs.nodejs ]; } // playwrightEnv pkgs) ''
+            export HOME=$TMPDIR
+            # The sandbox has no /etc/fonts; without fonts Chromium aborts.
+            export FONTCONFIG_FILE=${pkgs.makeFontsConf { fontDirectories = [ pkgs.dejavu_fonts ]; }}
+            export HYP_BIN=${self.packages.${system}.default}/bin/hyp
+            export NODE_PATH=${jsTestDeps pkgs}/node_modules
+            node ${./scripts/browser-test.cjs}
             touch $out
           '';
         });

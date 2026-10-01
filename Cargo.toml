@@ -33,6 +33,7 @@ libc = "0.2"
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+proptest = { version = "1", default-features = false, features = ["std"] }
 
 [profile.release]
 lto = "thin"
