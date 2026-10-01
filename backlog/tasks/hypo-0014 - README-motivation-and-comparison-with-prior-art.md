@@ -1,11 +1,11 @@
 ---
 id: HYPO-0014
 title: 'README: motivation and comparison with prior art'
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-09-29 22:16'
-updated_date: '2026-10-01 08:14'
+updated_date: '2026-10-01 19:02'
 labels:
   - docs
 dependencies:
@@ -31,7 +31,7 @@ The ChatGPT star ratings are unverified LLM output. Several of these repos are r
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Comparison table (hyp vs the tools above, plus backlog.md as the UX inspiration) with columns such as: hypothesis/falsification model, evidence polarity, GUI, CLI, storage/Git-friendliness, agent interface, maturity/licence
+- [x] #1 Comparison table (hyp vs the tools above, plus backlog.md as the UX inspiration) with columns such as: hypothesis/falsification model, evidence polarity, GUI, CLI, storage/Git-friendliness, agent interface, maturity/licence
 - [x] #2 Each row verified against the live repository (existence, licence, last activity, claimed features); rows that cannot be verified are dropped
 - [x] #3 An honest 'when not to use hyp' paragraph (e.g. statistics, literature mining, networked multi-user)
 - [x] #4 readme-improver review passes with no high-priority findings
@@ -55,4 +55,21 @@ Architect review: columns like maturity or last-activity go stale quickly; a sho
 
 - Review round: Related tools cut to backlog.md, Heuer's Analysis of Competing Hypotheses (1999, the methodological precedent), POPPER, Doubt and Argdown (MIT, active; replaces Arguman, whose last commit is from 2021). Dropped RigorGraph, Epistemos, popper (kliewerdaniel), go-argmap and Arguman as small or dormant. When not to use hyp now names categories and links Scope of this release for the technical limits. Conceptual model: Searle cited for A Taxonomy of Illocutionary Acts (1975; Expression and Meaning, 1979), normative and imperative share world-to-word fit and differ by persistence, the status axis branches (refuted) and anything can go stale.
 - AC 4 remains a self-audit against the readme-improver rubric, not a separate review.
+
+Closing review 2026-10-01: AC #1 checked. docs/related-tools.md (e4e4ecc) has a summary table of hyp against backlog.md and the tools above (Doubt, RigorGraph, Epistemos, POPPER, Kliewer's popper, Argdown, go-argmap, Arguman, plus Heuer's ACH), linked from the README Related tools section. Its columns are what the tool is and where it overlaps with hyp; the dimensions the AC names (falsification model, evidence polarity, GUI/CLI, storage, agent interface, licence) are covered per tool in prose rather than as columns, following the architect note that maturity and activity columns go stale. AC #4 was a self-audit against the readme-improver rubric, not a separate reviewer run; e4e4ecc additionally had an mped-architect fact-check (NO-GO with corrections, all applied, then GO).
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+The README says why hyp exists and when not to use it, and hyp is compared with related tools in docs/related-tools.md.
+
+Changes (193f872, a6d5c1c, 76f1c94, e4e4ecc):
+- README opening: "backlog.md, but for hypotheses"; agents as primary users with a stable --json contract (decision-0002); discipline enforced as tool rules; Markdown records, Git-friendly but not Git-dependent (decision-0001); observation-first work.
+- New README sections: When not to use hyp (by category, linking Scope of this release), Conceptual model (direction of fit: Anscombe, Searle, Zave and Jackson; the epistemic-status axis), Related tools (short list), License.
+- docs/related-tools.md: summary table plus per-tool strengths and weaknesses against hyp for backlog.md, Doubt, RigorGraph, Epistemos, POPPER, Kliewer's popper, Argdown, go-argmap, Arguman and ACH, and ideas worth borrowing; checked against each repository in October 2026 (licence, activity, documented features); no tool was installed or run.
+
+Review: readme-improver rubric applied by the authoring agent (no high findings); mped-architect fact-check on e4e4ecc (18 corrections applied, then GO). Gate: just fmt-check, lint, e2e exit 0.
+
+Caveat: the comparison describes documented features, not tested ones, and dates quickly; the doc says so.
+<!-- SECTION:FINAL_SUMMARY:END -->

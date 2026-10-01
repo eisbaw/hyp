@@ -5,7 +5,7 @@ status: In Progress
 assignee:
   - '@implementer-B'
 created_date: '2026-09-30 11:27'
-updated_date: '2026-10-01 09:30'
+updated_date: '2026-10-01 19:02'
 labels:
   - validation
   - cli
@@ -42,4 +42,22 @@ A write from any writer (CLI, apply, WebUI) refuses a new or changed observed_at
 AC #3 (WebUI date input) is the WebUI lane. The server rejects datetime-local values without an offset (YYYY-MM-DDTHH:MM), so the form must send a date or an RFC 3339 timestamp.
 
 Review round 2 (P1): a stored unreadable observed_at no longer blocks writes. hyp check reports it as the warning bad_observed_at (blocks_writes false; --strict fails), with a repair command that moves the text into the body and clears the field (hyp set E --body=... --observed-at=). Writes refuse a new or changed unreadable or future value for every writer (model::observed_at_refusal), kind invalid_input with a bad_observed_at diagnostic. --observed-at '' clears it (unknown) on observe, evidence add and set.
+
+Closing review 2026-10-01 (after the 0.4.0 merge): AC #1 and #2 are met; AC #3 is NOT met, so the task stays In Progress. The WebUI evidence form still renders observed_at as a text input (field("observed_at", "Observation date", …, "text", …) in web/app.js). Stream A (5c49f6c) only changed its default (now only for a new record; an edit keeps an empty value) and its help text (RFC 3339 with offset, or YYYY-MM-DD). The server refuses unreadable new values, so bad input is rejected on save, but the form is not a date/datetime input. Note for whoever takes AC #3: a plain datetime-local value (YYYY-MM-DDTHH:MM, no offset) is refused by the server, so the form must send a date or add the offset.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+observed_at is validated for every writer, the CLI can set it, and a stored unreadable value warns instead of blocking. The WebUI date input (AC #3) is still open.
+
+Changes (335ae01, 8bd8ba2):
+- model::is_observed_at (RFC 3339, or exactly YYYY-MM-DD) shared by the CLI value parser and validate().
+- hyp check reports a stored unreadable value as the warning bad_observed_at (blocks_writes false; --strict fails on it) with a repair that moves the text into the body and clears the field: hyp set E --body=… --observed-at=.
+- Every writer (CLI, apply, WebUI) refuses a new or changed value that is unreadable or more than a day ahead: invalid_input with a bad_observed_at diagnostic (model::observed_at_refusal).
+- hyp evidence add --observed-at and hyp set E --observed-at; --observed-at '' states unknown (observe, evidence add, set).
+
+Tests: tests/cli.rs an_unreadable_stored_observed_at_warns_and_does_not_block and updated tests, red against the previous src. just e2e and nix flake check green at a38c06c.
+
+Open: AC #3, the WebUI form uses a text input. Follow-up: the repair has no expected-revision precondition (HYPO-0101).
+<!-- SECTION:FINAL_SUMMARY:END -->

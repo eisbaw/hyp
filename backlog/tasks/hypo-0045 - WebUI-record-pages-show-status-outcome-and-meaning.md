@@ -1,11 +1,11 @@
 ---
 id: HYPO-0045
 title: 'WebUI: record pages show status, outcome and meaning'
-status: In Progress
+status: Done
 assignee:
   - '@implementer-A'
 created_date: '2026-09-30 11:27'
-updated_date: '2026-10-01 10:31'
+updated_date: '2026-10-01 19:01'
 labels:
   - webui
   - ux
@@ -39,3 +39,21 @@ Browser test-drive 2026-09-30. Experiment detail hides its status; run detail hi
 
 - Review fixes: the Source line has no separator when the locator is empty; Bears on items leave out the hypothesis body; frozen copies (targets, run plan) render as fields, raw text only when not JSON. Evidence form: observed_at defaults to now only for a new record; editing evidence whose observed_at is empty keeps it empty (DOM test, red without it).
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Record pages show state, roles and meaning: status, outcome, judgment and relation as badges; referenced records grouped by role; link direction; what evidence means for each hypothesis; and a link's ends cannot be edited in the WebUI.
+
+Changes (bfe3e40, 5c49f6c, b328f29):
+- Badges for experiment status, run outcome, assessment judgment and link relation.
+- "Referenced records" replaced by role sections (roles()): hypothesis under test, plan, cited evidence, evidence considered, falsification criterion, supersedes, resolved by; missing references shown by ID and marked missing.
+- Link pages: a FROM -> relation -> TO panel. Evidence cards list each hypothesis they bear on with stance and meaning, or "unexplained"; experiment cards name the hypothesis they test.
+- Runs and assessments are shown as history (no Edit/Archive, as the CLI refuses).
+- Editing a link: no From/To fields, and an advanced-JSON edit that changes from or to is rejected before sending.
+- Frozen targets render as fields; a run's frozen plan is the encoded Markdown record and is shown as text (b328f29 corrected the earlier claim that it rendered as fields).
+
+Tests: DOM test recordPages(), each part red when reverted. just e2e and nix flake check green at a38c06c.
+
+Follow-ups: the store does not yet enforce fixed link ends (HYPO-0103); the run's frozen plan as fields (HYPO-0116); role names from the server instead of a JS list (HYPO-0104); redundant stance text in Bears on (HYPO-0114).
+<!-- SECTION:FINAL_SUMMARY:END -->

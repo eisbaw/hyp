@@ -4,6 +4,7 @@ title: 'WebUI forms: visible errors, filtered choices, honest defaults'
 status: To Do
 assignee: []
 created_date: '2026-09-30 11:27'
+updated_date: '2026-10-01 19:00'
 labels:
   - webui
   - ux
@@ -26,3 +27,9 @@ Browser test-drive 2026-09-30 (screenshots /tmp/claude-1000/-home-mpedersen-topi
 - [ ] #4 After saving a child record the user returns to the parent hypothesis
 - [ ] #5 DOM test covers the error placement and the filtered options
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Re-confirmed after the 0.4.0 merge (2026-10-01), covered by AC #2 and #3: the "Review hypothesis" (assessment) form still defaults the judgment to inconclusive (select("judgment", …, "inconclusive") in web/app.js) even when no evidence is linked, so the default cannot be saved (every judgment except untested needs cited evidence); its "Evidence considered" list is objectOptions("evidence"), every evidence record, linked or not, while the server accepts only linked evidence (decision-0003). HYPO-0049 covers the evidence-list half with a server-side rule.
+<!-- SECTION:NOTES:END -->

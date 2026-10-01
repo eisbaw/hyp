@@ -1,11 +1,11 @@
 ---
 id: HYPO-0042
 title: 'WebUI: long unbroken titles make every page scroll horizontally'
-status: In Progress
+status: Done
 assignee:
   - '@implementer-A'
 created_date: '2026-09-30 11:26'
-updated_date: '2026-10-01 10:30'
+updated_date: '2026-10-01 19:01'
 labels:
   - webui
   - bug
@@ -35,3 +35,17 @@ Browser test-drive 2026-09-30. A hypothesis title with a ~95-character path (no 
 
 - Review fix: the body-wide overflow-wrap: anywhere was inherited by buttons and badges, so at 390 px 'Edit record'/'Archive' broke one letter per line beside a long title, and 'Edit' broke at 1440. Buttons, badges, tags and meta-line labels now use overflow-wrap: normal; .section-head wraps. Live Brave via the DevTools MCP, all views at 390 and 1440: with the old rule re-inserted via CSSOM, buttons broke on 7 views at 390 and 1 at 1440 (Edit button 39x190 px); with the fix none, and scrollWidth equals clientWidth on every view. DOM test asserts the computed overflow-wrap of a button, a badge and a meta-line label.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Long unbroken titles, IDs and sources wrap, so no view scrolls horizontally at 390 or 1440 px, and controls no longer break inside words.
+
+Changes:
+- web/style.css: body { overflow-wrap: anywhere } (bfe3e40); anywhere also lowers min-content, so flex and grid items shrink.
+- Review fix (5c49f6c): buttons, badges, tags and meta-line labels use overflow-wrap: normal (they had broken one letter per line beside a long title at 390 px); section heads wrap.
+
+Tests: DOM test longTitles() with a 115-character path title asserts the computed overflow-wrap of the record title, overview card title and ID, and of a button, a badge and a meta-line label (jsdom has no layout). Checked live in Brave (DevTools MCP) on every view at 390 and 1440 px: scrollWidth equals clientWidth everywhere; with the old rule re-inserted, buttons broke on 7 views at 390 px.
+
+Follow-up: the Playwright suite (scripts/browser-test.cjs) could assert no horizontal scroll with a long-path title, since jsdom cannot measure layout.
+<!-- SECTION:FINAL_SUMMARY:END -->

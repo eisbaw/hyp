@@ -1,11 +1,11 @@
 ---
 id: HYPO-0092
 title: 'WebUI: surface unexplained observations and what an observation bears on'
-status: In Progress
+status: Done
 assignee:
   - '@implementer-A'
 created_date: '2026-09-30 21:25'
-updated_date: '2026-10-01 10:30'
+updated_date: '2026-10-01 19:01'
 labels:
   - webui
   - agents
@@ -38,4 +38,26 @@ HYPO-0091 added observation-first work to the CLI: hyp observe, hyp add --explai
 - Also in this change: the page re-reads every 2 s while its last read failed or showed blocking diagnostics, and drops answers older than the latest read; this fixed the intermittent 'recovery' timeouts of the DOM test (a state only the page's read saw got no server event afterwards).
 
 - Review fixes: the derived list is now Snapshot::unexplained_observations (IDs, model.rs derive), so hyp export --format json carries it too; the WebSnapshot wrapper is gone. Recovery root cause fixed server-side: every read the server makes publishes what it saw (announce in src/web.rs), so a state only a client read saw is followed by an event when the project is valid again (tests/api.rs reads_publish_what_they_saw_so_recovery_is_announced, red without it). The client re-read is a bounded backstop (2 s apart, at most 15 in a row). Writes adopt their answer through adopt(), which also invalidates reads on their way (DOM test olderReadAfterSave, red without it).
+
+b328f29 (written by the coordinator; the implementer could not record it because Nix failed):
+- Save race: adopt() alone only moved the race. write() now takes its read-sequence slot when it sends and adopts the answer only if no read was issued meanwhile; otherwise it reads again, since a read issued during the round trip may carry newer state (a CLI write announced meanwhile). DOM test newerReadDuringSave, red with an unconditional adopt.
+- olderReadAfterSave waits until the page has decoded every held answer and then yields one task, instead of a fixed 300 ms, so it is deterministic.
+- A run's frozen plan is the encoded Markdown record (Store::commit), not JSON, so frozenFields shows it as raw text; the earlier note and commit message that it rendered as fields were wrong. Rendering it as fields is HYPO-0116.
+- README export section documents unexplained_observations (IDs there; {id, title} in hyp --json status).
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+The WebUI shows observation-first work: unexplained observations on the overview, what an observation bears on, and creating a hypothesis that explains an observation in one write.
+
+Changes (bfe3e40, 5c49f6c, b328f29):
+- Snapshot::unexplained_observations (IDs, derived in derive(), not part of the revision) in /api/snapshot, the transaction answer, the HTML export and hyp export --format json; the WebUI does not re-derive the rule.
+- Overview: "Unexplained observations" with an "Explain it" button each.
+- Evidence page: "Bears on" lists each hypothesis with stance, judgment, lifecycle and each link's meaning (editable), says when no live hypothesis accounts for it, and offers "Explain with a new hypothesis"; the new hypothesis and its supports link are one transaction, the observation fixed when the form opens.
+- Reads: every server read publishes what it saw (announce), so a state only a client read saw is followed by an event; the client re-read is a bounded backstop (2 s apart, at most 15). write() takes a read-sequence slot and adopts its answer only if no newer read was issued.
+
+Tests: tests/api.rs snapshot_lists_unexplained_observations and reads_publish_what_they_saw_so_recovery_is_announced; DOM tests observations() (overview set equals hyp --json status before and after), olderReadAfterSave, newerReadDuringSave; each red without its change. just e2e and nix flake check green at a38c06c.
+
+Follow-ups: one server-side create-with-explains (noted on HYPO-0083); hyp status recomputes the set (HYPO-0117); the timing-sensitive recovery waits (HYPO-0105).
+<!-- SECTION:FINAL_SUMMARY:END -->

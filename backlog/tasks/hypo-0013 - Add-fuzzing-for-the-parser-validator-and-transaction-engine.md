@@ -5,7 +5,7 @@ status: In Progress
 assignee:
   - '@implementer-c'
 created_date: '2026-09-29 22:16'
-updated_date: '2026-10-01 11:22'
+updated_date: '2026-10-01 19:02'
 labels:
   - testing
 dependencies:
@@ -59,4 +59,26 @@ cargo-fuzz needs nightly Rust, which the pinned nixpkgs toolchain does not provi
 - Review follow-ups (mped-architect): encode now refuses a record whose YAML header would not end in a line feed (the U+2028/U+2029 case), so a write fails with a message and leaves the notebook as it was, instead of writing a file hyp cannot read (test codec::a_value_hyp_cannot_store_is_refused_not_written). Storing such values is still the open bug (ignored test). The commit property now also checks that each change was applied (created, updated, patched, archived and deleted records are in the returned snapshot as asked; a commit that reports changes wrote files; mutant: a commit that applies nothing fails it). The read-back property allows Malformed only for files not named after their ID. Cosmetic edits target records of a kind they fit. A single predicate (generate::unicode_separator_bug) marks the known-bug input.
 - Seeds: tests/properties/main.rs fixes the seed (1013) unless PROPTEST_RNG_SEED is set, so just test, just e2e and the flake check are reproducible; just fuzz draws a fresh seed per round and prints it.
 - CI smoke: the flake package check (nix flake check) runs the properties binary with the default case counts (12 passed, 1 ignored in the sandbox).
+
+Correction to the earlier note that just test and just fuzz use fresh seeds: tests/properties/main.rs fixes the seed (1013) unless PROPTEST_RNG_SEED is set, so just test, just e2e and the flake check are reproducible with capped case counts (8 to 256 per property); only just fuzz draws a fresh seed per round and prints it. The flake no longer sets PROPTEST_RNG_SEED.
+
+Coordinator follow-ups: eval-time Playwright pin assert; encode refusal is InvalidInput and names the field; text() yields long word lines for YAML folding; fingerprint::the_rich_basis_holds_every_record_built_for_it.
+
+Closing review 2026-10-01: AC #1, #2, #3 and #5 are met (tests/properties; proptest on stable documented in the README; just fuzz SECONDS CASES; the flake package check runs the properties binary and GitHub CI runs nix flake check). AC #4 stays unchecked and the task In Progress: the trailing-newline bug is fixed with a regression test, but the U+2028/U+2029 storage bug is only refused, not fixed; it is filed as HYPO-0100, which this AC waits on. (Read literally, "or filed as separate tasks" is now satisfied; it is left open because the coordinator treats HYPO-0100 as blocking.)
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Property tests (proptest, stable Rust) cover the record format, validation, commits, crash recovery and the review fingerprint; they run in just test, just e2e, the flake check and CI, and just fuzz runs longer sessions with fresh seeds.
+
+Changes (43b1130, 9dad9fc, 6f390ca; merged in d1e2fe9):
+- tests/properties: codec (decode(encode(r)) == r; decode never panics on damaged or random bytes), snapshot (no query panics on arbitrary record sets; reads from disk report problems as diagnostics), commit (a failed batch leaves hyp/ byte-identical; a successful one is applied as asked and leaves no hyp check error), journal (recovery after a crash at any point is idempotent), fingerprint (cosmetic edits keep it, basis content edits change it).
+- Toolchain: proptest instead of cargo-fuzz (nightly-only; the pinned nixpkgs has none). Fixed seed 1013 unless PROPTEST_RNG_SEED is set, capped case counts per property; just fuzz SECONDS CASES draws a fresh seed per round and prints it; failures persist to tests/proptest-regressions/.
+- Each property was shown to fail against a deliberate mutant of src/.
+- Bug fixed: decode dropped the final newline of a YAML block scalar ending the front matter (regression test). Bug refused, not fixed: a multi-line value ending in U+2028/U+2029 in the last front-matter field; encode now refuses it (InvalidInput naming the field) instead of writing an unreadable file; pinned by an ignored test.
+
+Tests: the properties binary passes in just e2e and the flake check, with the known bug ignored. Gate at a38c06c green.
+
+Open: AC #4 waits on HYPO-0100 (store the U+2028/U+2029 values). Follow-ups: HYPO-0115 (journal paths, partial recovery, a pinned journal, observed_at refusals).
+<!-- SECTION:FINAL_SUMMARY:END -->
