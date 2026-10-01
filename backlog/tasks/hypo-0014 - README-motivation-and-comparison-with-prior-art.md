@@ -5,7 +5,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-09-29 22:16'
-updated_date: '2026-10-01 07:49'
+updated_date: '2026-10-01 08:14'
 labels:
   - docs
 dependencies:
@@ -52,4 +52,7 @@ Architect review: columns like maturity or last-activity go stale quickly; a sho
 
 - AC 1 left unchecked: the comparison is a list with one-line differences, not a table, following the architect note. Edit the AC or accept the list.
 - AC 4: the readme-improver rubric was applied by this agent itself (no separate sub-agent fan-out); no high findings in the opening or the new sections.
+
+- Review round: Related tools cut to backlog.md, Heuer's Analysis of Competing Hypotheses (1999, the methodological precedent), POPPER, Doubt and Argdown (MIT, active; replaces Arguman, whose last commit is from 2021). Dropped RigorGraph, Epistemos, popper (kliewerdaniel), go-argmap and Arguman as small or dormant. When not to use hyp now names categories and links Scope of this release for the technical limits. Conceptual model: Searle cited for A Taxonomy of Illocutionary Acts (1975; Expression and Meaning, 1979), normative and imperative share world-to-word fit and differ by persistence, the status axis branches (refuted) and anything can go stale.
+- AC 4 remains a self-audit against the readme-improver rubric, not a separate review.
 <!-- SECTION:NOTES:END -->
