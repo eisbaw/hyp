@@ -88,7 +88,7 @@
             installPhase = "mkdir -p $out";
           });
           # jsdom UI test against the packaged binary and a real server on loopback.
-          e2e-dom = pkgs.runCommand "hyp-e2e-dom" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
+          e2e-dom = pkgs.runCommand "hyp-e2e-dom" { nativeBuildInputs = [ pkgs.nodejs pkgs.bash ]; } ''
             export HYP_BIN=${self.packages.${system}.default}/bin/hyp
             export NODE_PATH=${jsTestDeps pkgs}/node_modules
             node ${./scripts/dom-test.cjs}

@@ -383,6 +383,99 @@ async function unknownObservedAt(w) {
   await wait(() => h1(w) === "Seen at a time nobody noted", "evidence edited");
   assert.equal(demo("evidence", "Seen at a time nobody noted").observed_at, "");
 }
+/** A repair command can carry record text: the `bad_observed_at` repair
+ * holds the whole body as `--body=…`. The page and the offline export print
+ * each command as `hyp check` does, on one line with shell-quoted words, and
+ * a shell runs that line as the argv it stands for, nothing the body says.
+ * The bodies take both quoted forms of `shell_word` (src/cli.rs), whose
+ * port `shellWord` (web/app.js) this compares with it. */
+async function hostileRepairs(w) {
+  const marker = (n) => path.join(root, "injected-" + n);
+  // A body: with control characters, so `$'…'`: named escapes, one-byte
+  // (ESC, DEL) and two-byte (U+0085) `\x` escapes.
+  await hostileRepair(
+    w,
+    `-starts with a dash; touch ${marker(1)}\n$(touch ${marker(2)}) \`touch ${marker(3)}\` it's a \\ backslash\ta tab\r\u001b[31m\u007f\u0085a C1 control, é`,
+    "last tuesday night",
+    marker,
+  );
+  // No body, so the repair's body is one line of the stored text: single
+  // quotes, with `'\''` for a quote.
+  await hostileRepair(
+    w,
+    "",
+    `it's; touch ${marker(4)} && echo "$(touch ${marker(5)})" | \`touch ${marker(6)}\` > x`,
+    marker,
+  );
+}
+async function hostileRepair(w, body, observedAt, marker) {
+  const id = cli(
+    "observe",
+    "Hostile body",
+    "--source",
+    "paste",
+    "--body=" + body,
+    "--observed-at",
+    "2026-09-01",
+  );
+  // Free text as observed_at, as older WebUIs stored it.
+  const file = path.join(root, "hyp", "evidence", id + ".md");
+  const stored = fs.readFileSync(file, "utf8");
+  fs.writeFileSync(
+    file,
+    stored.replace(
+      /^observed_at: .*$/m,
+      "observed_at: " + JSON.stringify(observedAt),
+    ),
+  );
+  const where = `hyp/evidence/${id}.md`;
+  const printed = cli("check").split("\n");
+  const at = printed.findIndex((l) => l.startsWith(`warning ${where}: `));
+  assert.ok(at >= 0, `${where} in hyp check:\n${printed.join("\n")}`);
+  const [head, note, repair, after] = printed.slice(at, at + 4);
+  assert.ok(note.startsWith("  note: "), note);
+  assert.ok(repair.startsWith("  repair: hyp set "), repair);
+  // The quoted form this case is for.
+  assert.ok(repair.includes(body ? " $'--body=" : " '--body="), repair);
+  assert.ok(!after?.startsWith("  repair: "), "one repair command");
+  const expected = [
+    `WARNING · ${where}`,
+    head.slice(`warning ${where}: `.length),
+    "Note: " + note.slice("  note: ".length),
+    "Repair: " + repair.slice("  repair: ".length),
+  ].join("\n");
+  // The diagnostic as a page shows it: its lines up to the blank line that
+  // separates diagnostics.
+  const shown = (doc) =>
+    (doc.querySelector(".diagnostics pre")?.textContent ?? "")
+      .split("\n\n")
+      .find((d) => d.startsWith(`WARNING · ${where}`));
+  await wait(() => shown(w.document), "bad_observed_at diagnostic shown");
+  assert.equal(shown(w.document), expected);
+  const report = new JSDOM(cli("export", "--format", "html"), {
+    url: "file:///hyp-report.html",
+    ...options("file:///hyp-report.html"),
+  });
+  windows.push(report.window);
+  await wait(() => shown(report.window.document), "export shows the repair");
+  assert.equal(shown(report.window.document), expected);
+  // Run the shown line in a shell, with this hyp as `hyp`.
+  const line = expected.split("\n").at(-1).slice("Repair: ".length);
+  execFileSync("bash", ["-c", line], {
+    cwd: root,
+    env: {
+      ...process.env,
+      PATH: path.dirname(path.resolve(bin)) + path.delimiter + process.env.PATH,
+    },
+  });
+  for (const n of [1, 2, 3, 4, 5, 6])
+    assert.ok(!fs.existsSync(marker(n)), "the body ran: " + marker(n));
+  const e = listed("evidence").find((e) => e.record.id === id).record;
+  const kept = "Observed at (as recorded): " + observedAt;
+  assert.equal(e.body, body ? body + "\n\n" + kept : kept);
+  assert.equal(e.observed_at, "");
+  await wait(() => !shown(w.document), "repair clears the warning");
+}
 /** The backstop re-read (`retrySoon` in app.js): the page's snapshot reads
  * are answered with `answer` (given the real read) until it shows `shown`;
  * then reads work again while the server's events are dropped, so only the
@@ -983,6 +1076,7 @@ async function main() {
     () => w.document.querySelector("#notice").hidden,
     "repair clears the notice",
   );
+  await hostileRepairs(w);
   // Should the event that a project is valid again be lost, the page reads
   // again itself (the server announces it: tests/api.rs).
   await recoversWithoutEvents(
@@ -1042,7 +1136,7 @@ async function main() {
   );
   assert.deepEqual(errors, []);
   console.log(
-    "PASS: relationships named from both ends, runs on the hypothesis page, frozen targets marked when changed, record status/outcome/roles/direction, evidence card interpretations, interpretation ends fixed, unexplained observations and bears-on, hypothesis created from an observation in one write, long titles wrap while controls do not, unknown observation time kept on edit, DOM forms, real HTTP writes, CLI↔UI SSE updates, editor changes, two tabs, dirty-form preservation, conflicts by status, saves despite unrelated writes, stale assessment rejected, evidence required and linked-only, criteria, evidence interpretations, criterion-meeting evidence counted against, falsification assessment, experiment and run, all views, captured data with escaped text previews, malformed-file recovery, saves and CLI repair despite a dangling link, unavailable-project cause, recovery when an event is lost, an older read not replacing a save nor a save a newer read, and offline export.",
+    "PASS: relationships named from both ends, runs on the hypothesis page, frozen targets marked when changed, record status/outcome/roles/direction, evidence card interpretations, interpretation ends fixed, unexplained observations and bears-on, hypothesis created from an observation in one write, long titles wrap while controls do not, unknown observation time kept on edit, DOM forms, real HTTP writes, CLI↔UI SSE updates, editor changes, two tabs, dirty-form preservation, conflicts by status, saves despite unrelated writes, stale assessment rejected, evidence required and linked-only, criteria, evidence interpretations, criterion-meeting evidence counted against, falsification assessment, experiment and run, all views, captured data with escaped text previews, malformed-file recovery, saves and CLI repair despite a dangling link, repair commands with record text shown shell-quoted as hyp check prints them and safe to paste, unavailable-project cause, recovery when an event is lost, an older read not replacing a save nor a save a newer read, and offline export.",
   );
 }
 main()

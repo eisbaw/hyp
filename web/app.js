@@ -273,13 +273,37 @@ function repairNotice(s) {
   if (!n) return "";
   return `${n} notebook error${n === 1 ? "" : "s"}, for example from a merge or sync. Saving still works unless it adds a new error. See the checks below for repairs.`;
 }
+/** `arg` as one shell word on one line, exactly as `shell_word` in
+ * src/cli.rs gives it for the `repair:` lines of `hyp check` (a port; the
+ * e2e test compares the two on hostile text). A word of only safe
+ * characters stays as it is; others are single-quoted, and text with a
+ * control character (Unicode Cc, as Rust's `char::is_control`) uses `$'…'`,
+ * so a body in a command cannot end the line or break out of the word. */
+function shellWord(arg) {
+  if (/^[A-Za-z0-9\-_./=:,@%+]+$/.test(arg)) return arg;
+  const control = /\p{Cc}/u;
+  if (!control.test(arg)) return `'${arg.replaceAll("'", "'\\''")}'`;
+  const named = { "\n": "\\n", "\t": "\\t", "\r": "\\r", "\\": "\\\\", "'": "\\'" };
+  let quoted = "$'";
+  for (const c of arg) {
+    if (Object.hasOwn(named, c)) quoted += named[c];
+    else if (control.test(c)) {
+      // Cc ends at U+009F, so its UTF-8 is one byte or two.
+      const p = c.codePointAt(0);
+      const bytes = p < 0x80 ? [p] : [0xc0 | (p >> 6), 0x80 | (p & 0x3f)];
+      quoted += bytes.map((b) => "\\x" + b.toString(16).padStart(2, "0")).join("");
+    } else quoted += c;
+  }
+  return quoted + "'";
+}
 /** A diagnostic's repair as `hyp check` prints it: the note, then each
- * command (an argv array, run in the project directory). */
+ * command (an argv array, run in the project directory) on one line, its
+ * words shell-quoted (`shellWord`). */
 function repairLines(r) {
   if (!r) return "";
   return [
     ...(r.note ? [`Note: ${r.note}`] : []),
-    ...r.commands.map((c) => `Repair: ${c.join(" ")}`),
+    ...r.commands.map((c) => `Repair: ${c.map(shellWord).join(" ")}`),
   ]
     .map((l) => "\n" + l)
     .join("");
