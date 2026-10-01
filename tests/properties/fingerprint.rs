@@ -356,14 +356,16 @@ fn the_rich_basis_holds_every_record_built_for_it() {
         id(Kind::Run, 0),
     ];
     for want in &expected {
-        assert!(basis.contains_key(want), "{want} is not in the basis: {basis:#?}");
+        assert!(
+            basis.contains_key(want),
+            "{want} is not in the basis: {basis:#?}"
+        );
     }
     for not in [id(Kind::Experiment, 0), id(Kind::Data, 0)] {
         assert!(!basis.contains_key(&not), "{not} is in the basis");
     }
     // The data record counts by its bytes, under the evidence that draws on it.
-    let Some(Data::Captured { sha256, .. }) =
-        snap.get(&id(Kind::Data, 0)).map(|e| &e.record.data)
+    let Some(Data::Captured { sha256, .. }) = snap.get(&id(Kind::Data, 0)).map(|e| &e.record.data)
     else {
         panic!("rich builds a data record")
     };
