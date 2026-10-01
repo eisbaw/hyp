@@ -873,6 +873,12 @@ pub struct Snapshot {
     /// shows, escaped. Derived on read, never stored, not in `revision`.
     #[serde(default)]
     pub previews: BTreeMap<String, String>,
+    /// The IDs of `Snapshot::unexplained` in project order (HYPO-0092), for
+    /// the WebUI and in `hyp export --format json`: the observations `hyp
+    /// status --json` lists under the same name, there with their titles.
+    /// Derived (`derive`), never stored, not in `revision`.
+    #[serde(default)]
+    pub unexplained_observations: Vec<String>,
     pub revision: String,
 }
 pub fn hash(bytes: impl AsRef<[u8]>) -> String {
@@ -1255,6 +1261,12 @@ impl Snapshot {
                 },
             );
         }
+        // Reads the `bearings` and `hypotheses` just derived.
+        self.unexplained_observations = self
+            .unexplained()
+            .into_iter()
+            .map(|e| e.record.id.clone())
+            .collect();
         self.revision =
             hash(serde_json::to_vec(&(&self.objects, &self.diagnostics)).unwrap_or_default());
     }

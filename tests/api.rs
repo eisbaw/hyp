@@ -155,6 +155,107 @@ async fn a_judgment_without_evidence_is_unprocessable() {
     let (status, body) = post(&app, change("untested")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
 }
+/// The snapshot carries `unexplained_observations` (HYPO-0092), the IDs of
+/// `Snapshot::unexplained`, in the answer to a read and to a write.
+#[tokio::test]
+async fn snapshot_lists_unexplained_observations() {
+    let (_dir, app, _store) = app();
+    let read = |app: axum::Router| async move {
+        let response = app
+            .oneshot(req("GET", "/api/snapshot", serde_json::Value::Null))
+            .await
+            .unwrap();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+    };
+    let none = serde_json::json!([]);
+    assert_eq!(read(app.clone()).await["unexplained_observations"], none);
+    let e = "E-00000000-0000-4000-8000-000000000001";
+    let h = "H-00000000-0000-4000-8000-000000000002";
+    let evidence = serde_json::json!({"id":e,"kind":"evidence","title":"Blip","source":"scope"});
+    let (status, written) = post(
+        &app,
+        serde_json::json!({"changes":[{"op":"create","record":evidence}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{written}");
+    assert_eq!(written["unexplained_observations"], serde_json::json!([e]));
+    assert_eq!(
+        read(app.clone()).await["unexplained_observations"],
+        serde_json::json!([e])
+    );
+    let hypothesis = serde_json::json!({"id":h,"kind":"hypothesis","title":"Explains the blip"});
+    let link = serde_json::json!({"kind":"link","title":"explains","body":"It would cause it","from":e,"to":h,"relation":"supports"});
+    let (status, body) = post(
+        &app,
+        serde_json::json!({"changes":[
+            {"op":"create","record":hypothesis},
+            {"op":"create","record":link},
+        ]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["unexplained_observations"], none);
+    assert_eq!(read(app).await["unexplained_observations"], none);
+}
+/// A state only a client's read sees (the project invalid or unreadable
+/// between two of the monitor's polls) is published to the change events,
+/// so the poll that sees the project as before announces it again. Before,
+/// only the monitor published, the watch kept the old revision, and that
+/// client never got an event to recover.
+#[tokio::test]
+async fn reads_publish_what_they_saw_so_recovery_is_announced() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = Store::init(dir.path()).unwrap();
+    hyp::cli::seed_demo(&store).unwrap();
+    let valid = store.snapshot().unwrap().revision;
+    let (events, _keep) = tokio::sync::watch::channel(valid.clone());
+    let state = Arc::new(AppState {
+        store: store.clone(),
+        port: 7432,
+        token: "test-token".into(),
+        events,
+    });
+    let app = router(state.clone());
+    let read = || async {
+        let response = app
+            .clone()
+            .oneshot(req("GET", "/api/snapshot", serde_json::Value::Null))
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (
+            status,
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+        )
+    };
+    let published = || state.events.borrow().clone();
+    // Invalid: a record file broken, then repaired before any poll.
+    let file = std::fs::read_dir(dir.path().join("hyp/hypotheses"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let original = std::fs::read_to_string(&file).unwrap();
+    std::fs::write(&file, "broken").unwrap();
+    let (status, invalid) = read().await;
+    assert_eq!(status, StatusCode::OK, "{invalid}");
+    assert_ne!(invalid["revision"], valid.as_str());
+    assert_eq!(published(), invalid["revision"].as_str().unwrap());
+    std::fs::write(&file, &original).unwrap();
+    assert_eq!(read().await.1["revision"], valid.as_str());
+    assert_eq!(published(), valid);
+    // Unreadable: the project directory gone for a moment.
+    let hyp = dir.path().join("hyp");
+    std::fs::rename(&hyp, dir.path().join("moved")).unwrap();
+    assert_eq!(read().await.0, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(published(), "unavailable");
+    std::fs::rename(dir.path().join("moved"), &hyp).unwrap();
+    assert_eq!(read().await.1["revision"], valid.as_str());
+    assert_eq!(published(), valid);
+}
 #[tokio::test]
 async fn rejects_foreign_host_origin_and_missing_token() {
     let (_dir, app, store) = app();

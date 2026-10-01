@@ -20,7 +20,14 @@ let snapshot = null,
   editing = null,
   dirty = false,
   pending = false,
-  connected = false;
+  connected = false,
+  retry = null,
+  retries = 0,
+  reads = 0;
+// The backstop re-read (`retrySoon`): how long after a failed or blocked
+// read, and how many times in a row; the server's own poll is every 2 s.
+const RETRY_MS = 2000;
+const RETRY_LIMIT = 15;
 let filters = {
   query: "",
   status: "",
@@ -87,6 +94,50 @@ const stanceClass = {
   mixed: "review",
 };
 const stanceBadge = (stance) => badge(stance, stanceClass[stance]);
+// The hypotheses (archived ones included) that evidence `id` bears on, in
+// project order, each with what it means for it: `Snapshot::bears_on`, read
+// from the server's bearings.
+const bearsOn = (id) =>
+  records().flatMap((h) => {
+    const b = snapshot?.bearings?.[h.record.id]?.find((x) => x.evidence === id);
+    return b ? [{ hypothesis: h, bearing: b }] : [];
+  });
+// Observations no live hypothesis accounts for, the set `hyp status` lists
+// (`Snapshot::unexplained`, derived by the server).
+const unexplainedIds = () => snapshot?.unexplained_observations || [];
+const isUnexplained = (id) => unexplainedIds().includes(id);
+const runsOf = (experiment) =>
+  all("run").filter((e) => e.record.experiment === experiment);
+// A record by ID as a link, or the bare ID when it is missing.
+const linkTo = (id) => (find(id) ? link(find(id).record) : esc(id));
+// A record by ID as plain text: short ID and title.
+const named = (id) =>
+  short(id) + (find(id) ? " · " + find(id).record.title : "");
+const ENDPOINTS_FIXED =
+  "The ends of a link cannot change: link the records anew and archive this link.";
+// The reason of a link from `hyp add --explains` when none is given
+// (cli.rs, Command::Add).
+const EXPLAINS_REASON = "Proposed as an explanation of this observation";
+// The observation a new hypothesis is created to explain: the evidence
+// whose page the form was opened from (`hyp add --explains`).
+const observationToExplain = (kind, owner, r = {}) =>
+  kind === "hypothesis" && !r.id && find(owner)?.record.kind === "evidence"
+    ? find(owner).record
+    : null;
+// A new link record, as `hyp link` and `hyp add --explains` write it.
+const newLink = (from, to, relation, title, body) => ({
+  id: "L-" + crypto.randomUUID(),
+  kind: "link",
+  title,
+  from,
+  to,
+  relation,
+  body,
+  tags: [],
+  archived: false,
+  created_at: "",
+  updated_at: "",
+});
 const related = (id) =>
   all().filter(
     (e) =>
@@ -133,21 +184,56 @@ async function fetchJSON(url, options) {
   }
   return data;
 }
+/** A backstop, not the way the page learns of recovery: the server
+ * announces every state any read of it saw (`announce` in src/web.rs), so
+ * an event follows when the project is valid again. Should that event be
+ * lost (the event stream reconnecting, say), the page reads again itself,
+ * `RETRY_MS` apart and at most `RETRY_LIMIT` times in a row, then waits
+ * for the next event. Asked repeatedly, it keeps one timer. */
+function retrySoon() {
+  if (retry || retries >= RETRY_LIMIT) return;
+  retries += 1;
+  retry = setTimeout(() => {
+    retry = null;
+    refresh();
+  }, RETRY_MS);
+}
+/** Takes `next` as the page's state: from a read, or the answer to a
+ * write. Any read still on its way is older and is then ignored. */
+function adopt(next) {
+  reads += 1;
+  snapshot = next;
+}
+/** Sends `changes` and takes the answer as the page's state, unless a read
+ * was issued while the write was on its way: that read may carry newer
+ * state (another writer's change announced meanwhile), so the page reads
+ * again instead of going back to the write's answer. */
+async function write(changes) {
+  const sent = ++reads;
+  const next = await transact(changes);
+  if (sent === reads) adopt(next);
+  else refresh();
+}
 async function refresh() {
   if (readOnly) return;
+  // Reads overlap (server events, retries, closing the editor); an older
+  // answer arriving last must not replace a newer one.
+  const read = ++reads;
   try {
     const next = await fetchJSON("/api/snapshot");
+    if (read !== reads) return;
     const blocking = next.diagnostics.filter((d) => d.blocks_writes);
     if (blocking.length) {
       if (!snapshot) {
-        snapshot = next;
+        adopt(next);
         render();
       }
       notice(
         "Invalid project files. Showing the last readable state; writes are blocked. " +
           blocking.map((d) => `${d.path}: ${d.message}`).join(" · "),
       );
-      connectivity("Invalid files · stale");
+      connectivity("Invalid files · stale · retrying");
+      retrySoon();
       return;
     }
     if (
@@ -163,13 +249,16 @@ async function refresh() {
       return;
     }
     const changed = !snapshot || snapshot.revision !== next.revision;
-    snapshot = next;
+    adopt(next);
+    retries = 0;
     if (!pending) notice(repairNotice(next));
     if (connected) connectivity("Live", true);
     if (changed) render();
   } catch (e) {
+    if (read !== reads) return;
     notice(e.message);
     connectivity("Unavailable · retrying");
+    retrySoon();
   }
 }
 function route() {
@@ -295,8 +384,24 @@ function overview() {
       "01",
     ) +
     stats() +
+    unexplainedSection() +
     `<div class="toolbar"><input id="search" aria-label="Search hypotheses" placeholder="Search statements, notes, tags…" value="${esc(filters.query)}"><select id="status-filter" aria-label="Assessment filter"><option value="">All assessments</option>${judgments.map((x) => `<option ${filters.status === x ? "selected" : ""} value="${x}">${human(x)}</option>`).join("")}</select><select id="tag-filter" aria-label="Tag filter"><option value="">All tags</option>${tags.map((t) => `<option ${filters.tag === t ? "selected" : ""} value="${esc(t)}">${esc(t)}</option>`).join("")}</select><label><input id="review-filter" type="checkbox" ${filters.review ? "checked" : ""}>Needs review</label><label><input id="archived-filter" type="checkbox" ${filters.archived ? "checked" : ""}>Archived</label></div><div class="cards" id="hypothesis-cards">${hypothesisCards()}</div>`
   );
+}
+/** The observations no live hypothesis accounts for, each with a way to
+ * propose one that explains it. Nothing while every observation is
+ * explained. */
+function unexplainedSection() {
+  const es = unexplainedIds().map(find).filter(Boolean);
+  if (!es.length) return "";
+  return `<section class="section" id="unexplained"><div class="section-head"><h2>Unexplained observations <span class="small">${es.length}</span></h2></div><p class="small">No live hypothesis accounts for these: none is supported or qualified by them, or each one that is has been falsified or archived.</p>${es
+    .map((e) =>
+      item(
+        e,
+        `<p class="small">${esc(e.record.source)}</p>${button("create:hypothesis", "＋ Explain it", e.record.id, 'class="mini-button"')}`,
+      ),
+    )
+    .join("")}</section>`;
 }
 function hypothesisCards() {
   const rows = records().filter(
@@ -332,17 +437,188 @@ function bindFilters() {
     });
   }
 }
+/** What a card says about a record beyond its summary: the hypothesis an
+ * experiment tests; for evidence, what it means for each hypothesis it
+ * bears on, or that nothing explains it. */
+function cardContext(r) {
+  if (r.kind === "experiment")
+    return `<p class="context">Tests ${linkTo(r.hypothesis)}</p>`;
+  if (r.kind !== "evidence") return "";
+  const lines = bearsOn(r.id).map(
+    ({ hypothesis: h, bearing: b }) =>
+      `<li>${stanceBadge(b.stance)} ${link(h.record)} <span class="small">${esc(b.bearings.map((x) => x.meaning).join("; "))}</span></li>`,
+  );
+  if (isUnexplained(r.id))
+    lines.push(
+      `<li>${badge("unexplained", "review")} <span class="small">No live hypothesis accounts for it.</span></li>`,
+    );
+  return lines.length
+    ? `<ul class="context interpretations">${lines.join("")}</ul>`
+    : "";
+}
 function card({ record: r }) {
   const st = state(r.id);
   const rel = related(r.id);
-  return `<article class="card"><div class="card-top"><span class="id">${esc(short(r.id))}</span>${badge(r.kind)}${st ? badge(st.judgment) : ""}${st?.needs_review ? badge("needs review", "review") : ""}${r.archived ? badge("archived") : ""}<span class="badges">${(r.tags || []).map((t) => `<span class="tag">${esc(t)}</span>`).join("")}</span></div><h3>${link(r)}</h3><p class="summary">${esc((r.scope || r.body || r.source || r.origin || r.conditions || "").slice(0, 210))}</p><div class="card-bottom"><span>${r.kind === "hypothesis" ? `${rel.filter((e) => e.record.kind === "link").length} evidence / relation links &nbsp; · &nbsp; ${rel.filter((e) => e.record.kind === "experiment").length} experiments` : esc(r.kind === "data" ? `${r.media_type} · ${bytes(r.size)} · used by ${dataUsers(r.id).length}` : r.source || r.status || r.outcome || r.judgment || (r.relation ? relationName(r.relation) : human(r.kind)))}</span><span>${r.lifecycle ? esc(r.lifecycle) + " &nbsp; · &nbsp; " : ""}${esc((r.updated_at || "").slice(0, 10))} <a class="arrow" aria-label="Open ${esc(r.title)}" href="#record/${esc(r.id)}">↗</a></span></div></article>`;
+  return `<article class="card"><div class="card-top"><span class="id">${esc(short(r.id))}</span>${badge(r.kind)}${st ? badge(st.judgment) : ""}${st?.needs_review ? badge("needs review", "review") : ""}${r.archived ? badge("archived") : ""}<span class="badges">${(r.tags || []).map((t) => `<span class="tag">${esc(t)}</span>`).join("")}</span></div><h3>${link(r)}</h3><p class="summary">${esc((r.scope || r.body || r.source || r.origin || r.conditions || "").slice(0, 210))}</p>${cardContext(r)}<div class="card-bottom"><span>${r.kind === "hypothesis" ? `${rel.filter((e) => e.record.kind === "link").length} evidence / relation links &nbsp; · &nbsp; ${rel.filter((e) => e.record.kind === "experiment").length} experiments` : esc(r.kind === "data" ? `${r.media_type} · ${bytes(r.size)} · used by ${dataUsers(r.id).length}` : r.source || r.status || r.outcome || r.judgment || (r.relation ? relationName(r.relation) : human(r.kind)))}</span><span>${r.lifecycle ? esc(r.lifecycle) + " &nbsp; · &nbsp; " : ""}${esc((r.updated_at || "").slice(0, 10))} <a class="arrow" aria-label="Open ${esc(r.title)}" href="#record/${esc(r.id)}">↗</a></span></div></article>`;
 }
-function item(e, extra = "") {
+function item(e, extra = "", withBody = true) {
   const r = e.record;
-  return `<div class="detail-item"><div class="item-top"><h3>${link(r)}</h3>${!immutable(r) ? button("edit", "Edit", r.id, 'class="mini-button"') : ""}</div><span class="id">${esc(short(r.id))}${r.archived ? " · archived" : ""}</span>${extra}${r.body ? `<div class="notes">${esc(r.body)}</div>` : ""}</div>`;
+  return `<div class="detail-item"><div class="item-top"><h3>${link(r)}</h3>${!immutable(r) ? button("edit", "Edit", r.id, 'class="mini-button"') : ""}</div><span class="id">${esc(short(r.id))}${r.archived ? " · archived" : ""}</span>${extra}${withBody && r.body ? `<div class="notes">${esc(r.body)}</div>` : ""}</div>`;
 }
-function section(title, entries, action = "", owner = "") {
-  return `<section class="section"><div class="section-head"><h2>${esc(title)} <span class="small">${entries.length}</span></h2>${action ? button("create:" + action, "＋ Add", owner) : ""}</div>${entries.map((e) => item(e)).join("") || '<p class="small">Nothing recorded yet.</p>'}</section>`;
+function section(title, entries, action = "", owner = "", render = item) {
+  return `<section class="section"><div class="section-head"><h2>${esc(title)} <span class="small">${entries.length}</span></h2>${action ? button("create:" + action, "＋ Add", owner) : ""}</div>${entries.map((e) => render(e)).join("") || '<p class="small">Nothing recorded yet.</p>'}</section>`;
+}
+/** The evidence run `r` cites, as links. */
+const cites = (r) =>
+  (r.evidence || []).length
+    ? "cites " + r.evidence.map(linkTo).join(" · ")
+    : "cites no evidence";
+/** A run: its outcome and the evidence it cites. */
+function runItem(e) {
+  return item(
+    e,
+    `<div class="badges">${badge(e.record.outcome)}</div><p class="small cited">${cites(e.record)}</p>`,
+  );
+}
+/** An experiment with its status and each of its runs. */
+function experimentItem(e) {
+  const runs = runsOf(e.record.id);
+  return item(
+    e,
+    `<div class="badges">${badge(e.record.status)}</div><div class="runs">${
+      runs
+        .map(
+          ({ record: r }) =>
+            `<div class="run" data-run="${esc(r.id)}">${badge(r.outcome)} ${link(r)} <span class="small">${cites(r)}</span></div>`,
+        )
+        .join("") || '<p class="small">No runs yet.</p>'
+    }</div>`,
+  );
+}
+/** The records `r` references, each under the role it plays for `r`
+ * (empty roles left out). Links show theirs as a direction instead. */
+function roles(r) {
+  const ids = (v) => (Array.isArray(v) ? v : [v]).filter(Boolean);
+  const list = {
+    prediction: [["Hypothesis", r.hypothesis]],
+    criterion: [["Hypothesis", r.hypothesis]],
+    gap: [
+      ["Hypothesis", r.hypothesis],
+      ["Resolved by", r.resolved_by],
+    ],
+    experiment: [["Hypothesis under test", r.hypothesis]],
+    run: [
+      ["Plan: the experiment it ran", r.experiment],
+      ["Cited evidence", r.evidence],
+    ],
+    assessment: [
+      ["Assessed hypothesis", r.hypothesis],
+      ["Evidence considered", r.evidence],
+      ["Falsification criterion", r.criterion],
+      ["Supersedes", r.supersedes],
+    ],
+  }[r.kind];
+  // A reference to a record that is gone is shown as its ID, marked.
+  const shown = (x) =>
+    x.missing
+      ? `<div class="detail-item" data-missing="${esc(x.missing)}"><div class="item-top"><h3>${esc(x.missing)}</h3>${badge("missing", "falsified")}</div></div>`
+      : item(x);
+  return (list || [])
+    .map(([title, v]) => [title, ids(v).map((id) => find(id) || { missing: id })])
+    .filter(([, entries]) => entries.length)
+    .map(([title, entries]) => section(title, entries, "", "", shown))
+    .join("");
+}
+/** An experiment's frozen targets: each as it was when the experiment was
+ * created, marked when the record has changed (or gone) since. */
+function targetsSection(x) {
+  const rows = (x.targets || []).map((t) => {
+    const now = find(t.id);
+    const changed = !now || now.revision !== t.revision;
+    const mark = !now
+      ? badge("missing", "falsified")
+      : changed
+        ? badge("changed since frozen", "review")
+        : badge("as frozen");
+    const renamed =
+      now && now.record.title !== t.title
+        ? `<p class="small">Frozen as: ${esc(t.title)}</p>`
+        : "";
+    return `<div class="detail-item target" data-target="${esc(t.id)}" data-changed="${changed}"><div class="item-top"><h3>${now ? link(now.record) : esc(t.title)}</h3><span class="badges">${now ? badge(now.record.kind) : ""}${mark}</span></div><span class="id">${esc(short(t.id))} · frozen revision ${esc(t.revision.slice(0, 12))}</span>${renamed}${changed ? `<details><summary class="small">Frozen content</summary>${frozenFields(t.body)}</details>` : ""}</div>`;
+  });
+  return `<section class="section" data-section="targets"><div class="section-head"><h2>Frozen targets <span class="small">${rows.length}</span></h2></div><p class="small">What this experiment tests, as it was when planned. A changed target needs a new experiment.</p>${rows.join("") || '<p class="small">No targets.</p>'}</section>`;
+}
+/** A frozen copy of a record (`Entry::frozen`: the record as JSON) as its
+ * fields; text that is not a JSON record (older notebooks) as it is. */
+function frozenFields(body) {
+  let r;
+  try {
+    r = JSON.parse(body);
+  } catch {
+    r = null;
+  }
+  if (!r || typeof r !== "object")
+    return `<pre class="raw">${esc(body)}</pre>`;
+  const skip = ["id", "kind", "archived", "created_at", "updated_at"];
+  const blank = (v) =>
+    v == null || v === "" || (Array.isArray(v) && !v.length);
+  // Lists of plain values joined; anything holding objects as JSON.
+  const text = (v) =>
+    typeof v !== "object"
+      ? String(v)
+      : Array.isArray(v) && v.every((x) => typeof x !== "object" || x === null)
+        ? v.join(", ")
+        : JSON.stringify(v);
+  return Object.entries(r)
+    .filter(([k, v]) => !skip.includes(k) && !blank(v))
+    .map(
+      ([k, v]) =>
+        `<div class="meta-line"><span>${esc(human(k))}</span><strong class="notes">${esc(text(v))}</strong></div>`,
+    )
+    .join("");
+}
+/** A run's plan: the experiment as it was when the run was recorded. Its
+ * frozen body is the encoded Markdown record (front matter and procedure,
+ * `Store::commit`), shown as that text: the page has no front-matter parser. */
+function planSection(run) {
+  const p = run.plan || {};
+  const now = find(p.id);
+  const changed = !now || now.revision !== p.revision;
+  return `<section class="section" data-section="plan" data-changed="${changed}"><div class="section-head"><h2>Frozen plan</h2></div><p class="small">${changed ? "The experiment has changed since this run; this is the plan as it ran." : "The experiment is unchanged since this run."} Revision ${esc((p.revision || "").slice(0, 12))}.</p><details><summary class="small">${esc(p.title)}</summary><pre class="raw">${esc(p.body)}</pre></details></section>`;
+}
+/** A link's direction: from, relation, to. */
+function directionPanel(r) {
+  const end = (label, id) =>
+    `<div class="end"><span class="eyebrow">${label}</span><strong>${linkTo(id)}</strong><span class="id">${esc(find(id) ? human(find(id).record.kind) + " · " : "")}${esc(short(id))}</span></div>`;
+  return `<div class="panel direction" data-direction>${end("FROM", r.from)}<div class="relation">${badge(relationName(r.relation), r.relation)} →</div>${end("TO", r.to)}</div>`;
+}
+/** The hypotheses evidence `id` bears on with what it means for each, its
+ * links to claims (each editable) and whether no live hypothesis accounts
+ * for it, as `hyp show E-…` lists them under "Bears on". */
+function bearsOnSection(id) {
+  const rows = bearsOn(id).map(({ hypothesis: h, bearing: b }) =>
+    item(
+      h,
+      `<div class="badges">${stanceBadge(b.stance)}${state(h.record.id) ? badge(state(h.record.id).judgment) : ""}${badge(h.record.lifecycle)}</div>${b.bearings
+        .map(
+          (x) =>
+            `<div class="bearing"><a class="small" href="#record/${esc(x.link)}">${esc(x.meaning)}</a><p class="small">${esc(find(x.link)?.record.body)}</p>${button("edit", "Edit interpretation", x.link, 'class="mini-button"')}</div>`,
+        )
+        .join("")}`,
+      false,
+    ),
+  );
+  const none = isUnexplained(id)
+    ? `<p class="unexplained">${badge("unexplained", "review")} No live hypothesis accounts for this observation.</p>`
+    : "";
+  return `<section class="section" data-section="bears-on"><div class="section-head"><h2>Bears on <span class="small">${rows.length}</span></h2><span class="actions">${button("create:link", "＋ Interpret", id)}${button("create:hypothesis", "＋ Explain with a new hypothesis", id)}</span></div>${none}${rows.join("") || '<p class="small">It bears on no hypothesis yet.</p>'}</section>`;
+}
+/** A record as JSON, frozen copies left out: they are shown above. */
+function structured(r) {
+  const shown = structuredClone(r);
+  for (const t of [...(shown.targets || []), shown.plan].filter(Boolean))
+    t.body = "(frozen content, shown above)";
+  return JSON.stringify(shown, null, 2);
 }
 function detail(id) {
   const e = find(id);
@@ -353,7 +629,16 @@ function detail(id) {
     );
   const r = e.record,
     st = state(id);
-  const top = `<div class="page-title"><div><span class="eyebrow">${esc(human(r.kind))} · ${esc(short(r.id))}</span><h1>${esc(r.title)}</h1><div class="badges">${st ? badge(st.judgment) : ""}${st?.needs_review ? badge("needs review", "review") : ""}${r.lifecycle ? badge(r.lifecycle) : ""}${r.archived ? badge("archived") : ""}</div></div><div class="actions">${!immutable(r) ? button("edit", "Edit record", r.id) : ""}${!["assessment", "run"].includes(r.kind) ? button(r.archived ? "restore" : "archive", r.archived ? "Restore" : "Archive", r.id) : ""}${r.archived ? button("delete", "Delete", r.id) : ""}</div></div>`;
+  // What state the record is in, by kind: an experiment's status, a run's
+  // outcome, an assessment's judgment (a link's relation: `directionPanel`).
+  const facets = [
+    r.status && badge(r.status),
+    r.outcome && badge(r.outcome),
+    r.judgment && badge(r.judgment),
+  ]
+    .filter(Boolean)
+    .join("");
+  const top = `<div class="page-title"><div><span class="eyebrow">${esc(human(r.kind))} · ${esc(short(r.id))}</span><h1>${esc(r.title)}</h1><div class="badges">${st ? badge(st.judgment) : ""}${st?.needs_review ? badge("needs review", "review") : ""}${r.lifecycle ? badge(r.lifecycle) : ""}${facets}${r.archived ? badge("archived") : ""}</div></div><div class="actions">${!immutable(r) ? button("edit", "Edit record", r.id) : ""}${!["assessment", "run"].includes(r.kind) ? button(r.archived ? "restore" : "archive", r.archived ? "Restore" : "Archive", r.id) : ""}${r.archived ? button("delete", "Delete", r.id) : ""}</div></div>`;
   // The data records this record references (decision-0005).
   const dataRefs = section(
     "Data",
@@ -362,39 +647,33 @@ function detail(id) {
   if (r.kind === "data") return top + dataDetail(e);
   if (r.kind !== "hypothesis") {
     let extra = "";
-    if (r.kind === "experiment") {
-      extra = section(
-        "Runs",
-        all("run").filter((e) => e.record.experiment === id),
-        "run",
-        id,
-      );
-    }
+    if (r.kind === "experiment")
+      extra =
+        targetsSection(r) + section("Runs", runsOf(id), "run", id, runItem);
+    if (r.kind === "run") extra = planSection(r);
+    if (r.kind === "link") extra = directionPanel(r);
     if (r.kind === "evidence") {
-      extra = section(
-        "Interpretations",
-        all("link").filter((e) => e.record.from === id),
-        "link",
-        id,
+      // Links from it that bear on no hypothesis (to an archived claim, say).
+      const shown = new Set(
+        bearsOn(id).flatMap(({ bearing: b }) => b.bearings.map((x) => x.link)),
       );
+      const other = all("link").filter(
+        (e) => e.record.from === id && !shown.has(e.record.id),
+      );
+      extra =
+        bearsOnSection(id) +
+        (other.length ? section("Other interpretations", other) : "");
     }
-    const references = [
-      r.hypothesis,
-      r.experiment,
-      r.from,
-      r.to,
-      ...(r.evidence || []),
-    ]
-      .filter(Boolean)
-      .map(find)
-      .filter(Boolean);
+    const history = ["assessment", "run"].includes(r.kind)
+      ? `<p class="small">${r.kind === "run" ? "Runs" : "Assessments"} are history: they cannot be edited or archived. Record a new one instead.</p>`
+      : "";
     return (
       top +
-      `<div class="panel"><div class="notes">${esc(r.body || "No additional notes.")}</div>${r.source ? `<p class="small">Source: ${esc(r.source)} · ${esc(r.locator)}</p>` : ""}${r.confidence != null ? `<p>Subjective confidence: ${Math.round(r.confidence * 100)}%</p>` : ""}</div>` +
+      `<div class="panel"><div class="notes">${esc(r.body || "No additional notes.")}</div>${r.source ? `<p class="small">Source: ${esc(r.source)}${r.locator ? " · " + esc(r.locator) : ""}</p>` : ""}${r.confidence != null ? `<p>Subjective confidence: ${Math.round(r.confidence * 100)}%</p>` : ""}${history}</div>` +
       extra +
       (r.data?.length ? dataRefs : "") +
-      section("Referenced records", references) +
-      `<details class="section"><summary>Structured record · ${esc(e.revision.slice(0, 12))}</summary><pre class="raw">${esc(JSON.stringify(r, null, 2))}</pre></details>`
+      roles(r) +
+      `<details class="section"><summary>Structured record · ${esc(e.revision.slice(0, 12))}</summary><pre class="raw">${esc(structured(r))}</pre></details>`
     );
   }
   const owned = all().filter((e) => e.record.hypothesis === id);
@@ -435,6 +714,7 @@ function detail(id) {
     owned.filter((e) => e.record.kind === "experiment"),
     "experiment",
     id,
+    experimentItem,
   )}${section(
     "Open questions",
     owned.filter((e) => e.record.kind === "gap" && !e.record.resolved),
@@ -449,12 +729,16 @@ function detail(id) {
           ) &&
           (e.record.from === id || e.record.to === id),
       )
-      .map((e) =>
-        item(
+      .map((e) => {
+        // Named from this hypothesis's side: the other end of the link.
+        const rel = esc(relationName(e.record.relation));
+        return item(
           e,
-          `<p>${esc(relationName(e.record.relation))} ${find(e.record.to) ? link(find(e.record.to).record) : esc(e.record.to)}</p>`,
-        ),
-      )
+          e.record.from === id
+            ? `<p data-direction="from">This hypothesis ${rel} ${linkTo(e.record.to)}</p>`
+            : `<p data-direction="to">${linkTo(e.record.from)} ${rel} this hypothesis</p>`,
+        );
+      })
       .join("") || '<p class="small">No hypothesis relationships.</p>'
   }</section></div>`;
   const side = `<div class="detail-side"><div class="panel"><span class="eyebrow">CURRENT ASSESSMENT</span><h2>${esc(human(st?.judgment || "untested"))}</h2>${current.length > 1 ? '<p class="diagnostics">Conflicting assessment branches. Add an assessment to reconcile them.</p>' : ""}${st?.confidence != null ? `<div class="meta-line"><span>Subjective confidence</span><strong>${Math.round(st.confidence * 100)}%</strong></div>` : ""}<p class="small">${st?.needs_review ? "The underlying record changed. This judgment needs review." : "Judgment is explicit. Evidence never changes it automatically."}</p>${current.map((e) => `<p class="notes">${esc(e.record.body)}</p>`).join("")}<div class="section">${button("create:assessment", "Review hypothesis", id, 'class="primary"')}</div></div><div class="panel section"><span class="eyebrow">NOTEBOOK DETAILS</span><div class="meta-line"><span>Lifecycle</span><strong>${esc(r.lifecycle)}</strong></div><div class="meta-line"><span>Created</span><strong>${esc(r.created_at.slice(0, 10))}</strong></div><p class="small">${r.tags.map((t) => "#" + esc(t)).join(" ")}</p><p class="small">${esc(r.untestable_reason || "")}</p><a href="#graph/${esc(id)}">Explore relationships ↗</a><details><summary class="small">Full ID & revision</summary><pre class="raw">${esc(id)}\n${esc(e.revision)}</pre></details></div></div>`;
@@ -647,11 +931,20 @@ function openEditor(kind, owner = "", entry = null) {
   if (readOnly) return;
   // The form shows this snapshot, so every precondition of the save is taken
   // from it, never from a refresh that arrives while the form is open.
-  editing = { kind, owner, entry, seen: snapshot };
+  // The observation a new hypothesis explains is fixed when the form opens:
+  // the save then always sends its link, and the server rejects it if the
+  // observation is gone meanwhile.
+  const explains = observationToExplain(kind, owner, entry?.record)?.id || "";
+  editing = { kind, owner, entry, seen: snapshot, explains };
   dirty = false;
   pending = false;
   $("#form-error").textContent = "";
-  $("#editor-title").textContent = (entry ? "Edit " : "New ") + human(kind);
+  // A link from evidence is an interpretation of it.
+  const interpretation =
+    kind === "link" &&
+    find(entry?.record.from ?? owner)?.record.kind === "evidence";
+  $("#editor-title").textContent =
+    (entry ? "Edit " : "New ") + (interpretation ? "interpretation" : human(kind));
   $("#editor-fields").innerHTML = formFields(kind, owner, entry?.record);
   $("#editor").showModal();
   $("#editor-fields input")?.focus();
@@ -669,6 +962,17 @@ function formFields(kind, owner, r = {}) {
         "Reason if no falsification criterion",
         r.untestable_reason || "",
       );
+    const ev = observationToExplain(kind, owner, r);
+    if (ev)
+      f +=
+        `<p class="small" data-explains="${esc(ev.id)}">Explains ${esc(short(ev.id))} · ${esc(ev.title)}: saved together with a supports link from the observation to the new hypothesis.</p>` +
+        field(
+          "reason",
+          "Why it would explain the observation",
+          "",
+          "textarea",
+          `Left empty: ${EXPLAINS_REASON}.`,
+        );
   }
   if (
     ["prediction", "criterion", "gap", "experiment", "assessment"].includes(
@@ -703,10 +1007,14 @@ function formFields(kind, owner, r = {}) {
         "A URL, project-relative path, or description of the observation source.",
       ) +
       field("locator", "Precise locator", r.locator || "") +
+      // RFC 3339 with an offset (toISOString: UTC) or a date; empty means
+      // unknown. Only a new record defaults to now: an edit keeps "unknown".
       field(
         "observed_at",
         "Observation date",
-        r.observed_at || new Date().toISOString(),
+        r.id ? r.observed_at || "" : new Date().toISOString(),
+        "text",
+        "An RFC 3339 timestamp with offset, or YYYY-MM-DD; empty if unknown.",
       );
     if (!r.id)
       f +=
@@ -738,15 +1046,19 @@ function formFields(kind, owner, r = {}) {
         ),
       )
       .map((e) => [e.record.id, short(e.record.id) + " · " + e.record.title]);
-    f +=
-      select("from", "From", opts, r.from || owner) +
-      select(
-        "relation",
-        "Relation",
-        relations.map((r) => [r, relationName(r)]),
-        r.relation || "supports",
-      ) +
-      select("to", "To", opts, r.to || "");
+    const relation = select(
+      "relation",
+      "Relation",
+      relations.map((r) => [r, relationName(r)]),
+      r.relation || "supports",
+    );
+    // The ends of an existing link are fixed (`buildRecord`).
+    f += r.id
+      ? `<p class="small" data-endpoints>From ${esc(named(r.from))} to ${esc(named(r.to))}. ${ENDPOINTS_FIXED}</p>` +
+        relation
+      : select("from", "From", opts, r.from || owner) +
+        relation +
+        select("to", "To", opts, r.to || "");
   }
   if (kind === "experiment") {
     f += select(
@@ -846,8 +1158,16 @@ function buildRecord(form) {
         updated_at: "",
         kind,
       };
-  if (entry && get("advanced") !== JSON.stringify(entry.record, null, 2))
-    return JSON.parse(get("advanced"));
+  if (entry && get("advanced") !== JSON.stringify(entry.record, null, 2)) {
+    const edited = JSON.parse(get("advanced"));
+    const old = entry.record;
+    if (
+      old.kind === "link" &&
+      (edited.from !== old.from || edited.to !== old.to)
+    )
+      throw new Error(ENDPOINTS_FIXED);
+    return edited;
+  }
   r.title = get("title");
   r.body = get("body");
   r.tags = get("tags")
@@ -886,11 +1206,9 @@ function buildRecord(form) {
       });
       break;
     case "link":
-      Object.assign(r, {
-        from: get("from"),
-        to: get("to"),
-        relation: get("relation"),
-      });
+      // An edit keeps the ends (`ENDPOINTS_FIXED`); its form has no fields for them.
+      if (!entry) Object.assign(r, { from: get("from"), to: get("to") });
+      r.relation = get("relation");
       break;
     case "experiment":
       r.status = get("status");
@@ -979,21 +1297,27 @@ async function save(ev) {
     if (!editing.entry && r.kind === "evidence" && fd.get("target"))
       changes.push({
         op: "create",
-        record: {
-          id: "L-" + crypto.randomUUID(),
-          kind: "link",
-          title: "Interpretation of " + r.title,
-          from: r.id,
-          to: fd.get("target"),
-          relation: fd.get("relation"),
-          body: fd.get("reason") || r.title,
-          tags: [],
-          archived: false,
-          created_at: "",
-          updated_at: "",
-        },
+        record: newLink(
+          r.id,
+          fd.get("target"),
+          fd.get("relation"),
+          "Interpretation of " + r.title,
+          fd.get("reason") || r.title,
+        ),
       });
-    snapshot = await transact(changes);
+    // A hypothesis proposed for an observation, linked in the same write.
+    if (editing.explains)
+      changes.push({
+        op: "create",
+        record: newLink(
+          editing.explains,
+          r.id,
+          "supports",
+          `${r.id.slice(0, 10)} explains ${editing.explains.slice(0, 10)}`,
+          fd.get("reason") || EXPLAINS_REASON,
+        ),
+      });
+    await write(changes);
     dirty = false;
     pending = false;
     $("#editor").close();
@@ -1042,7 +1366,7 @@ async function action(e) {
   )
     return;
   try {
-    snapshot = await transact([
+    await write([
       {
         op: action === "delete" ? "delete" : "archive",
         id,

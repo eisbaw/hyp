@@ -21,6 +21,15 @@ body {
   background: var(--paper);
   color: var(--ink);
   font: 14px/1.55 var(--sans);
+  /* Titles, IDs and sources often hold paths and identifiers without
+     spaces: break them anywhere rather than widen the page (HYPO-0042). */
+  overflow-wrap: anywhere;
+}
+/* Controls and labels are short words: never break inside them. */
+button,
+.badge,
+.tag {
+  overflow-wrap: normal;
 }
 button,
 input,
@@ -455,6 +464,7 @@ input[type="checkbox"] {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
   gap: 12px;
   margin-bottom: 15px;
 }
@@ -499,6 +509,7 @@ input[type="checkbox"] {
 }
 .meta-line span {
   color: var(--muted);
+  overflow-wrap: normal;
 }
 .actions {
   display: flex;
@@ -546,6 +557,37 @@ input[type="checkbox"] {
 }
 .bearing {
   margin-top: 8px;
+}
+.context {
+  font-size: 12px;
+  margin: -8px 0 16px;
+}
+.interpretations {
+  list-style: none;
+  padding: 0;
+}
+.interpretations li {
+  margin: 4px 0;
+}
+.detail-item .badges {
+  margin-top: 8px;
+}
+.run,
+.unexplained {
+  margin: 8px 0;
+  font-size: 12px;
+}
+.direction {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 14px;
+  margin: 29px 0;
+}
+.direction .end {
+  display: grid;
+  gap: 3px;
+  flex: 1 1 200px;
 }
 .evidence-heading.negative {
   color: #aa6a52;
