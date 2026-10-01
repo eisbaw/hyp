@@ -29,12 +29,8 @@ async function main() {
     });
     server.on("exit", (code) => reject(new Error("server exited " + code)));
   });
-  browser = await chromium.launch({
-    headless: true,
-    ...(process.env.CHROMIUM_PATH
-      ? { executablePath: process.env.CHROMIUM_PATH }
-      : {}),
-  });
+  // The browser comes from PLAYWRIGHT_BROWSERS_PATH, which the flake sets.
+  browser = await chromium.launch({ headless: true });
   const page = await browser.newPage({
     viewport: { width: 1440, height: 1050 },
   });

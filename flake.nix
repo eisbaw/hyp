@@ -11,16 +11,22 @@
         npmRoot = ./scripts;
         nodejs = pkgs.nodejs;
       };
-      # Headless Chromium for scripts/browser-test.cjs, from the nixpkgs Playwright build.
-      # The npm `playwright` in scripts/package.json must be the version of
-      # pkgs.playwright-driver (1.59.1 at the current flake.lock): each Playwright
-      # release looks for its own browser revision under PLAYWRIGHT_BROWSERS_PATH.
-      # After a nixpkgs update, pin the new version there and regenerate the lockfile.
-      playwrightBrowsers = pkgs: pkgs.playwright-driver.browsers.override {
-        withChromium = false;
-        withFirefox = false;
-        withWebkit = false;
-      };
+      # The npm `playwright` that scripts/browser-test.cjs runs, an exact version.
+      npmPlaywright = (builtins.fromJSON (builtins.readFile ./scripts/package.json)).dependencies.playwright;
+      # Browsers for scripts/browser-test.cjs, from the nixpkgs Playwright build: the
+      # Chromium headless shell only (what a headless launch uses; withChromium =
+      # false leaves out full Chromium). Each Playwright release looks for its own
+      # browser revisions under PLAYWRIGHT_BROWSERS_PATH, so the npm version must be
+      # pkgs.playwright-driver's; evaluation fails otherwise. After a nixpkgs update,
+      # pin the new version in scripts/package.json and regenerate the lockfile.
+      playwrightBrowsers = pkgs:
+        assert pkgs.lib.assertMsg (pkgs.playwright-driver.version == npmPlaywright)
+          "scripts/package.json pins playwright ${npmPlaywright}, but nixpkgs has playwright-driver ${pkgs.playwright-driver.version}: pin that exact version and regenerate scripts/package-lock.json";
+        pkgs.playwright-driver.browsers.override {
+          withChromium = false;
+          withFirefox = false;
+          withWebkit = false;
+        };
       # What scripts/browser-test.cjs needs besides node: the browser, and no
       # check of host libraries, which nix provides.
       playwrightEnv = pkgs: {

@@ -166,7 +166,15 @@ fn a_value_hyp_cannot_store_is_refused_not_written() {
     let err = store
         .commit(vec![Change::create_seen(h, &Snapshot::default())], None)
         .unwrap_err();
-    assert!(format!("{err:#}").contains("U+2028"), "{err:#}");
+    // Error kinds are contract (decision-0002): input to fix.
+    assert_eq!(
+        hyp::error::kind_of(&err),
+        hyp::error::ErrorKind::InvalidInput,
+        "{err:#}"
+    );
+    let message = format!("{err:#}");
+    assert!(message.contains("U+2028"), "{message}");
+    assert!(message.contains("untestable_reason"), "{message}");
     assert_eq!(crate::files(&dir.path().join("hyp")), before);
     assert!(store.read(Verify::Content).unwrap().diagnostics.is_empty());
 }

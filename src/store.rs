@@ -930,12 +930,29 @@ pub fn encode(r: &Record) -> Result<String> {
     // line breaks) without a line feed; the closing `---` would then not
     // start a line, and `decode` could not read the file back. Refuse it
     // rather than write a file that blocks every later write.
-    ensure!(
-        yaml.ends_with('\n'),
-        "{}: a multi-line text field ends with a Unicode line or paragraph separator \
-         (U+2028 or U+2029), which hyp cannot store yet; remove it and retry",
-        r.id
-    );
+    if !yaml.ends_with('\n') {
+        let field = serde_json::to_value(&header)
+            .ok()
+            .and_then(|v| {
+                v.as_object()?
+                    .iter()
+                    .find(|(_, v)| {
+                        v.as_str().is_some_and(|s| {
+                            s.contains('\n') && s.ends_with(['\u{2028}', '\u{2029}'])
+                        })
+                    })
+                    .map(|(name, _)| format!("field {name}"))
+            })
+            .unwrap_or_else(|| "a field".into());
+        bail!(Classified::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "{}: {field} is multi-line and ends with a Unicode line or paragraph \
+                 separator (U+2028 or U+2029), which hyp cannot store",
+                r.id
+            )
+        ));
+    }
     Ok(format!("---\n{yaml}---\n{}", r.body))
 }
 /// An error in the YAML front matter of a record file, its line numbers

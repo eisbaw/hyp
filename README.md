@@ -333,7 +333,7 @@ The Rust tests cover semantic workflows, stale writes, concurrent writers, inval
 
 `scripts/browser-test.cjs` runs the UI in headless Chromium with Playwright: `just browser-test`, and the `e2e-browser` flake check. The flake provides the browser (`PLAYWRIGHT_BROWSERS_PATH`); the npm `playwright` in `scripts/package.json` must match the nixpkgs `playwright-driver` version, so pin both together after a nixpkgs update. Set `HYP_BIN` to test a packaged executable.
 
-`tests/properties/` holds property tests (proptest, stable Rust) of the record format, validation, commits, crash recovery and the review fingerprint. `just test` and the flake check run a few cases each with a fixed seed, so they are reproducible; `just fuzz [SECONDS] [CASES]` runs many cases with fresh seeds. A failing case is saved under `tests/proptest-regressions/` and replayed first; commit it with the fix.
+`tests/properties/` holds property tests (proptest, stable Rust) of the record format, validation, commits, crash recovery and the review fingerprint. `just test` and the flake check run a capped number of cases per property (8 to 256) with a fixed seed, so they are reproducible; `just fuzz [SECONDS] [CASES]` runs many cases with fresh seeds. A failing case is saved under `tests/proptest-regressions/` and replayed first; commit it with the fix.
 
 ## Scope of this release
 

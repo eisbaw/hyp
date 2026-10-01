@@ -328,6 +328,48 @@ fn plain(title: &str, data: Data) -> Record {
     r
 }
 
+/// `rich` builds what it says: with nothing archived, the basis of its
+/// hypothesis holds the claim, its criterion and prediction, the three links,
+/// all three observations (two linked, one cited by the run) and the run,
+/// and not the experiment or the data record (whose hash counts under the
+/// evidence instead). The fingerprint properties take basis members from
+/// `basis` itself, so they alone would not notice a member missing.
+#[test]
+fn the_rich_basis_holds_every_record_built_for_it() {
+    use proptest::{strategy::ValueTree, test_runner::TestRunner};
+    let mut runner = TestRunner::deterministic();
+    let mut records = rich().new_tree(&mut runner).unwrap().current();
+    records.iter_mut().for_each(|r| r.archived = false);
+    let snap = snapshot_of(records);
+    let basis = snap.basis(&rich_hypothesis());
+    let id = |k: Kind, n: u128| id_of(k, 100 + n);
+    let expected = [
+        id(Kind::Hypothesis, 0),
+        id(Kind::Criterion, 0),
+        id(Kind::Prediction, 0),
+        id(Kind::Evidence, 0),
+        id(Kind::Evidence, 1),
+        id(Kind::Evidence, 2),
+        id(Kind::Link, 0),
+        id(Kind::Link, 1),
+        id(Kind::Link, 2),
+        id(Kind::Run, 0),
+    ];
+    for want in &expected {
+        assert!(basis.contains_key(want), "{want} is not in the basis: {basis:#?}");
+    }
+    for not in [id(Kind::Experiment, 0), id(Kind::Data, 0)] {
+        assert!(!basis.contains_key(&not), "{not} is in the basis");
+    }
+    assert_eq!(
+        basis[&id(Kind::Evidence, 0)]["attachments"],
+        serde_json::json!([snap.get(&id(Kind::Data, 0)).map(|e| match &e.record.data {
+            Data::Captured { sha256, .. } => sha256.clone(),
+            _ => unreachable!(),
+        })])
+    );
+}
+
 proptest! {
     #![proptest_config(crate::cases(64))]
 

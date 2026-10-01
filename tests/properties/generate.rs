@@ -82,11 +82,14 @@ const NASTY: &[&str] = &[
     "\u{10FFFF}",
 ];
 
-/// Any text, biased towards what breaks serializers.
+/// Any text, biased towards what breaks serializers; also long lines of
+/// words, which a YAML emitter may fold. Used for titles, scopes and every
+/// other text field.
 pub fn text() -> BoxedStrategy<String> {
     let nasty = || select(NASTY).prop_map(String::from);
     prop_oneof![
         6 => "[a-zA-Z0-9 .,]{0,24}",
+        1 => "[a-z ]{60,300}",
         2 => any::<String>(),
         3 => vec(nasty(), 0..6).prop_map(|v| v.concat()),
         2 => vec(prop_oneof![nasty(), any::<String>()], 0..4).prop_map(|v| v.concat()),
