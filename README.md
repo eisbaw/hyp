@@ -1,8 +1,12 @@
 # hyp
 
-**A place to change your mind.** A hypothesis notebook for coding and research agents. When an agent suspects a cause, hyp gives it a place to record the claim, state what would falsify it, plan experiments, cite what it observed and record an explicit judgment, instead of declaring victory early. Humans inspect and steer through a live WebUI.
+**A place to change your mind.** hyp is [backlog.md](https://github.com/MrLesk/Backlog.md), but for hypotheses: a notebook in which coding and research agents work in a structured way with tentative, unconfirmed information. When an agent suspects a cause, hyp gives it a place to record the claim, state what would falsify it, plan experiments, cite what it observed and record an explicit judgment, instead of declaring victory early. Humans inspect and steer through a live WebUI.
 
-It keeps everything as Markdown files in a plain directory. Git is not needed, but the files are Git-friendly (see [Using hyp with Git](#using-hyp-with-git-optional)).
+Agents produce hypotheses all the time ("the bug is probably X") and readily report one as the root cause with no falsification criterion and no cited evidence. hyp makes the discipline a rule the tool enforces rather than advice in a prompt, because agents follow tool errors more reliably than prose: an investigation needs a falsification criterion (or a stated reason why there can be none), every judgment gives a rationale and every one except `untested` cites linked evidence, and `falsified` names a criterion and cites evidence that meets it. Agents are the primary users, so the CLI's `--json` output, exit codes and error kinds are a [stable contract](#machine-contract) ([decision-0002](backlog/decisions/decision-0002%20-%20hyp-is-primarily-a-tool-for-agents-to-work-in-a-structured-way-with-tentative-unconfirmed-information-humans-inspect-and-steer.md)).
+
+Like backlog.md, it keeps everything as Markdown files in any directory. Git is not needed and hyp never runs it, but the files are Git-friendly ([decision-0001](backlog/decisions/decision-0001%20-%20hyp-does-not-require-or-depend-on-Git-but-is-Git-friendly.md); see [Using hyp with Git](#using-hyp-with-git-optional)).
+
+What hyp is not, and how it compares with similar tools: [When not to use hyp](#when-not-to-use-hyp), [Conceptual model](#conceptual-model), [Related tools](#related-tools).
 
 No account, cloud service, database server, telemetry, CDN or JavaScript build step. One executable serves its embedded HTML/CSS/JavaScript assets. The application and all validation/storage logic are Rust.
 
@@ -341,4 +345,52 @@ hyp itself makes no judgments: agents and humans record them. No automated exper
 
 See [VALIDATION.md](VALIDATION.md) for the checks run on this release.
 
-Licensed under MIT.
+## When not to use hyp
+
+hyp records an investigation; it does not carry one out. It holds tentative claims, not settled ones. Use something else for:
+
+- **Statistics.** hyp computes no p-values, posteriors or effect sizes, and a confidence is a number someone entered. Run the analysis elsewhere and cite its output as evidence (`hyp capture` keeps the bytes).
+- **Running experiments.** `hyp run` records an execution; it executes nothing. Agentic falsification frameworks such as POPPER (see [Related tools](#related-tools)) do the testing.
+- **Literature mining or generating hypotheses.** hyp neither searches sources nor proposes claims.
+- **Debate among many people.** Multi-user argument-mapping platforms such as Arguman are built for it; hyp is local, has no accounts and has one notebook per project (see [Scope of this release](#scope-of-this-release)).
+- **A shared knowledge base or agent memory.** hyp has no retrieval, access control or server. A claim that is no longer tentative belongs in documentation, a specification or a test (see [Conceptual model](#conceptual-model)).
+- **A one-off evidence map to publish.** When one question is settled in one sitting and the goal is a document for readers, a single-question map such as Doubt's fits better than a notebook with a lifecycle and review tracking.
+- **Plans and tasks.** What to do next belongs in a task tracker such as backlog.md. A hyp experiment is the procedure for testing a claim, not a work item.
+
+## Conceptual model
+
+Structured knowledge kept beside code can be sorted by *direction of fit*: when the record and the world disagree, which one is wrong? Anscombe's shopping list (*Intention*, 1957) is the classic case: the same list is an instruction for the shopper and a report for a detective following him, so a mismatch is the shopper's mistake in what he bought but the detective's mistake in what he wrote. Searle named the two directions word-to-world and world-to-word (*Intentionality*, 1983). Zave and Jackson draw the same line in software between indicative statements, the environment as it is (domain knowledge), and optative ones, the environment as we want it (requirements) ("Four Dark Corners of Requirements Engineering", ACM TOSEM 6(1), 1997).
+
+| Kind         | Holds                               | When record and world disagree                             | Example                   |
+| ------------ | ----------------------------------- | ---------------------------------------------------------- | ------------------------- |
+| Definitional | What there is: ontology, vocabulary | No direction of its own: it fixes the terms the others use | glossary, schema          |
+| Descriptive  | Observations, hypotheses, facts     | The record is wrong: it must fit the world                 | **hyp**                   |
+| Normative    | Specifications, invariants          | The world is wrong: it must keep fitting the record        | specs, tests, type checks |
+| Imperative   | Tasks: what to do                   | The world is not there yet: the task is open               | backlog.md                |
+
+Descriptive claims also differ in epistemic status, and move along it:
+
+```text
+observation -> hypothesis -> corroborated -> fact -> stale
+```
+
+An observation is a dated record of something seen. A hypothesis is a claim that would explain it or predict more. A hypothesis that has survived serious attempts to refute it is corroborated; one relied on without citing evidence any more has become a fact; any of them goes stale when what it rested on changes. Checks move a claim along the axis: each is an evidential event (an experiment run, an observation linked to a criterion or prediction) followed by a judgment that cites it. A check whose observation meets a falsification criterion takes the claim off the axis instead: it is refuted.
+
+hyp covers the descriptive corner up to corroboration. Observations are evidence (`hyp observe`; captured bytes are data records), hypotheses carry their criteria and predictions, experiments and runs are the checks, and assessments are the judgments: `supported` for corroborated, which never means proven, and `falsified` for refuted. Staleness shows as **needs review** when anything an assessment's basis holds changes; a world that changed without a new record goes unnoticed. Facts are out of scope: hyp has no "true" state and closing an investigation declares nothing, so a claim that has become a fact moves out, into documentation or into a test, where its direction of fit turns normative.
+
+## Related tools
+
+hyp's shape (plain files in any directory, a CLI for agents, a browser view for humans, agent instructions installed by the tool) comes from backlog.md. Each entry below was checked against its repository in October 2026; licences are as the repository states them.
+
+- [backlog.md](https://github.com/MrLesk/Backlog.md) (MIT): Markdown task manager and Kanban board for humans and AI agents, with a CLI and a web UI. It tracks what to do; hyp tracks what is believed and on what evidence.
+- [Doubt](https://github.com/alsoleg89/doubt) (MIT): agent skill and zero-dependency Node CLI that turns one contested question into a source-grounded evidence map (claims, observations, unknowns; `supports`, `contradicts`, `qualifies` and `missing` edges), stored as JSON and rendered as self-contained HTML. The closest evidence model; a map is one document per question, while hyp is a notebook kept through an investigation, with falsification criteria, experiments, runs and judgments that are flagged when their basis changes.
+- [RigorGraph](https://github.com/f0909172434/rigorgraph) (MIT): local-first Python CLI, GitHub Action and agent skills that keep claim-evidence graphs in JSONL, audit them deterministically and render an offline HTML report; a claim becomes `VERIFIED` only with an independent review record. Built for promoting research claims (proofs, literature, benchmarks) through review; hyp centres on falsification of tentative causes and has a live WebUI instead of a report.
+- [Epistemos](https://github.com/Voltolini-SPACE/epistemos) (MIT): Python engine and web panel for agent memory and provenance: claims with typed evidence and reviews from which belief is derived, bitemporal history, SQLite storage, access over SDK, REST and MCP, and authorization. Knowledge infrastructure for many agents; hyp is a file-based notebook with no database or service.
+- [POPPER](https://github.com/snap-stanford/POPPER) (MIT in its `setup.py`; no licence file): research code for *Automated Hypothesis Validation with Agentic Sequential Falsifications* (Huang et al., 2025), in which LLM agents design and run falsification experiments under a sequential test that controls the Type-I error. It performs the testing; hyp records it. Its result can be cited as evidence in hyp.
+- [popper](https://github.com/kliewerdaniel/popper) (no licence stated): a research program that tests whether a knowledge-graph compiler produces falsifiable hypotheses from literature; a hypothesis without a falsification condition or a quantitative prediction fails to "compile". It generates and benchmarks hypotheses; hyp tracks them through an investigation.
+- [go-argmap](https://github.com/BaseMax/go-argmap) (MIT): Go terminal UI for argument maps (claims, premises, objections, supports) saved as JSON or text, with circular-reasoning detection. Argument structure without evidence provenance, experiments or judgments.
+- [Arguman](https://github.com/arguman/arguman.org) (GPL-3.0 per its README): self-hosted Django platform where many users argue contentions with premises joined by "because", "but" or "however". Public debate rather than a single project's investigation record.
+
+## License
+
+MIT, see [LICENSE](LICENSE).

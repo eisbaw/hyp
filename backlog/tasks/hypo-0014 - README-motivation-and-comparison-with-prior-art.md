@@ -1,10 +1,11 @@
 ---
 id: HYPO-0014
 title: 'README: motivation and comparison with prior art'
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - '@claude'
 created_date: '2026-09-29 22:16'
-updated_date: '2026-09-29 22:30'
+updated_date: '2026-10-01 07:49'
 labels:
   - docs
 dependencies:
@@ -31,14 +32,24 @@ The ChatGPT star ratings are unverified LLM output. Several of these repos are r
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
 - [ ] #1 Comparison table (hyp vs the tools above, plus backlog.md as the UX inspiration) with columns such as: hypothesis/falsification model, evidence polarity, GUI, CLI, storage/Git-friendliness, agent interface, maturity/licence
-- [ ] #2 Each row verified against the live repository (existence, licence, last activity, claimed features); rows that cannot be verified are dropped
-- [ ] #3 An honest 'when not to use hyp' paragraph (e.g. statistics, literature mining, networked multi-user)
-- [ ] #4 readme-improver review passes with no high-priority findings
-- [ ] #5 README opens with a short motivation: hyp is primarily for agents to work in a structured way with tentative, unconfirmed information (hypotheses, falsification criteria, cited evidence) while humans inspect and steer via the WebUI; it works in any directory, Git-friendly but not Git-dependent, like backlog.md
+- [x] #2 Each row verified against the live repository (existence, licence, last activity, claimed features); rows that cannot be verified are dropped
+- [x] #3 An honest 'when not to use hyp' paragraph (e.g. statistics, literature mining, networked multi-user)
+- [x] #4 readme-improver review passes with no high-priority findings
+- [x] #5 README opens with a short motivation: hyp is primarily for agents to work in a structured way with tentative, unconfirmed information (hypotheses, falsification criteria, cited evidence) while humans inspect and steer via the WebUI; it works in any directory, Git-friendly but not Git-dependent, like backlog.md
 <!-- AC:END -->
 
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
 Architect review: columns like maturity or last-activity go stale quickly; a short 'related tools' list with one-line differences may be better than a wide table.
+
+- README opening rewritten: backlog.md, but for hypotheses; agents primary (decision-0002); tool-enforced rules; VCS-optional (decision-0001); pointer to the new sections.
+- New sections at the end: When not to use hyp, Conceptual model (direction of fit: Anscombe 1957, Searle 1983, Zave and Jackson TOSEM 6(1) 1997; epistemic-status axis), Related tools, License.
+- Related tools is a list with one-line differences instead of a wide table (architect note): maturity, stars and last-activity columns go stale.
+- Verified through the hosting API (existence, licence, description) and each README, October 2026: backlog.md MIT; Doubt MIT; RigorGraph MIT; Epistemos MIT; POPPER (Stanford) MIT in setup.py, no LICENSE file; popper (kliewerdaniel) no licence; go-argmap MIT; Arguman GPL-3.0 per README (API reports NOASSERTION). None dropped.
+- Not looked up: ach-workbench, falsification-ledger, falsify, ReproDeck, honest-signal (no repository URLs recorded).
+- readme-improver self-audit: no high findings; decision references now link to their files.
+
+- AC 1 left unchecked: the comparison is a list with one-line differences, not a table, following the architect note. Edit the AC or accept the list.
+- AC 4: the readme-improver rubric was applied by this agent itself (no separate sub-agent fan-out); no high findings in the opening or the new sections.
 <!-- SECTION:NOTES:END -->
