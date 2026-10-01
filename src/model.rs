@@ -444,11 +444,15 @@ values!(Code {
     Cycle => "cycle",
     Inconsistent => "inconsistent",
     NoCriterion => "no_criterion",
+    BadObservedAt => "bad_observed_at",
 });
 impl Code {
+    /// `no_criterion` and `bad_observed_at` (evidence whose stored
+    /// observed_at hyp cannot read as a time) are warnings: nothing derived
+    /// depends on them, so they never block a write.
     pub fn severity(self) -> &'static str {
         match self {
-            Self::NoCriterion => "warning",
+            Self::NoCriterion | Self::BadObservedAt => "warning",
             _ => "error",
         }
     }
@@ -458,7 +462,9 @@ impl Code {
     /// (`attachment`: a data record's or a legacy attachment's, missing, not
     /// a regular file, or of another length); an invalid record breaks rules of its own fields,
     /// including naming a record by a short ID or one of the wrong kind (the
-    /// ID prefix gives the kind). The other errors are between loaded
+    /// ID prefix gives the kind). An invalid record does not block its own
+    /// repair through hyp: a write that changes only invalid records and
+    /// leaves each valid (`Store::repair_scope`). The other errors are between loaded
     /// records, as a merge, sync or hand edit leaves them; writes that add no
     /// new error may repair them (see `Store::commit_written`).
     /// `changed_bytes` (stored bytes changed in place to bytes of the same
@@ -482,7 +488,14 @@ pub struct Repair {
 }
 /// A problem `hyp check` reports: one per rule a record breaks.
 /// `(path, code)` identifies it across reads; the message is for people and
-/// may change.
+/// may change. `path` is relative to the project root, always under `hyp/`:
+/// the record's file (`hyp/<directory>/<id>.md`), or for stored bytes no
+/// record file stands for (a legacy attachment, a stray symlink) the file
+/// under `hyp/assets/`. In the error of a rejected write, a diagnostic
+/// about a record one of the write's changes names also has `change`, that
+/// change's index (from 0, in the order given), and `ref`, its batch-local
+/// reference if it gave one: a new record's path names a file that does not
+/// exist.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Diagnostic {
     pub path: String,
@@ -491,6 +504,10 @@ pub struct Diagnostic {
     pub code: Code,
     pub blocks_writes: bool,
     pub repair: Option<Repair>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change: Option<usize>,
+    #[serde(rename = "ref", default, skip_serializing_if = "Option::is_none")]
+    pub reference: Option<String>,
 }
 impl Diagnostic {
     pub fn new(path: impl Into<String>, code: Code, message: impl Into<String>) -> Self {
@@ -501,25 +518,29 @@ impl Diagnostic {
             code,
             blocks_writes: code.blocks_writes(),
             repair: None,
+            change: None,
+            reference: None,
+        }
+    }
+    /// The diagnostic of `v`, a rule the record at `path` breaks.
+    pub fn of(path: impl Into<String>, v: Violation) -> Self {
+        Self {
+            repair: v.repair,
+            ..Self::new(path, v.code, v.message)
         }
     }
     pub fn identity(&self) -> (&str, Code) {
         (&self.path, self.code)
     }
 }
-/// A rule that `Snapshot::validate` found record-wise broken.
+/// A rule that `Snapshot::validate` found record-wise broken; with the
+/// record's path, a `Diagnostic` (`Diagnostic::of`).
 #[derive(Debug)]
 pub struct Violation {
     pub code: Code,
     pub message: String,
     pub repair: Option<Repair>,
 }
-impl std::fmt::Display for Violation {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-impl std::error::Error for Violation {}
 /// The violations of one record, in the order the rules are checked.
 #[derive(Default)]
 struct Violations(Vec<Violation>);
@@ -537,33 +558,187 @@ impl Violations {
         });
     }
 }
-/// The repair of record `r`'s reference to `missing`, which does not exist.
-/// Restoring it is lossless, and after a partial sync it may only be late,
-/// so that comes first. Only a link, which nothing references and which
-/// holds no content of its own beyond its explanation, is offered deletion.
-fn dangling_repair(r: &Record, missing: &str) -> Repair {
+/// The repair of record `r`'s reference to `missing`, which does not exist
+/// (`exists` tells which records do). Restoring it is lossless, and after a
+/// partial sync it may only be late, so that comes first. Only a link, which
+/// nothing references and which holds no content of its own beyond its
+/// explanation, is offered deletion; a gap resolved by the missing evidence
+/// is offered to drop it: resolved by the evidence that remains, or, with
+/// none, open again.
+fn dangling_repair(r: &Record, missing: &str, exists: impl Fn(&str) -> bool) -> Repair {
     let restore = format!(
         "Restore {missing} from the source of the merge or sync: that loses nothing, \
          and after a partial sync it may still be arriving."
     );
-    if !matches!(r.data, Data::Link { .. }) {
-        return Repair {
-            note: Some(restore),
-            commands: vec![],
-        };
-    }
-    let hyp = |op: &str| vec!["hyp".to_string(), op.to_string(), r.id.clone()];
-    let mut commands = vec![hyp("archive"), hyp("delete")];
-    if r.archived {
-        commands.remove(0);
-    }
+    let hyp = |args: &[&str]| {
+        let mut argv = vec!["hyp".to_string()];
+        argv.extend(args.iter().map(|a| a.to_string()));
+        argv
+    };
+    let (what, commands) = match &r.data {
+        Data::Link { .. } => {
+            let mut commands = vec![hyp(&["archive", &r.id]), hyp(&["delete", &r.id])];
+            if r.archived {
+                commands.remove(0);
+            }
+            (
+                "remove this link with the commands; a delete cannot be undone without \
+                 version control",
+                commands,
+            )
+        }
+        Data::Gap { resolved_by, .. } if resolved_by.iter().any(|id| id == missing) => {
+            let remaining: Vec<&str> = resolved_by
+                .iter()
+                .map(String::as_str)
+                .filter(|id| exists(id))
+                .collect();
+            match remaining.as_slice() {
+                [] => (
+                    "reopen the gap with the command (nothing else answers it)",
+                    vec![hyp(&["set", &r.id, "--resolved", "false"])],
+                ),
+                _ => (
+                    "keep the gap resolved by the evidence that remains with the command",
+                    vec![hyp(&["set", &r.id, "--by", &remaining.join(",")])],
+                ),
+            }
+        }
+        _ => {
+            return Repair {
+                note: Some(restore),
+                commands: vec![],
+            };
+        }
+    };
     Repair {
-        note: Some(format!(
-            "{restore} Only if it is gone for good, remove this link with the commands; \
-             a delete cannot be undone without version control."
-        )),
+        note: Some(format!("{restore} Only if it is gone for good, {what}.")),
         commands,
     }
+}
+/// The repair of an invalid record `r` (`Code::Invalid`: it breaks rules
+/// of its own fields). hyp accepts a write that repairs it while it blocks
+/// other writes (`Store::repair_scope`), except for kinds it never changes.
+fn invalid_repair(r: &Record) -> Repair {
+    let note = if r.is_immutable() {
+        format!(
+            "hyp never changes {} {} record: restore {} from version control or the source \
+             of the merge or sync, or fix it by hand. hyp check confirms the fix.",
+            article(r.data.kind()),
+            r.data.kind(),
+            r.id
+        )
+    } else {
+        format!(
+            "Fix it with hyp set {id} … (or a patch in hyp apply, or hyp edit {id}), or restore \
+             it from version control. Until then hyp accepts only writes that change invalid \
+             records and leave each of them valid. hyp check confirms the fix.",
+            id = r.id
+        )
+    };
+    Repair {
+        note: Some(note),
+        commands: vec![],
+    }
+}
+/// Whether `value` is an `observed_at` hyp accepts: an RFC 3339 timestamp
+/// (2026-09-12T14:03:00Z) or a date (2026-09-12). It is stored as given.
+pub fn is_observed_at(value: &str) -> bool {
+    let date = value.len() == 10
+        && value.bytes().enumerate().all(|(i, b)| {
+            if i == 4 || i == 7 {
+                b == b'-'
+            } else {
+                b.is_ascii_digit()
+            }
+        })
+        && chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok();
+    date || chrono::DateTime::parse_from_rfc3339(value).is_ok()
+}
+/// How far after `now` an `observed_at` may lie: a date is local to whoever
+/// observed it, and clocks differ.
+const OBSERVED_AT_TOLERANCE: chrono::TimeDelta = chrono::TimeDelta::days(1);
+/// Whether `observed_at` (as `is_observed_at` accepts it) lies more than a
+/// day after `now`: an observation cannot have been made yet. Checked when
+/// it is written, not by `hyp check`, whose verdict must not depend on the
+/// clock.
+pub fn observed_in_future(observed_at: &str, now: chrono::DateTime<Utc>) -> bool {
+    let latest = now + OBSERVED_AT_TOLERANCE;
+    match chrono::DateTime::parse_from_rfc3339(observed_at) {
+        Ok(t) => t > latest,
+        Err(_) => chrono::NaiveDate::parse_from_str(observed_at, "%Y-%m-%d")
+            .is_ok_and(|d| d > latest.date_naive()),
+    }
+}
+/// Why a write may not store `observed_at` on evidence whose stored value
+/// is `stored` (None for new evidence), or None if it may. Only a new or
+/// changed value is judged: one already stored (free text an older hyp let
+/// through, a value that was in the future when written by hand) does not
+/// block other changes to its record; `hyp check` warns about an unreadable
+/// one (`observed_at_warning`). Empty means unknown and is always allowed.
+pub fn observed_at_refusal(
+    stored: Option<&str>,
+    observed_at: &str,
+    now: chrono::DateTime<Utc>,
+) -> Option<String> {
+    if stored == Some(observed_at) || observed_at.is_empty() {
+        return None;
+    }
+    if !is_observed_at(observed_at) {
+        return Some(format!(
+            "observed_at {observed_at:?} is neither an RFC 3339 timestamp \
+             (2026-09-12T14:03:00Z) nor a date (2026-09-12); leave it empty when unknown"
+        ));
+    }
+    observed_in_future(observed_at, now).then(|| {
+        format!(
+            "observed_at {observed_at} is in the future (more than a day from now): \
+             give when it was observed"
+        )
+    })
+}
+/// The `bad_observed_at` warning for evidence `r`, at `path`, whose stored
+/// observed_at hyp cannot read as a time, or None. Its repair keeps the text
+/// in the body and clears the field, in one command; with a known time,
+/// set that instead.
+pub fn observed_at_warning(r: &Record, path: String) -> Option<Diagnostic> {
+    let Data::Evidence { observed_at, .. } = &r.data else {
+        return None;
+    };
+    if observed_at.is_empty() || is_observed_at(observed_at) {
+        return None;
+    }
+    let kept = format!("Observed at (as recorded): {observed_at}");
+    let body = match r.body.trim().is_empty() {
+        true => kept,
+        false => format!("{}\n\n{kept}", r.body.trim_end()),
+    };
+    let mut d = Diagnostic::new(
+        path,
+        Code::BadObservedAt,
+        format!(
+            "observed_at {observed_at:?} is neither an RFC 3339 timestamp nor a date \
+             (YYYY-MM-DD); it is kept as text but cannot be read as a time"
+        ),
+    );
+    d.repair = Some(Repair {
+        note: Some(format!(
+            "The command moves the text into the body and clears observed_at (unknown). It \
+             holds the whole body as this check read it and states no revision, so run hyp \
+             check again right before running it, or a body changed in between is lost. If \
+             you know when it was observed, set that instead: hyp set {id} --observed-at \
+             YYYY-MM-DD (keep the text with --body first if it says more).",
+            id = r.id
+        )),
+        commands: vec![vec![
+            "hyp".into(),
+            "set".into(),
+            r.id.clone(),
+            format!("--body={body}"),
+            "--observed-at=".into(),
+        ]],
+    });
+    Some(d)
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HypothesisState {
@@ -1089,6 +1264,11 @@ impl Snapshot {
     pub fn validate(&self, r: &Record) -> Vec<Violation> {
         let mut out = Violations::default();
         Self::validate_fields(r, &mut out);
+        for v in &mut out.0 {
+            if v.repair.is_none() {
+                v.repair = Some(invalid_repair(r));
+            }
+        }
         self.validate_relations(r, &mut out);
         out.0
     }
@@ -1103,17 +1283,19 @@ impl Snapshot {
             "title is required".into()
         });
         if r.title.contains(['\n', '\r']) {
+            // `validate` gives an immutable record the general repair.
+            let repair = (!r.is_immutable()).then(|| Repair {
+                note: Some(format!(
+                    "Keep the first line as the title and move the rest into the body: \
+                     hyp edit {}. hyp check confirms the fix.",
+                    r.id
+                )),
+                commands: vec![],
+            });
             out.push(
                 Invalid,
                 "title must be a single line; put the rest in the body".into(),
-                Some(Repair {
-                    note: Some(
-                        "Edit the file by hand: keep the first line as the title and move \
-                         the rest into the body. hyp check confirms the fix."
-                            .into(),
-                    ),
-                    commands: vec![],
-                }),
+                repair,
             );
         }
         out.require(r.title.len() <= 2000, Invalid, || {
@@ -1184,6 +1366,8 @@ impl Snapshot {
                 attachments,
                 ..
             } => {
+                // An unreadable observed_at is a warning (`observed_at_warning`)
+                // and refused only when written (`observed_at_refusal`).
                 out.require(!source.trim().is_empty(), Invalid, || {
                     "evidence source is required".into()
                 });
@@ -1307,7 +1491,7 @@ impl Snapshot {
                 }
                 if let Some(c) = criterion {
                     out.require(is(c, &[Kind::Criterion]), Invalid, || {
-                        "criterion must belong to the assessed hypothesis".into()
+                        format!("{c} is not a criterion")
                     });
                 }
                 for s in supersedes {
@@ -1315,7 +1499,7 @@ impl Snapshot {
                         "assessment cannot supersede itself".into()
                     });
                     out.require(is(s, &[Kind::Assessment]), Invalid, || {
-                        "superseded assessment belongs to another hypothesis".into()
+                        format!("superseded {s} is not an assessment")
                     });
                 }
             }
@@ -1331,7 +1515,7 @@ impl Snapshot {
                 out.push(
                     Code::DanglingReference,
                     format!("references {id}, which does not exist"),
-                    Some(dangling_repair(r, id)),
+                    Some(dangling_repair(r, id, |id| self.get(id).is_some())),
                 );
             }
         }
@@ -1515,16 +1699,24 @@ impl Snapshot {
         }
         Ok(())
     }
-    /// Fails while a diagnostic blocks writes (`Code::blocks_writes`).
-    /// Other errors do not block here; `Store::commit_written` rejects only
-    /// writes that add one.
+    /// The errors that block writes (`Code::blocks_writes`).
+    pub fn blocking(&self) -> Vec<&Diagnostic> {
+        self.diagnostics
+            .iter()
+            .filter(|d| d.severity == "error" && d.blocks_writes)
+            .collect()
+    }
+    /// Fails while a diagnostic blocks writes (`Code::blocks_writes`), with
+    /// kind `Blocked` and the blocking diagnostics. Other errors do not
+    /// block here; `Store::commit_written` rejects only writes that add one,
+    /// and lets a write through that repairs invalid records only.
     pub fn assert_writable(&self) -> Result<()> {
-        let errors = || self.diagnostics.iter().filter(|d| d.severity == "error");
-        let blocking: Vec<_> = errors().filter(|d| d.blocks_writes).collect();
+        let blocking = self.blocking();
         let Some(first) = blocking.first() else {
             return Ok(());
         };
-        let others = errors().count() - blocking.len();
+        let errors = self.diagnostics.iter().filter(|d| d.severity == "error");
+        let others = errors.count() - blocking.len();
         let n = match blocking.len() {
             1 => "1 error blocks".to_string(),
             n => format!("{n} errors block"),
@@ -1534,12 +1726,27 @@ impl Snapshot {
             1 => " (1 more does not)".into(),
             m => format!(" ({m} more do not)"),
         };
-        bail!(Classified::new(
+        // A record hyp can change, by the ID its file is named by.
+        let changeable = |d: &Diagnostic| {
+            let id = d.path.rsplit('/').next().unwrap_or_default();
+            let id = id.strip_suffix(".md").unwrap_or(id);
+            self.get(id).is_some_and(|e| !e.record.is_immutable())
+        };
+        let only_invalid = blocking.iter().all(|d| d.code == Code::Invalid);
+        let repairable = match only_invalid && blocking.iter().any(|d| changeable(d)) {
+            true => {
+                ". Invalid records can be repaired through hyp: a write that changes only \
+                 invalid records and leaves each of them valid is accepted"
+            }
+            false => "",
+        };
+        bail!(Classified::about(
             ErrorKind::Blocked,
             format!(
-                "{n} writes{more}; run hyp check and repair files before writing: {}: {}",
+                "{n} writes{more}; run hyp check and repair files before writing: {}: {}{repairable}",
                 first.path, first.message
-            )
+            ),
+            blocking.into_iter().cloned().collect(),
         ));
     }
 }

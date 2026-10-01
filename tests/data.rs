@@ -800,6 +800,47 @@ fn legacy() -> Legacy {
         updated,
     }
 }
+/// HYPO-0067: `(path, code)` identifies a diagnostic, and every path has one
+/// form, relative to the project root: a record's file, or for a legacy
+/// attachment its stored bytes, under `hyp/` (they were a bare ID and a path
+/// relative to `hyp/`). A missing attachment is reported once, not again
+/// when `hyp check` hashes stored bytes.
+#[test]
+fn every_diagnostic_names_a_path_under_hyp() {
+    let l = legacy();
+    let p = l.dir.path();
+    let h = id_of(ok(p, &["add", "Without a criterion"]));
+    std::fs::remove_file(p.join("hyp/assets").join(&l.shas[1])).unwrap();
+    let out = run(p, &["--json", "check"]);
+    assert_eq!(out.status.code(), Some(1));
+    let diagnostics = json(&String::from_utf8_lossy(&out.stdout));
+    let identities: Vec<(&str, &str)> = diagnostics
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| (d["path"].as_str().unwrap(), d["code"].as_str().unwrap()))
+        .collect();
+    let missing = format!("hyp/assets/{}", l.shas[1]);
+    let warning = format!("hyp/hypotheses/{h}.md");
+    assert!(
+        identities.contains(&(warning.as_str(), "no_criterion")),
+        "{identities:?}"
+    );
+    assert_eq!(
+        identities
+            .iter()
+            .filter(|(path, _)| *path == missing)
+            .collect::<Vec<_>>(),
+        [&(missing.as_str(), "attachment")],
+        "{identities:?}"
+    );
+    for (path, _) in &identities {
+        assert!(path.starts_with("hyp/"), "{identities:?}");
+        if !path.starts_with("hyp/assets/") {
+            assert!(p.join(path).is_file(), "{path} names the record's file");
+        }
+    }
+}
 /// Checks a migrated legacy notebook: schema 3, no attachments left, one
 /// data record per distinct stored file with the ID derived from its hash,
 /// title, origin and times from the notebook (the earliest `created_at` of

@@ -26,15 +26,18 @@ fn text(out: &mut Vec<String>, indent: &str, text: &str) {
         out.push(format!("{indent}{line}").trim_end().to_string());
     }
 }
-/// The first line: ID and kind, for a hypothesis also the first 12 hex
-/// digits of its review token, what `hyp assess --reviewed` takes; then the
+/// The first line: ID and kind, then for a hypothesis the first 12 hex
+/// digits of its review token (what `hyp assess --reviewed` and `hyp
+/// experiment add --reviewed` take), for any other record those of its
+/// revision (what `hyp run --reviewed` takes of an experiment); then the
 /// title.
-fn header(out: &mut Vec<String>, r: &Record, state: Option<&HypothesisState>) {
-    let mut first = format!("{}  {}", r.id, r.data.kind());
-    if let Some(state) = state {
-        first.push_str(&format!("  review {}", &state.review_token[..12]));
-    }
-    out.push(first);
+fn header(out: &mut Vec<String>, e: &Entry, state: Option<&HypothesisState>) {
+    let r = &e.record;
+    let first = match state {
+        Some(state) => format!("  review {}", &state.review_token[..12]),
+        None => format!("  revision {}", &e.revision[..12]),
+    };
+    out.push(format!("{}  {}{first}", r.id, r.data.kind()));
     field(out, "", "title", &r.title);
 }
 fn footer(out: &mut Vec<String>, r: &Record) {
@@ -107,7 +110,7 @@ fn section(out: &mut Vec<String>, name: &str, lines: Vec<String>) {
 pub fn plain(s: &Snapshot, e: &Entry) -> String {
     let r = &e.record;
     let mut out = Vec::new();
-    header(&mut out, r, s.hypotheses.get(&r.id));
+    header(&mut out, e, s.hypotheses.get(&r.id));
     match (&r.data, s.hypotheses.get(&r.id)) {
         (
             Data::Hypothesis {
