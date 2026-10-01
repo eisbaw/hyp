@@ -1,0 +1,98 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 600" width="1280" height="600" role="img" aria-labelledby="t d">
+  <title id="t">Lifecycle, judgment and needs review</title>
+  <desc id="d">A hypothesis has a lifecycle (draft, investigating, paused, closed) and, separately, a judgment (untested, inconclusive, supported, weakened, falsified). Investigating needs an active falsification criterion or an untestable reason. Every judgment needs a reason; every judgment except untested cites linked evidence; falsified also names a criterion and cites evidence that meets it. An assessment records a fingerprint of its basis; when the basis changes the hypothesis needs review.</desc>
+  <!-- Drawn from src/model.rs: Lifecycle, Judgment::requirement, the assessment rules and derive (needs_review). Update it when those change. -->
+  <style>
+    text { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; fill: #e6edf3; }
+    .title { font-size: 22px; font-weight: 700; }
+    .h { font-size: 18px; font-weight: 700; }
+    .cmd { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; fill: #9ecbff; }
+    .note { font-size: 14px; fill: #a9b8c9; }
+    .rule { font-size: 14px; fill: #c9d4e0; }
+    .pl { font-size: 16px; font-weight: 600; text-anchor: middle; }
+    .panel { fill: #122036; stroke: #2b3b55; stroke-width: 1.5; }
+    .edge { stroke: #8b9bb0; stroke-width: 2; fill: none; }
+    .life { fill: #16243a; stroke: #4a6a94; stroke-width: 2; }
+    .box { fill: #16243a; stroke: #4a6a94; stroke-width: 2; }
+  </style>
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#8b9bb0"/>
+    </marker>
+  </defs>
+
+  <rect x="1" y="1" width="1278" height="598" rx="20" fill="#0f1a2b" stroke="#2b3b55" stroke-width="2"/>
+  <text class="title" x="40" y="46">Lifecycle and judgment are separate</text>
+  <text class="note" x="40" y="72">Lifecycle says where the work stands; the judgment says what the evidence shows. Closing never declares H true.</text>
+
+  <!-- Lifecycle panel -->
+  <rect class="panel" x="40" y="92" width="580" height="300" rx="14"/>
+  <text class="h" x="60" y="124">Lifecycle</text>
+  <text class="cmd" x="160" y="124">hyp set H-… --lifecycle …</text>
+
+  <rect class="life" x="60" y="160" width="100" height="40" rx="20"/>
+  <text class="pl" x="110" y="186">draft</text>
+  <rect class="life" x="190" y="160" width="150" height="40" rx="20" style="stroke:#9ecbff"/>
+  <text class="pl" x="265" y="186">investigating</text>
+  <rect class="life" x="370" y="160" width="100" height="40" rx="20"/>
+  <text class="pl" x="420" y="186">paused</text>
+  <rect class="life" x="500" y="160" width="100" height="40" rx="20"/>
+  <text class="pl" x="550" y="186">closed</text>
+
+  <path d="M265,200 L265,232" stroke="#9ecbff" stroke-width="2" stroke-dasharray="4 3"/>
+  <rect x="60" y="232" width="540" height="64" rx="10" fill="#0f1a2b" stroke="#9ecbff" stroke-width="1.5"/>
+  <text class="rule" x="78" y="259">Investigating needs an active falsification criterion F</text>
+  <text class="rule" x="78" y="282">(<tspan class="cmd">hyp falsify-if</tspan>) or an <tspan class="cmd">--untestable-reason</tspan>.</text>
+
+  <text class="note" x="60" y="330">Any lifecycle can be set from any other; drafts may be incomplete.</text>
+  <text class="note" x="60" y="354">Lifecycle is outside the basis: closing H flags no judgment.</text>
+
+  <!-- Judgment panel -->
+  <rect class="panel" x="660" y="92" width="580" height="300" rx="14"/>
+  <text class="h" x="680" y="124">Judgment</text>
+  <text class="cmd" x="790" y="124">hyp assess H-… --reviewed TOKEN --status …</text>
+
+  <rect x="680" y="144" width="140" height="34" rx="17" fill="#1c2633" stroke="#768390" stroke-width="2"/>
+  <text class="pl" x="750" y="167" style="fill:#c5d1de">untested</text>
+  <text class="rule" x="846" y="166">a reason only</text>
+
+  <rect x="680" y="190" width="140" height="34" rx="17" fill="#1c2633" stroke="#8b9bb0" stroke-width="2"/>
+  <text class="pl" x="750" y="213">inconclusive</text>
+  <rect x="680" y="236" width="140" height="34" rx="17" fill="#15301f" stroke="#57ab5a" stroke-width="2"/>
+  <text class="pl" x="750" y="259" style="fill:#a8e0a9">supported</text>
+  <rect x="680" y="282" width="140" height="34" rx="17" fill="#33240f" stroke="#e0823d" stroke-width="2"/>
+  <text class="pl" x="750" y="305" style="fill:#f5b97a">weakened</text>
+  <path d="M832,192 L838,192 L838,314 L832,314" stroke="#8b9bb0" stroke-width="1.5" fill="none"/>
+  <text class="rule" x="846" y="245">a reason, and cites evidence linked</text>
+  <text class="rule" x="846" y="267">to H or to its active F or P</text>
+
+  <rect x="680" y="328" width="140" height="34" rx="17" fill="#3b1a1d" stroke="#f47067" stroke-width="2"/>
+  <text class="pl" x="750" y="351" style="fill:#ffb4ad">falsified</text>
+  <text class="rule" x="846" y="340">also names an active F of H and cites</text>
+  <text class="rule" x="846" y="362">evidence that meets it (supports F)</text>
+
+  <!-- needs review -->
+  <text class="h" x="40" y="436">Needs review</text>
+  <text class="note" x="190" y="436">A new assessment supersedes the current one; a judgment is never rewritten.</text>
+
+  <rect class="box" x="40" y="456" width="270" height="70" rx="12"/>
+  <text class="rule" x="58" y="485"><tspan class="cmd">hyp assess</tspan> records a</text>
+  <text class="rule" x="58" y="508">fingerprint of the basis</text>
+  <path class="edge" d="M310,491 L352,491" marker-end="url(#a)"/>
+
+  <rect class="box" x="354" y="456" width="320" height="70" rx="12"/>
+  <text class="rule" x="372" y="485">the basis changes: claim, F, P,</text>
+  <text class="rule" x="372" y="508">links, linked evidence, runs</text>
+  <path class="edge" d="M674,491 L716,491" marker-end="url(#a)"/>
+
+  <rect x="718" y="472" width="170" height="38" rx="19" fill="#3a2a0a" stroke="#d29922" stroke-width="2" stroke-dasharray="5 3"/>
+  <text class="pl" x="803" y="497" style="fill:#f2cc60;font-weight:700">needs review</text>
+  <path class="edge" d="M888,491 L930,491" marker-end="url(#a)"/>
+
+  <rect class="box" x="932" y="456" width="308" height="70" rx="12"/>
+  <text class="rule" x="950" y="485">read <tspan class="cmd">hyp show H-…</tspan>, then</text>
+  <text class="rule" x="950" y="508">assess again with its new token</text>
+
+  <text class="note" x="40" y="556">Two current assessments, as a merge can leave, also need review. Archiving H changes the basis; closing it does not.</text>
+  <text class="note" x="40" y="578">An assess whose --reviewed token is stale writes nothing and exits 3.</text>
+</svg>

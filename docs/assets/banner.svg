@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 300" width="1200" height="300" role="img" aria-labelledby="t d">
+  <title id="t">hyp: a place to change your mind</title>
+  <desc id="d">A hypothesis explains an observation; an assessment judges it falsified or supported, and a judgment is marked needs review when what it rested on changes.</desc>
+  <!-- Motif only; the accurate figures are model.svg and states.svg. -->
+  <style>
+    text { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+    .name { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 120px; font-weight: 700; fill: #e6edf3; }
+    .tag { font-size: 30px; font-weight: 600; fill: #9ecbff; }
+    .sub { font-size: 18px; fill: #8b9bb0; }
+    .node { fill: #16243a; stroke: #4a6a94; stroke-width: 2; }
+    .nlabel { font-size: 20px; font-weight: 600; fill: #e6edf3; text-anchor: middle; }
+    .edge { stroke: #8b9bb0; stroke-width: 2; fill: none; }
+    .elabel { font-size: 14px; fill: #a9b8c9; text-anchor: middle; font-style: italic; }
+  </style>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#8b9bb0"/>
+    </marker>
+  </defs>
+
+  <rect x="2" y="2" width="1196" height="296" rx="24" fill="#0f1a2b" stroke="#2b3b55" stroke-width="2"/>
+
+  <!-- Name and tagline -->
+  <text class="name" x="60" y="150">hyp</text>
+  <text class="tag" x="64" y="200">A place to change your mind</text>
+  <text class="sub" x="64" y="236">Hypotheses, what would falsify them, evidence and judgments,</text>
+  <text class="sub" x="64" y="260">as Markdown files, for coding and research agents.</text>
+
+  <!-- Motif: observation -> hypothesis -> falsified | supported, needs review -->
+  <rect class="node" x="592" y="118" width="150" height="58" rx="12"/>
+  <text class="nlabel" x="667" y="154">observation</text>
+
+  <path class="edge" d="M742,147 L834,147" marker-end="url(#arrow)"/>
+  <text class="elabel" x="788" y="136">explained by</text>
+
+  <rect class="node" x="840" y="118" width="150" height="58" rx="12"/>
+  <text class="nlabel" x="915" y="154">hypothesis</text>
+
+  <path class="edge" d="M990,136 C1010,136 1010,86 1028,86" marker-end="url(#arrow)"/>
+  <path class="edge" d="M990,158 C1010,158 1010,208 1028,208" marker-end="url(#arrow)"/>
+
+  <rect x="1034" y="64" width="140" height="44" rx="22" fill="#3b1a1d" stroke="#f47067" stroke-width="2"/>
+  <text class="nlabel" x="1104" y="93" style="fill:#ffb4ad">falsified</text>
+
+  <rect x="1034" y="186" width="140" height="44" rx="22" fill="#15301f" stroke="#57ab5a" stroke-width="2"/>
+  <text class="nlabel" x="1104" y="215" style="fill:#a8e0a9">supported</text>
+
+  <!-- needs review: hangs off the judgment it flags -->
+  <path d="M1104,230 L1104,246" stroke="#d29922" stroke-width="2" stroke-dasharray="4 3"/>
+  <rect x="1034" y="246" width="140" height="32" rx="16" fill="#3a2a0a" stroke="#d29922" stroke-width="2" stroke-dasharray="5 3"/>
+  <text x="1104" y="267" text-anchor="middle" style="font-size:15px;font-weight:600;fill:#f2cc60">needs review</text>
+</svg>

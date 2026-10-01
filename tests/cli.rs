@@ -4675,15 +4675,16 @@ fn a_config_with_an_unknown_key_or_garbage_is_invalid() {
     }
 }
 /// The schema table in code names released hyp versions no newer than
-/// this one, and the README lists the same rows.
+/// this one, and the schema table in docs/storage.md lists the same rows
+/// (it was in the README when this test was named).
 #[test]
 fn the_schema_table_matches_this_version_and_the_readme() {
     let parse = |v: &str| -> Vec<u64> { v.split('.').map(|n| n.parse().unwrap()).collect() };
     let schemas = hyp::store::SCHEMAS;
     let (_, newest) = schemas[schemas.len() - 1];
     assert!(parse(newest) <= parse(env!("CARGO_PKG_VERSION")));
-    let readme = include_str!("../README.md");
-    let rows: Vec<Vec<&str>> = readme
+    let docs = include_str!("../docs/storage.md");
+    let rows: Vec<Vec<&str>> = docs
         .lines()
         .filter(|l| l.starts_with('|'))
         .map(|l| l.split('|').map(str::trim).collect())
@@ -4694,7 +4695,7 @@ fn the_schema_table_matches_this_version_and_the_readme() {
         assert!(
             rows.iter()
                 .any(|r| r.len() > 3 && r[1] == schema && r[2] == version),
-            "README schema table lacks | {schema} | {version} |"
+            "docs/storage.md schema table lacks | {schema} | {version} |"
         );
     }
 }

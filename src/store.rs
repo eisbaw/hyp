@@ -860,8 +860,9 @@ fn patched(old: &Record, set: serde_json::Map<String, serde_json::Value>) -> Res
 /// hyp version that reads it. This hyp reads and writes all of them. A new
 /// notebook starts at the first; a write raises it when it first stores
 /// something only a later schema holds (`Data::schema`), and reading never
-/// does. The README's schema table lists the same rows. From schema 3 on
-/// a raise also writes the row's version to config.toml (`raised`).
+/// does. The schema table in docs/storage.md lists the same rows. From
+/// schema 3 on a raise also writes the row's version to config.toml
+/// (`raised`).
 pub const SCHEMAS: &[(u32, &str)] = &[
     (1, "0.1.0"), // the record fields of hyp 0.1.0
     (2, "0.2.0"), // + a gap's `resolved_by` (HYPO-0076)

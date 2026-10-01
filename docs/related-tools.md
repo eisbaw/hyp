@@ -2,7 +2,7 @@
 
 Checked against each project's repository (README and, where noted, other files) in October 2026. None of the tools was installed or run for this comparison: their features are as documented, not as tested. Projects in this niche are young and change quickly, so check the source before relying on a detail here.
 
-Claims about hyp refer to this repository's README.
+Claims about hyp refer to this repository's README and the files in `docs/`.
 
 ## Summary
 
@@ -28,6 +28,14 @@ None of the tools above combines everything hyp does:
 - gaps, and observation-first work (`hyp observe`);
 - one Markdown file per record, Git-friendly without requiring Git;
 - a stable `--json` and exit-code contract for agents.
+
+## In brief
+
+- [backlog.md](https://github.com/MrLesk/Backlog.md) (MIT), the model for hyp's shape: Markdown files in any directory, a CLI for agents, a browser view for humans, agent instructions installed by the tool. It is imperative (what to do); hyp is descriptive (what is believed, and on what evidence).
+- Analysis of Competing Hypotheses (Richards J. Heuer Jr., *Psychology of Intelligence Analysis*, CIA Center for the Study of Intelligence, 1999, chapter 8), the methodological precedent: weigh every observation against every rival hypothesis and look for the evidence that refutes, not the evidence that fits. hyp's evidence matrix compares hypotheses the same way; hyp adds explicit falsification criteria and records the judgments.
+- [POPPER](https://github.com/snap-stanford/POPPER) (Huang et al., *Automated Hypothesis Validation with Agentic Sequential Falsifications*, 2025), an agentic falsification framework: LLM agents design and run falsification experiments under statistical error control. It performs the testing; hyp records an investigation and executes nothing.
+- [Doubt](https://github.com/alsoleg89/doubt) (MIT), the closest evidence model: an agent skill and CLI that turn one contested question into a source-grounded evidence map with supporting, contradicting, qualifying and missing evidence. A map is a document per question; hyp is a notebook kept through an investigation, with falsification criteria, experiments and judgments that are flagged when their basis changes.
+- [Argdown](https://github.com/argdown/argdown) (MIT), argument mapping: a plain-text syntax and tools that turn pros, cons and premise-conclusion structures into argument maps. It models the structure of an argument; hyp models evidence and judgments about a tentative claim.
 
 ## Per tool
 
