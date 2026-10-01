@@ -388,7 +388,7 @@ hyp covers the descriptive kind up to corroboration. Observations are evidence (
 
 ## Related tools
 
-Checked against each source in October 2026.
+Checked against each source in October 2026. [docs/related-tools.md](docs/related-tools.md) compares these and other tools, with strengths and weaknesses against hyp.
 
 - [backlog.md](https://github.com/MrLesk/Backlog.md) (MIT), the model for hyp's shape: Markdown files in any directory, a CLI for agents, a browser view for humans, agent instructions installed by the tool. It is imperative (what to do); hyp is descriptive (what is believed, and on what evidence).
 - Analysis of Competing Hypotheses (Richards J. Heuer Jr., *Psychology of Intelligence Analysis*, CIA Center for the Study of Intelligence, 1999, chapter 8), the methodological precedent: weigh every observation against every rival hypothesis and look for the evidence that refutes, not the evidence that fits. hyp's evidence matrix compares hypotheses the same way; hyp adds explicit falsification criteria and records the judgments.
