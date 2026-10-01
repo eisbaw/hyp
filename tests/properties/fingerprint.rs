@@ -361,12 +361,15 @@ fn the_rich_basis_holds_every_record_built_for_it() {
     for not in [id(Kind::Experiment, 0), id(Kind::Data, 0)] {
         assert!(!basis.contains_key(&not), "{not} is in the basis");
     }
+    // The data record counts by its bytes, under the evidence that draws on it.
+    let Some(Data::Captured { sha256, .. }) =
+        snap.get(&id(Kind::Data, 0)).map(|e| &e.record.data)
+    else {
+        panic!("rich builds a data record")
+    };
     assert_eq!(
         basis[&id(Kind::Evidence, 0)]["attachments"],
-        serde_json::json!([snap.get(&id(Kind::Data, 0)).map(|e| match &e.record.data {
-            Data::Captured { sha256, .. } => sha256.clone(),
-            _ => unreachable!(),
-        })])
+        serde_json::json!([sha256])
     );
 }
 
