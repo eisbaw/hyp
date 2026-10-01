@@ -363,7 +363,7 @@ hyp records an investigation; it does not carry one out, and it holds tentative 
 
 ## Conceptual model
 
-Records kept beside code differ by *direction of fit*: when record and world disagree, which one must change? Zave and Jackson draw this line for software between indicative statements, the environment as it is, and optative ones, the environment as we want it ("Four Dark Corners of Requirements Engineering", ACM TOSEM 6(1), 1997), after Anscombe's shopping list (*Intention*, 1957) and Searle's words-to-world and world-to-words directions ("A Taxonomy of Illocutionary Acts", 1975; in *Expression and Meaning*, 1979).
+Records kept beside code differ by *direction of fit*: when record and world disagree, which one must change? Zave and Jackson draw this line for software between indicative statements, the environment as it is, and optative ones, the environment as we want it (“Four Dark Corners of Requirements Engineering”, ACM TOSEM 6(1), 1997); philosophers call the same distinction direction of fit, after Anscombe's shopping list (*Intention*, 1957) and Searle's words-to-world and world-to-words directions ("A Taxonomy of Illocutionary Acts", 1975; in *Expression and Meaning*, 1979).
 
 | Kind         | Holds                               | Direction of fit                         | Example                   |
 | ------------ | ----------------------------------- | ---------------------------------------- | ------------------------- |
