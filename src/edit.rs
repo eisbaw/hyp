@@ -23,11 +23,10 @@ pub fn edit(store: &Store, e: &Entry) -> Result<Committed> {
     let r = &e.record;
     let kind = r.data.kind();
     ensure!(
-        !matches!(r.data, Data::Assessment { .. } | Data::Run { .. }),
-        "{} is {} {kind}: assessments and runs are immutable, so hyp edit cannot \
-         change it; record a new one instead",
-        r.id,
-        article(kind)
+        !r.is_immutable(),
+        "{} is immutable ({kind}): assessments, runs and data records cannot be \
+         changed, so hyp edit cannot open it; record a new one instead",
+        r.id
     );
     let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
     let pristine = store::encode(r)?;

@@ -75,7 +75,7 @@ pub fn new_experiment_status() -> ExperimentStatus {
 pub fn new_outcome() -> Outcome {
     Outcome::Observed
 }
-values!(Kind { Hypothesis => "hypothesis", Prediction => "prediction", Criterion => "criterion", Evidence => "evidence", Link => "link", Experiment => "experiment", Run => "run", Assessment => "assessment", Gap => "gap" });
+values!(Kind { Hypothesis => "hypothesis", Prediction => "prediction", Criterion => "criterion", Evidence => "evidence", Link => "link", Experiment => "experiment", Run => "run", Assessment => "assessment", Gap => "gap", Data => "data" });
 impl Kind {
     pub fn prefix(self) -> &'static str {
         match self {
@@ -88,6 +88,7 @@ impl Kind {
             Self::Run => "R",
             Self::Assessment => "A",
             Self::Gap => "G",
+            Self::Data => "D",
         }
     }
     /// The kind a full ID (`<prefix>-<UUID>`) names; None for anything else,
@@ -116,6 +117,10 @@ pub struct FrozenRef {
     #[serde(default)]
     pub body: String,
 }
+/// A file copied into `hyp/assets/` and attached to evidence by hyp 0.2.0
+/// and earlier. Read from notebooks of schema 1 and 2; a write that raises
+/// a notebook to schema 3 turns each into a data record (decision-0005,
+/// `Store::commit_written`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Attachment {
@@ -150,7 +155,8 @@ pub enum Data {
         locator: String,
         #[serde(default)]
         observed_at: String,
-        #[serde(default)]
+        /// Legacy (`Attachment`); not written while empty.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<Attachment>,
     },
     Link {
@@ -198,6 +204,24 @@ pub enum Data {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         resolved_by: Vec<String>,
     },
+    /// Captured bytes (decision-0005, kind `data`, ID prefix `D-`): stored
+    /// once per hash at `hyp/assets/<sha256>`, immutable once captured. The
+    /// body is an optional note. `captured_at`, `size` and, when not given,
+    /// `media_type` are set by the server from the stored bytes, so a create
+    /// may leave them out. Needs schema 3.
+    #[serde(rename = "data")]
+    Captured {
+        /// Where the bytes came from, as text: a path, URL, host or the
+        /// command that produced them (hyp never runs it).
+        origin: String,
+        #[serde(default)]
+        captured_at: String,
+        #[serde(default)]
+        media_type: String,
+        #[serde(default)]
+        size: u64,
+        sha256: String,
+    },
 }
 impl Data {
     pub fn kind(&self) -> &'static str {
@@ -214,6 +238,7 @@ impl Data {
             Self::Run { .. } => Kind::Run,
             Self::Assessment { .. } => Kind::Assessment,
             Self::Gap { .. } => Kind::Gap,
+            Self::Captured { .. } => Kind::Data,
         }
     }
     pub fn directory(&self) -> &'static str {
@@ -227,15 +252,18 @@ impl Data {
             Self::Run { .. } => "runs",
             Self::Assessment { .. } => "assessments",
             Self::Gap { .. } => "gaps",
+            Self::Captured { .. } => "data",
         }
     }
     pub fn prefix(&self) -> &'static str {
         self.kind_value().prefix()
     }
     /// The first notebook schema (`store::SCHEMAS`) whose readers can load
-    /// this record's file: 2 for a gap with `resolved_by`, otherwise 1.
+    /// these fields: 3 for a data record, 2 for a gap with `resolved_by`,
+    /// otherwise 1. `Record::schema` adds the header's.
     pub fn schema(&self) -> u32 {
         match self {
+            Self::Captured { .. } => 3,
             Self::Gap { resolved_by, .. } if !resolved_by.is_empty() => 2,
             _ => 1,
         }
@@ -250,6 +278,8 @@ impl Data {
             _ => None,
         }
     }
+    /// The IDs these fields name. `Record::references` adds the header's
+    /// data references; use that for a whole record.
     pub fn references(&self) -> Vec<&str> {
         let mut refs = self.owner().into_iter().collect::<Vec<_>>();
         match self {
@@ -287,7 +317,7 @@ impl Data {
     pub fn references_mut(&mut self) -> Vec<&mut String> {
         use std::iter::once;
         match self {
-            Self::Hypothesis { .. } | Self::Evidence { .. } => vec![],
+            Self::Hypothesis { .. } | Self::Evidence { .. } | Self::Captured { .. } => vec![],
             Self::Prediction { hypothesis, .. } | Self::Criterion { hypothesis } => {
                 vec![hypothesis]
             }
@@ -332,6 +362,11 @@ pub struct Record {
     pub body: String,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// The data records (`D-` IDs) this record draws on (decision-0005): any
+    /// kind but data itself may name some, and one data record may be named
+    /// by many. Stored as `data`; left out while empty, as it needs schema 3.
+    #[serde(rename = "data", default, skip_serializing_if = "Vec::is_empty")]
+    pub data_refs: Vec<String>,
     #[serde(default)]
     pub archived: bool,
     #[serde(default)]
@@ -349,11 +384,40 @@ impl Record {
             title: title.into(),
             body: String::new(),
             tags: vec![],
+            data_refs: vec![],
             archived: false,
             created_at: now.clone(),
             updated_at: now,
             data,
         }
+    }
+    /// Every ID this record names: those of its kind's fields
+    /// (`Data::references`), then its data references.
+    pub fn references(&self) -> Vec<&str> {
+        let mut refs = self.data.references();
+        refs.extend(self.data_refs.iter().map(String::as_str));
+        refs
+    }
+    /// The IDs `references` returns, in the same order, to rewrite them: how
+    /// `hyp apply` replaces batch-local references with full IDs.
+    pub fn references_mut(&mut self) -> Vec<&mut String> {
+        let mut refs = self.data.references_mut();
+        refs.extend(self.data_refs.iter_mut());
+        refs
+    }
+    /// The first notebook schema whose readers can load this record's file:
+    /// `Data::schema`, and 3 while it has data references.
+    pub fn schema(&self) -> u32 {
+        let header = if self.data_refs.is_empty() { 1 } else { 3 };
+        self.data.schema().max(header)
+    }
+    /// Whether this record's kind cannot be changed once created:
+    /// assessments and runs are history, data records captured bytes.
+    pub fn is_immutable(&self) -> bool {
+        matches!(
+            self.data,
+            Data::Assessment { .. } | Data::Run { .. } | Data::Captured { .. }
+        )
     }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -388,8 +452,9 @@ impl Code {
         }
     }
     /// Whether this problem blocks every write. hyp cannot load a malformed
-    /// file (it may hold a record other records depend on) and cannot trust a
-    /// broken attachment; an invalid record breaks rules of its own fields,
+    /// file (it may hold a record other records depend on) and cannot trust
+    /// stored bytes that are missing or changed (`attachment`: a data
+    /// record's or a legacy attachment's); an invalid record breaks rules of its own fields,
     /// including naming a record by a short ID or one of the wrong kind (the
     /// ID prefix gives the kind). The other errors are between loaded
     /// records, as a merge, sync or hand edit leaves them; writes that add no
@@ -620,6 +685,11 @@ pub struct Snapshot {
     /// in `hyp export --format json`.
     #[serde(default)]
     pub bearings: BTreeMap<String, Vec<EvidenceBearing>>,
+    /// Data record ID -> the start of its bytes as text (`data::preview`),
+    /// for `text/*` media types with intact bytes only: what the WebUI
+    /// shows, escaped. Derived on read, never stored, not in `revision`.
+    #[serde(default)]
+    pub previews: BTreeMap<String, String>,
     pub revision: String,
 }
 pub fn hash(bytes: impl AsRef<[u8]>) -> String {
@@ -841,12 +911,27 @@ impl Snapshot {
     /// predictions, links touching any of them (for a link to another
     /// hypothesis only the link, not that hypothesis), `linked_evidence`, and
     /// runs of its experiments with the evidence they cite. Evidence counts
-    /// with its provenance (source, locator, attachment hashes). Not covered:
-    /// lifecycle, tags, the untestable reason, experiments themselves, gaps,
-    /// assessments and timestamps. `fingerprint` hashes it; `hyp --json show`
-    /// prints it.
+    /// with its provenance (source, locator, attachment hashes). Any of these
+    /// records that references data records (`Record::data_refs`) counts with
+    /// their sha256s, in order (decision-0005): under `data`, left out while
+    /// there are none, so a record without data keeps its fingerprint; for
+    /// evidence after its attachment hashes under `attachments`, so turning
+    /// an attachment into a data record (the schema-3 migration) keeps the
+    /// fingerprint too. A reference to a missing data record counts as its
+    /// ID. Not covered: lifecycle, tags, the untestable reason, experiments
+    /// themselves, gaps, assessments, the data records' other metadata and
+    /// timestamps. `fingerprint` hashes it; `hyp --json show` prints it.
     pub fn basis(&self, id: &str) -> BTreeMap<String, serde_json::Value> {
         use serde_json::json;
+        let data_hashes = |r: &Record| -> Vec<String> {
+            r.data_refs
+                .iter()
+                .map(|d| match self.get(d).map(|e| &e.record.data) {
+                    Some(Data::Captured { sha256, .. }) => sha256.clone(),
+                    _ => d.clone(),
+                })
+                .collect()
+        };
         let own = self.claim_records(id, false);
         let experiments: BTreeSet<&str> = self
             .objects
@@ -887,6 +972,10 @@ impl Snapshot {
                 }
                 _ => continue,
             };
+            let mut fields = fields;
+            if !r.data_refs.is_empty() {
+                fields["data"] = json!(data_hashes(r));
+            }
             basis.insert(r.id.clone(), fields);
         }
         for e in &self.objects {
@@ -899,7 +988,11 @@ impl Snapshot {
             } = &r.data
             {
                 if evidence_ids.contains(r.id.as_str()) {
-                    let hashes: Vec<&str> = attachments.iter().map(|a| a.sha256.as_str()).collect();
+                    let hashes: Vec<String> = attachments
+                        .iter()
+                        .map(|a| a.sha256.clone())
+                        .chain(data_hashes(r))
+                        .collect();
                     basis.insert(
                         r.id.clone(),
                         json!({"title": r.title, "body": r.body, "archived": r.archived,
@@ -1028,7 +1121,7 @@ impl Snapshot {
                 out.push(Invalid, e.to_string(), None);
             }
         }
-        for id in r.data.references() {
+        for id in r.references() {
             out.require(Kind::of_id(id).is_some(), Invalid, || {
                 "stored references must use full IDs".into()
             });
@@ -1045,8 +1138,39 @@ impl Snapshot {
                 });
             }
         };
+        for (i, id) in r.data_refs.iter().enumerate() {
+            out.require(is(id, &[Kind::Data]), Invalid, || {
+                format!("{id} is not a data record (data references name D- records)")
+            });
+            out.require(!r.data_refs[..i].contains(id), Invalid, || {
+                format!("data names {id} twice; list each data record once")
+            });
+        }
         let claim = [Kind::Hypothesis, Kind::Prediction, Kind::Criterion];
         match &r.data {
+            Data::Captured {
+                origin,
+                captured_at,
+                media_type,
+                sha256,
+                ..
+            } => {
+                out.require(r.data_refs.is_empty(), Invalid, || {
+                    "a data record cannot reference data records".into()
+                });
+                out.require(!origin.trim().is_empty(), Invalid, || {
+                    "a data record needs its origin: where the bytes came from".into()
+                });
+                if let Err(e) = chrono::DateTime::parse_from_rfc3339(captured_at) {
+                    out.push(Invalid, format!("captured_at: {e}"), None);
+                }
+                out.require(crate::data::is_media_type(media_type), Invalid, || {
+                    format!("media_type {media_type:?} is not of the form type/subtype")
+                });
+                out.require(crate::data::is_sha256(sha256), Invalid, || {
+                    "sha256 must be 64 lowercase hex digits".into()
+                });
+            }
             Data::Evidence {
                 source,
                 attachments,
@@ -1194,7 +1318,7 @@ impl Snapshot {
     /// A missing record is reported once, as `DanglingReference`; rules that
     /// would need it are skipped.
     fn validate_relations(&self, r: &Record, out: &mut Violations) {
-        for id in r.data.references() {
+        for id in r.references() {
             if Kind::of_id(id).is_some() && self.get(id).is_none() {
                 out.push(
                     Code::DanglingReference,

@@ -645,10 +645,11 @@ fn archive_restore_delete_and_attachment_integrity() {
     let s = store.attach(&e.id, &attachment).unwrap().snapshot;
     s.assert_writable().unwrap();
     let entry = s.find(&e.id).unwrap();
-    let dest = if let Data::Evidence { attachments, .. } = &entry.record.data {
-        store.root.join("hyp").join(&attachments[0].path)
-    } else {
-        panic!();
+    // Attached through a data record (HYPO-0090), stored at assets/<sha256>.
+    let data = s.get(&entry.record.data_refs[0]).unwrap();
+    let dest = match &data.record.data {
+        Data::Captured { sha256, .. } => store.root.join("hyp/assets").join(sha256),
+        other => panic!("{other:?}"),
     };
     std::fs::write(&dest, "modified").unwrap();
     assert!(store.snapshot().unwrap().assert_writable().is_err());
@@ -675,7 +676,35 @@ fn archive_restore_delete_and_attachment_integrity() {
             None,
         )
         .unwrap();
+    // The data record outlives the evidence; unreferenced now, it can go too.
+    let s = store.snapshot().unwrap();
+    let ids: Vec<&str> = s.objects.iter().map(|x| x.record.id.as_str()).collect();
+    assert_eq!(ids, [data.record.id.as_str()]);
+    let d = s.objects[0].clone();
+    let s = store
+        .commit(
+            vec![Change::Archive {
+                id: d.record.id.clone(),
+                archived: true,
+                expected_revision: d.revision.clone(),
+            }],
+            None,
+        )
+        .unwrap();
+    store
+        .commit(
+            vec![Change::Delete {
+                id: d.record.id.clone(),
+                expected_revision: s.objects[0].revision.clone(),
+            }],
+            None,
+        )
+        .unwrap();
     assert!(store.snapshot().unwrap().objects.is_empty());
+    assert!(
+        dest.exists(),
+        "stored bytes are kept, not garbage-collected"
+    );
 }
 #[test]
 fn export_escapes_script_injection() {
@@ -834,9 +863,10 @@ fn conflicts_are_classified_by_type_even_when_wrapped_in_context() {
     assert_eq!(to_json(&io)["kind"], "io");
     assert_eq!(to_json(&io).get("ids"), None, "ids only for conflicts");
 }
-/// `Data::references_mut` must reach exactly the IDs `references` reads, in
-/// the same order: `hyp apply` resolves batch-local references through it,
-/// and a field it missed would keep an unresolved "@name".
+/// `Record::references_mut` must reach exactly the IDs `references` reads,
+/// in the same order: `hyp apply` resolves batch-local references through
+/// it, and a field it missed would keep an unresolved "@name". Every kind,
+/// each with data references in its header (HYPO-0090).
 #[test]
 fn references_mut_reaches_every_reference_in_order() {
     let id = |n: usize| format!("X-{n:08}");
@@ -899,19 +929,35 @@ fn references_mut_reaches_every_reference_in_order() {
             resolved: true,
             resolved_by: vec![id(2), id(3)],
         },
+        Data::Captured {
+            origin: "o".into(),
+            captured_at: String::new(),
+            media_type: String::new(),
+            size: 0,
+            sha256: String::new(),
+        },
     ];
+    let kinds: Vec<Kind> = every_kind.iter().map(Data::kind_value).collect();
     assert_eq!(
-        every_kind.len(),
-        <Kind as clap::ValueEnum>::value_variants().len()
+        kinds,
+        <Kind as clap::ValueEnum>::value_variants(),
+        "every kind once"
     );
-    for mut data in every_kind {
-        let read: Vec<String> = data.references().into_iter().map(str::to_string).collect();
-        let reached: Vec<String> = data
+    for data in every_kind {
+        let mut record = Record::new("t", data);
+        record.data_refs = vec![id(7), id(8)];
+        let read: Vec<String> = record
+            .references()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        assert!(read.ends_with(&[id(7), id(8)]), "{read:?}");
+        let reached: Vec<String> = record
             .references_mut()
             .into_iter()
             .map(|s| s.clone())
             .collect();
-        assert_eq!(read, reached, "{}", data.kind());
+        assert_eq!(read, reached, "{}", record.data.kind());
     }
 }
 #[test]
@@ -1943,6 +1989,14 @@ fn a_batch_may_not_bring_unreviewed_records_into_the_basis() {
 /// basis is a contract. A serde_json `preserve_order` flip, a renamed field
 /// or enum value, or a new field changes every fingerprint; this makes that
 /// loud.
+///
+/// HYPO-0090 changed the projection deliberately, by addition only: a record
+/// with data references counts with their hashes (`data`, and for evidence
+/// after its attachments under `attachments`). So the notebook below, which
+/// has none, keeps the fingerprint pinned before data records existed; the
+/// same notebook after the schema-3 migration (its attachment a data record)
+/// keeps it too; and data referenced by the hypothesis, a run and a link
+/// changes it, pinned below.
 #[test]
 fn the_fingerprint_canonical_form_is_pinned() {
     let entry = |id: &str, title: &str, data: Data| Entry {
@@ -1951,6 +2005,7 @@ fn the_fingerprint_canonical_form_is_pinned() {
             title: title.into(),
             body: format!("{title}."),
             tags: vec!["tag".into()],
+            data_refs: vec![],
             archived: false,
             created_at: "2026-01-01T00:00:00+00:00".into(),
             updated_at: "2026-01-02T00:00:00+00:00".into(),
@@ -2043,9 +2098,64 @@ fn the_fingerprint_canonical_form_is_pinned() {
         serde_json::to_string(&s.basis(&h)).unwrap(),
         r#"{"E-00000000-0000-4000-8000-000000000004":{"archived":false,"attachments":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"body":"Observation.","locator":"line 1","source":"log.txt","title":"Observation"},"F-00000000-0000-4000-8000-000000000002":{"archived":false,"body":"Criterion.","title":"Criterion"},"H-00000000-0000-4000-8000-000000000001":{"archived":false,"assumptions":"None","body":"Claim.","scope":"Scope","title":"Claim"},"L-00000000-0000-4000-8000-000000000005":{"archived":false,"body":"Interpretation.","from":"E-00000000-0000-4000-8000-000000000004","relation":"contradicts","to":"H-00000000-0000-4000-8000-000000000001"},"P-00000000-0000-4000-8000-000000000003":{"archived":false,"body":"Prediction.","conditions":"Conditions","title":"Prediction"},"R-00000000-0000-4000-8000-000000000007":{"body":"Run.","evidence":["E-00000000-0000-4000-8000-000000000004"],"outcome":"observed","title":"Run"}}"#
     );
+    const BEFORE_DATA: &str = "6bff2cf94d53b7f9235ed7173e93b7c0011efeaa04429140bb9c3d8a548638ac";
+    assert_eq!(s.fingerprint(&h), BEFORE_DATA);
+
+    // Migrated: the attachment is a data record with the same hash.
+    let d = id("D", 8);
+    let data_record = |id: &str, sha: &str| {
+        entry(
+            id,
+            "Capture",
+            Data::Captured {
+                origin: "log.txt".into(),
+                captured_at: "2026-01-01T00:00:00+00:00".into(),
+                media_type: "text/plain".into(),
+                size: 7,
+                sha256: sha.into(),
+            },
+        )
+    };
+    let mut migrated = s.clone();
+    let e_index = migrated
+        .objects
+        .iter()
+        .position(|x| x.record.id == e)
+        .unwrap();
+    let evidence = &mut migrated.objects[e_index].record;
+    if let Data::Evidence { attachments, .. } = &mut evidence.data {
+        attachments.clear();
+    }
+    evidence.data_refs = vec![d.clone()];
+    migrated.objects.push(data_record(&d, &"a".repeat(64)));
+    assert_eq!(migrated.basis(&h), s.basis(&h), "migration keeps the basis");
+    assert_eq!(migrated.fingerprint(&h), BEFORE_DATA);
+
+    // Data referenced by the hypothesis, the run and the link (one missing).
+    let (d2, gone) = (id("D", 9), id("D", 10));
+    let mut with_data = migrated.clone();
+    with_data.objects.push(data_record(&d2, &"b".repeat(64)));
+    for x in with_data.objects.iter_mut() {
+        if x.record.id == h || x.record.id == r {
+            x.record.data_refs = vec![d2.clone()];
+        }
+        if x.record.id == l {
+            x.record.data_refs = vec![gone.clone(), d.clone()];
+        }
+    }
+    let basis = with_data.basis(&h);
+    assert!(
+        !basis.contains_key(&d2),
+        "data records are not basis entries"
+    );
+    // A missing data record counts as its ID.
     assert_eq!(
-        s.fingerprint(&h),
-        "6bff2cf94d53b7f9235ed7173e93b7c0011efeaa04429140bb9c3d8a548638ac"
+        serde_json::to_string(&basis).unwrap(),
+        r#"{"E-00000000-0000-4000-8000-000000000004":{"archived":false,"attachments":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"body":"Observation.","locator":"line 1","source":"log.txt","title":"Observation"},"F-00000000-0000-4000-8000-000000000002":{"archived":false,"body":"Criterion.","title":"Criterion"},"H-00000000-0000-4000-8000-000000000001":{"archived":false,"assumptions":"None","body":"Claim.","data":["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],"scope":"Scope","title":"Claim"},"L-00000000-0000-4000-8000-000000000005":{"archived":false,"body":"Interpretation.","data":["D-00000000-0000-4000-8000-000000000010","aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"from":"E-00000000-0000-4000-8000-000000000004","relation":"contradicts","to":"H-00000000-0000-4000-8000-000000000001"},"P-00000000-0000-4000-8000-000000000003":{"archived":false,"body":"Prediction.","conditions":"Conditions","title":"Prediction"},"R-00000000-0000-4000-8000-000000000007":{"body":"Run.","data":["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],"evidence":["E-00000000-0000-4000-8000-000000000004"],"outcome":"observed","title":"Run"}}"#
+    );
+    assert_eq!(
+        with_data.fingerprint(&h),
+        "28342e133fd869299896a5bf51e34c695a47c19a69c8a077d3db13dd0f0d2d84"
     );
 }
 /// Frozen history stripped of its content on disk is reported, not loaded

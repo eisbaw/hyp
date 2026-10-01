@@ -488,6 +488,63 @@ async function main() {
   const allText = w.document.querySelector("main").textContent;
   assert.ok(allText.includes("competes-with"), "competes-with in All records");
   assert.ok(!/competes.with/.test(allText.replaceAll("competes-with", "")));
+  // Captured data (HYPO-0090): listed with metadata; text previewed as
+  // escaped text, binary not at all; referrers shown both ways.
+  const textFile = path.join(root, "boot.log");
+  const hostile = '<img src=x onerror="window.pwned=1"> boot ok\n';
+  fs.writeFileSync(textFile, hostile);
+  const textData = cli("capture", textFile, "--origin", "serial console");
+  const binFile = path.join(root, "dump.bin");
+  fs.writeFileSync(binFile, Buffer.from([0, 1, 2, 255]));
+  const binData = cli("capture", binFile, "--origin", "dd if=/dev/mem");
+  const observed = cli(
+    "observe",
+    "Boot log shows ok",
+    "--source",
+    "serial",
+    "--data",
+    textData,
+  );
+  w.location.hash = "data";
+  await wait(
+    () =>
+      h1(w) === "Data" &&
+      w.document.querySelector("main").textContent.includes("dump.bin"),
+    "data view lists captures",
+  );
+  const dataText = w.document.querySelector("main").textContent;
+  for (const part of ["boot.log", "text/plain", "application/octet-stream", "serial console"])
+    assert.ok(dataText.includes(part), part + " in " + dataText);
+  w.location.hash = "record/" + textData;
+  await wait(() => h1(w) === "boot.log", "text data detail");
+  const pre = w.document.querySelector("pre.preview");
+  assert.ok(pre, "text preview");
+  assert.equal(pre.textContent, hostile);
+  assert.equal(w.document.querySelector("main img"), null, "preview is not HTML");
+  assert.equal(w.pwned, undefined);
+  const detailText = w.document.querySelector("main").textContent;
+  assert.ok(detailText.includes("Boot log shows ok"), "referrer listed");
+  assert.ok(detailText.includes("serial console"));
+  assert.equal(
+    w.document.querySelector('[data-action="edit"][data-id="' + textData + '"]'),
+    null,
+    "data records cannot be edited",
+  );
+  assert.ok(w.document.querySelector('[data-action="archive"][data-id="' + textData + '"]'));
+  w.location.hash = "record/" + binData;
+  await wait(() => h1(w) === "dump.bin", "binary data detail");
+  assert.equal(w.document.querySelector("pre.preview"), null, "no binary preview");
+  assert.ok(
+    w.document
+      .querySelector("main")
+      .textContent.includes("No preview for application/octet-stream"),
+  );
+  w.location.hash = "record/" + observed;
+  await wait(() => h1(w) === "Boot log shows ok", "evidence with data");
+  assert.ok(
+    w.document.querySelector('main a[href="#record/' + textData + '"]'),
+    "evidence links its data",
+  );
   const original = fs.readFileSync(filename, "utf8");
   fs.writeFileSync(filename, "broken");
   await wait(
@@ -574,7 +631,7 @@ async function main() {
   );
   assert.deepEqual(errors, []);
   console.log(
-    "PASS: DOM forms, real HTTP writes, CLI↔UI SSE updates, editor changes, two tabs, dirty-form preservation, conflicts by status, saves despite unrelated writes, stale assessment rejected, evidence required and linked-only, criteria, evidence interpretations, criterion-meeting evidence counted against, falsification assessment, experiment and run, all views, malformed-file recovery, saves and CLI repair despite a dangling link, unavailable-project cause and offline export.",
+    "PASS: DOM forms, real HTTP writes, CLI↔UI SSE updates, editor changes, two tabs, dirty-form preservation, conflicts by status, saves despite unrelated writes, stale assessment rejected, evidence required and linked-only, criteria, evidence interpretations, criterion-meeting evidence counted against, falsification assessment, experiment and run, all views, captured data with escaped text previews, malformed-file recovery, saves and CLI repair despite a dangling link, unavailable-project cause and offline export.",
   );
 }
 main()

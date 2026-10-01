@@ -1,7 +1,7 @@
 use crate::{
     agents::{self, Agent, Operation},
     model::*,
-    store::{Change, Committed, Conflict, Store, Written},
+    store::{self, Change, Committed, Conflict, Store, Written},
     web,
 };
 use anyhow::{Context, Result, ensure};
@@ -95,6 +95,9 @@ const TITLE: &str = "One line; '-' reads stdin: its first line is the title, \
                      the rest is appended to the body";
 /// Help for a hypothesis ID argument.
 const HYPOTHESIS: &str = "The hypothesis: an H- ID or unique prefix of one";
+/// Help for the --data argument of the commands that create or change a record.
+const DATA: &str = "Data records this record draws on: D- IDs or unique prefixes, as \
+                    `hyp capture` prints them; comma-separated or repeated";
 #[derive(Subcommand)]
 pub enum Command {
     /// Create a project here, optionally with an example notebook.
@@ -147,6 +150,8 @@ pub enum Command {
         /// one. Comma-separated or repeated.
         #[arg(long, value_delimiter = ',', value_name = "HYPOTHESIS")]
         competes_with: Vec<String>,
+        #[arg(long, value_delimiter = ',', value_name = "DATA", help = DATA)]
+        data: Vec<String>,
     },
     /// Record an observation before any hypothesis explains it.
     ///
@@ -172,6 +177,8 @@ pub enum Command {
         /// (YYYY-MM-DD). Default: now.
         #[arg(long, value_name = "WHEN", value_parser = parse_observed_at)]
         observed_at: Option<String>,
+        #[arg(long, value_delimiter = ',', value_name = "DATA", help = DATA)]
+        data: Vec<String>,
     },
     /// Add a prediction: what the hypothesis says you will observe.
     Predict {
@@ -183,6 +190,8 @@ pub enum Command {
         /// When the prediction applies.
         #[arg(long, default_value = "", hide_default_value = true)]
         conditions: String,
+        #[arg(long, value_delimiter = ',', value_name = "DATA", help = DATA)]
+        data: Vec<String>,
     },
     /// Add a falsification criterion: what would refute the hypothesis.
     FalsifyIf {
@@ -191,6 +200,8 @@ pub enum Command {
         /// The refuting observation. One line; '-' reads stdin: its first
         /// line is the title, the rest is appended to the body.
         title: String,
+        #[arg(long, value_delimiter = ',', value_name = "DATA", help = DATA)]
+        data: Vec<String>,
     },
     /// Note a gap: an open question about a hypothesis.
     Gap {
@@ -198,6 +209,43 @@ pub enum Command {
         hypothesis: String,
         #[arg(help = TITLE)]
         title: String,
+        #[arg(long, value_delimiter = ',', value_name = "DATA", help = DATA)]
+        data: Vec<String>,
+    },
+    /// Copy a file's bytes (or stdin's) into the project as a data record.
+    ///
+    /// Prints the new record's D- ID. The bytes are stored once per SHA-256
+    /// under hyp/assets/, at most 32 MiB; the record (title, origin, media
+    /// type, size, sha256, the time of capture) cannot be changed later.
+    /// Name it from any record with --data D-…. Repeating a capture of the
+    /// same bytes with the same title, origin, media type and note prints
+    /// the existing ID and writes nothing.
+    Capture {
+        /// The file to copy, or '-' for stdin (`cmd | hyp capture - --origin cmd`).
+        file: String,
+        /// Where the bytes came from: a path, URL, host, or the command that
+        /// produced them (hyp never runs it).
+        #[arg(long)]
+        origin: String,
+        /// One line (default: the file name; for stdin, the origin's first line).
+        #[arg(long)]
+        title: Option<String>,
+        /// type/subtype (default: guessed from the file name, else text/plain
+        /// for UTF-8 text and application/octet-stream for anything else).
+        #[arg(long, value_name = "TYPE")]
+        media_type: Option<String>,
+        /// A note about the data ('-' reads stdin, unless FILE is '-').
+        #[arg(long, default_value = "", hide_default_value = true)]
+        body: String,
+        /// Record empty data (0 bytes); without it an empty capture is an
+        /// error, as an empty pipe usually means the command before it failed.
+        #[arg(long)]
+        allow_empty: bool,
+    },
+    /// Read a data record's bytes.
+    Data {
+        #[command(subcommand)]
+        command: DataCommand,
     },
     /// Record evidence and link it to a claim, or attach files to it.
     Evidence {
@@ -224,6 +272,8 @@ pub enum Command {
         /// What was done and seen ('-' reads stdin).
         #[arg(long, default_value = "", hide_default_value = true)]
         body: String,
+        #[arg(long, value_delimiter = ',', value_name = "DATA", help = DATA)]
+        data: Vec<String>,
     },
     /// Link evidence to a claim, or relate two hypotheses.
     ///
@@ -278,8 +328,10 @@ pub enum Command {
         /// The rationale ('-' reads stdin).
         #[arg(long)]
         reason: String,
+        #[arg(long, value_delimiter = ',', value_name = "DATA", help = DATA)]
+        data: Vec<String>,
     },
-    /// Change title, body, tags, lifecycle or status; resolve a gap.
+    /// Change title, body, tags, lifecycle, status, data; resolve a gap.
     Set {
         /// The record: an ID or unique prefix.
         id: String,
@@ -311,6 +363,11 @@ pub enum Command {
         /// be resolved (with --resolved true, or already).
         #[arg(long, value_delimiter = ',', value_name = "EVIDENCE")]
         by: Vec<String>,
+        /// Data records the record draws on: D- IDs or unique prefixes,
+        /// comma-separated or repeated, replacing earlier ones. Not for
+        /// assessments, runs or data records, which cannot change.
+        #[arg(long, value_delimiter = ',', value_name = "DATA")]
+        data: Vec<String>,
     },
     /// Where the investigation stands: start here when resuming work.
     ///
@@ -434,15 +491,15 @@ needs what the matching command asks for; the rest gets its defaults (a
 hypothesis is a draft, an experiment is planned and targets its hypothesis, a
 run is observed, a gap open) and the server sets the times. A patch sets only
 the fields in "set" and keeps the others; it cannot change "id", "kind" or
-"created_at". An update gives the whole record as read, changed. Assessments
-and runs cannot be changed. REV is .entry.revision of `hyp --json show ID`,
+"created_at". An update gives the whole record as read, changed. Assessments,
+runs and data records cannot be changed. REV is .entry.revision of `hyp --json show ID`,
 or a revision a --json write printed. "archived": false restores. Use full
 IDs, not prefixes, or references.
 
 References: a create may set "id": "@name" (letters, digits, - and _), and
 later changes in the batch write "@name" in record fields that take an ID
 ("hypothesis", "from", "to", "experiment", "evidence", "criterion", target
-"id"s, "resolved_by") and in "expected" keys; hyp replaces it with the full ID
+"id"s, "resolved_by", "data") and in "expected" keys; hyp replaces it with the full ID
 it generates. With --json, "written" lists the full IDs in change order, a
 create's "ref" with it. Records the batch creates need no statement in
 "expected", and cannot also be patched, updated, archived or deleted in it:
@@ -477,6 +534,11 @@ predictions; every judgment except untested cites some, and falsified also a
                "hypothesis": "H-…", "judgment": "weakened",
                "confidence": 0.3, "evidence": ["E-…"]},
     "expected": {"hypotheses": {"H-…": {"review_token": "…"}}}}]
+
+Any record but a data record may name data records: "data": ["D-…"]. A data
+record ("kind": "data", "title", "origin", "sha256", optional "media_type")
+describes bytes hyp already stores (`hyp capture` stored them); the server sets
+its "captured_at" and "size".
 
 An experiment ("hypothesis", "status", "targets": [{"id": "H-…"}, {"id":
 "P-…"}], its hypothesis among them) states the revision of every target, a run
@@ -622,13 +684,36 @@ pub enum EvidenceCommand {
         /// The observation in detail ('-' reads stdin).
         #[arg(long, default_value = "", hide_default_value = true)]
         body: String,
+        #[arg(long, value_delimiter = ',', value_name = "DATA", help = DATA)]
+        data: Vec<String>,
     },
-    /// Copy a file into the project and attach it to evidence.
+    /// Capture a file as a data record and reference it from evidence.
+    ///
+    /// Prints the evidence's ID, then the data record's. Reuses a data
+    /// record the evidence references, or any with the same bytes, before
+    /// capturing a new one (title: the file name; origin: the path as given).
+    /// Evidence that holds the bytes already is left as it is ("no
+    /// changes"); if it holds them as an attachment of hyp 0.2.0, only its
+    /// ID is printed.
     Attach {
         /// The evidence: an E- ID or unique prefix.
         id: String,
         /// The file (at most 32 MiB).
         path: PathBuf,
+    },
+}
+#[derive(Subcommand)]
+pub enum DataCommand {
+    /// Write a data record's bytes to stdout, or to a file.
+    ///
+    /// Fails, writing nothing, if the stored bytes are missing or no longer
+    /// match the record's sha256 (hyp check reports that too).
+    Get {
+        /// The data record: a D- ID or unique prefix.
+        id: String,
+        /// Write to this file instead of stdout (replacing it).
+        #[arg(long, value_name = "FILE")]
+        output: Option<PathBuf>,
     },
 }
 #[derive(Subcommand)]
@@ -720,6 +805,7 @@ fn stdin_arguments(command: &Command) -> Vec<&'static str> {
         Command::Link { reason, .. } | Command::Assess { reason, .. } => {
             vec![("--reason", Some(reason))]
         }
+        Command::Capture { file, body, .. } => vec![("FILE", Some(file)), ("--body", Some(body))],
         Command::Set { title, body, .. } => {
             vec![("--title", title.as_ref()), ("--body", body.as_ref())]
         }
@@ -752,10 +838,22 @@ fn print_json(value: &impl serde::Serialize) -> Result<()> {
 /// What a write command prints: one full ID per line, or with --json
 /// `{"written": [{"id", "kind", "revision"}], "revision"}`, the objects
 /// its changes named with their revisions (null once deleted) and the
-/// project revision, all after the write.
-fn print_written(written: &[Written], after: &Snapshot, json: bool) -> Result<()> {
+/// project revision, all after the write; plus `"migrated"`, in the same
+/// form, when the write also converted legacy attachments (the data records
+/// it created and the evidence it changed). Plain output lists only
+/// `written`; `report` names the converted records on stderr.
+fn print_written(
+    written: &[Written],
+    migrated: &[Written],
+    after: &Snapshot,
+    json: bool,
+) -> Result<()> {
     if json {
-        return print_json(&serde_json::json!({"written": written, "revision": after.revision}));
+        let mut out = serde_json::json!({"written": written, "revision": after.revision});
+        if !migrated.is_empty() {
+            out["migrated"] = serde_json::json!(migrated);
+        }
+        return print_json(&out);
     }
     for w in written {
         println!("{}", w.id);
@@ -850,7 +948,28 @@ fn summary(actions: &[Action], c: &Committed) -> String {
 /// --json, its `summary` on stderr: always when nothing changed, otherwise
 /// only for a person (stderr is a terminal).
 fn report(actions: &[Action], c: &Committed, json: bool) -> Result<()> {
-    print_written(&c.written, &c.snapshot, json)?;
+    print_written(&c.written, &c.migrated, &c.snapshot, json)?;
+    // The write changed records the command did not name: say which.
+    if !json && !c.migrated.is_empty() {
+        let of = |kind: Kind| -> Vec<&str> {
+            c.migrated
+                .iter()
+                .filter(|w| w.kind == kind)
+                .map(|w| w.id.as_str())
+                .collect()
+        };
+        let raised = c.raised_to.map_or(String::new(), |n| {
+            format!("raised the notebook to schema {n}; ")
+        });
+        let created = match of(Kind::Data).as_slice() {
+            [] => String::new(),
+            ids => format!("; created data records {}", ids.join(", ")),
+        };
+        eprintln!(
+            "{raised}converted the attachments of evidence {} into data references{created}",
+            of(Kind::Evidence).join(", ")
+        );
+    }
     let nothing = c.written.iter().all(|w| !w.changed);
     if !json && (nothing || std::io::stderr().is_terminal()) {
         eprintln!("{}", summary(actions, c));
@@ -899,9 +1018,9 @@ fn find_kind(s: &Snapshot, arg: &str, id: &str, kinds: &[Kind]) -> Result<String
             Some((last, init)) => format!("{} or {last}", init.join(", ")),
             None => unreachable!("no kinds given"),
         };
-        // "evidence" is a mass noun: "expected evidence", not "an evidence".
+        // "evidence" and "data" are mass nouns: "expected evidence", not "an evidence".
         let a = match kinds[0] {
-            Kind::Evidence => String::new(),
+            Kind::Evidence | Kind::Data => String::new(),
             k => format!("{} ", article(k.as_str())),
         };
         anyhow::bail!(
@@ -944,6 +1063,15 @@ fn create(s: &Snapshot, r: Record) -> Change {
 fn hypothesis(s: &Snapshot, id: &str) -> Result<String> {
     find_kind(s, "<HYPOTHESIS>", id, &[Kind::Hypothesis])
 }
+/// The full IDs of the data records `--data` names, each once.
+fn data_refs(s: &Snapshot, ids: &[String]) -> Result<Vec<String>> {
+    Ok(distinct(find_all(s, "--data", ids, &[Kind::Data])?))
+}
+/// `r` referencing the data records `--data` names.
+fn with_data(s: &Snapshot, mut r: Record, ids: &[String]) -> Result<Record> {
+    r.data_refs = data_refs(s, ids)?;
+    Ok(r)
+}
 /// What evidence bears on, and what an experiment tests.
 const CLAIM: [Kind; 3] = [Kind::Hypothesis, Kind::Prediction, Kind::Criterion];
 fn print_steps(steps: &[agents::Step], json: bool) -> Result<()> {
@@ -980,7 +1108,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             // A new project: everything in it was written by this command.
             let s = store.snapshot()?;
             let written: Vec<Written> = s.objects.iter().map(Written::of).collect();
-            print_written(&written, &s, true)?;
+            print_written(&written, &[], &s, true)?;
         } else {
             println!("Initialized {}", store.root.display());
             print_steps(&steps, false)?;
@@ -1030,6 +1158,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             explains,
             reason,
             competes_with,
+            data,
         } => {
             let explains = distinct(find_all(&s, "--explains", &explains, &[Kind::Evidence])?);
             let rivals = distinct(find_all(
@@ -1049,6 +1178,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 },
             )?;
             h.tags = tags;
+            h.data_refs = data_refs(&s, &data)?;
             let reason = match reason {
                 Some(reason) => input("--reason", reason)?,
                 None => "Proposed as an explanation of this observation".into(),
@@ -1087,62 +1217,120 @@ pub async fn run(cli: Cli) -> Result<()> {
             locator,
             body,
             observed_at,
+            data,
         } => changes.push(create(
             &s,
-            titled(
-                title,
-                body,
-                Data::Evidence {
-                    source,
-                    locator,
-                    observed_at: observed_at.unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
-                    attachments: vec![],
-                },
+            with_data(
+                &s,
+                titled(
+                    title,
+                    body,
+                    Data::Evidence {
+                        source,
+                        locator,
+                        observed_at: observed_at.unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
+                        attachments: vec![],
+                    },
+                )?,
+                &data,
             )?,
         )),
         Command::Predict {
             hypothesis: h,
             title,
             conditions,
-        } => changes.push(create(
-            &s,
-            titled(
-                title,
-                String::new(),
-                Data::Prediction {
-                    hypothesis: hypothesis(&s, &h)?,
-                    conditions,
-                },
-            )?,
-        )),
+            data,
+        } => {
+            let data_kind = Data::Prediction {
+                hypothesis: hypothesis(&s, &h)?,
+                conditions,
+            };
+            let r = titled(title, String::new(), data_kind)?;
+            changes.push(create(&s, with_data(&s, r, &data)?));
+        }
         Command::FalsifyIf {
             hypothesis: h,
             title,
-        } => changes.push(create(
-            &s,
-            titled(
-                title,
-                String::new(),
-                Data::Criterion {
-                    hypothesis: hypothesis(&s, &h)?,
-                },
-            )?,
-        )),
+            data,
+        } => {
+            let data_kind = Data::Criterion {
+                hypothesis: hypothesis(&s, &h)?,
+            };
+            let r = titled(title, String::new(), data_kind)?;
+            changes.push(create(&s, with_data(&s, r, &data)?));
+        }
         Command::Gap {
             hypothesis: h,
             title,
-        } => changes.push(create(
-            &s,
-            titled(
+            data,
+        } => {
+            let data_kind = Data::Gap {
+                hypothesis: hypothesis(&s, &h)?,
+                resolved: false,
+                resolved_by: vec![],
+            };
+            let r = titled(title, String::new(), data_kind)?;
+            changes.push(create(&s, with_data(&s, r, &data)?));
+        }
+        Command::Capture {
+            file,
+            origin,
+            title,
+            media_type,
+            body,
+            allow_empty,
+        } => {
+            let (bytes, name) = if file == "-" {
+                (store::read_capped(std::io::stdin(), "stdin")?, None)
+            } else {
+                let path = PathBuf::from(&file);
+                let f = std::fs::File::open(&path)
+                    .with_context(|| format!("cannot read {}", path.display()))?;
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| file.clone());
+                (store::read_capped(f, &file)?, Some(name))
+            };
+            let title = match title {
+                Some(t) => t,
+                None => name.clone().unwrap_or_else(|| {
+                    let first = origin.trim().lines().next().unwrap_or_default();
+                    first.chars().take(120).collect()
+                }),
+            };
+            let capture = store::Capture {
+                bytes,
                 title,
-                String::new(),
-                Data::Gap {
-                    hypothesis: hypothesis(&s, &h)?,
-                    resolved: false,
-                    resolved_by: vec![],
-                },
-            )?,
-        )),
+                origin,
+                media_type,
+                name,
+                note: input("--body", body)?,
+                allow_empty,
+            };
+            return report(&[Action::Created], &store.capture(capture)?, cli.json);
+        }
+        Command::Data {
+            command: DataCommand::Get { id, output },
+        } => {
+            let id = find_kind(&s, "<ID>", &id, &[Kind::Data])?;
+            let Some(Data::Captured { sha256, .. }) = s.get(&id).map(|e| &e.record.data) else {
+                unreachable!("find_kind returned a data record");
+            };
+            let bytes = store
+                .blob(sha256)
+                .with_context(|| format!("cannot read the bytes of {id} (see hyp check)"))?;
+            match output {
+                Some(path) => write_outside(&store, &path, &bytes)?,
+                None => {
+                    use std::io::Write;
+                    let mut out = std::io::stdout().lock();
+                    out.write_all(&bytes)?;
+                    out.flush()?;
+                }
+            }
+            return Ok(());
+        }
         Command::Evidence { command } => match command {
             EvidenceCommand::Add {
                 hypothesis: h,
@@ -1153,9 +1341,10 @@ pub async fn run(cli: Cli) -> Result<()> {
                 qualifies,
                 reason,
                 body,
+                data,
             } => {
                 let target = find_kind(&s, "<HYPOTHESIS>", &h, &CLAIM)?;
-                let r = titled(
+                let mut r = titled(
                     title,
                     body,
                     Data::Evidence {
@@ -1165,6 +1354,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                         attachments: vec![],
                     },
                 )?;
+                r.data_refs = data_refs(&s, &data)?;
                 let mut l = Record::new(
                     format!("Evidence for {}", &target[..10]),
                     Data::Link {
@@ -1187,7 +1377,8 @@ pub async fn run(cli: Cli) -> Result<()> {
                 changes.extend([create(&s, r), create(&s, l)]);
             }
             EvidenceCommand::Attach { id, path } => {
-                return report(&[Action::Updated], &store.attach(&id, &path)?, cli.json);
+                let actions = [Action::Updated, Action::Created];
+                return report(&actions, &store.attach(&id, &path)?, cli.json);
             }
         },
         Command::Experiment {
@@ -1221,6 +1412,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             outcome,
             evidence,
             body,
+            data,
         } => {
             let e = s.find(&find_kind(
                 &s,
@@ -1238,7 +1430,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     evidence: find_all(&s, "--evidence", &evidence, &[Kind::Evidence])?,
                 },
             )?;
-            changes.push(create(&s, r));
+            changes.push(create(&s, with_data(&s, r, &data)?));
         }
         Command::Link {
             from,
@@ -1265,6 +1457,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             evidence,
             criterion,
             reason,
+            data,
         } => {
             let h = hypothesis(&s, &h)?;
             // A prefix of 12 hex digits (48 bits) is ample to detect a change.
@@ -1316,6 +1509,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 },
             );
             r.body = input("--reason", reason)?;
+            r.data_refs = data_refs(&s, &data)?;
             changes.push(create(&s, r));
         }
         Command::Set {
@@ -1328,6 +1522,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             tags,
             resolved,
             by,
+            data,
         } => {
             let e = s.find(&id)?;
             let mut r = e.record.clone();
@@ -1398,6 +1593,9 @@ pub async fn run(cli: Cli) -> Result<()> {
                 );
                 *resolved_by = find_all(&s, "--by", &by, &[Kind::Evidence])?;
             }
+            if !data.is_empty() {
+                r.data_refs = data_refs(&s, &data)?;
+            }
             changes.push(Change::Update {
                 record: r,
                 expected_revision: e.revision.clone(),
@@ -1418,7 +1616,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 let related: Vec<&Entry> = s
                     .objects
                     .iter()
-                    .filter(|x| x.record.data.references().contains(&e.record.id.as_str()))
+                    .filter(|x| x.record.references().contains(&e.record.id.as_str()))
                     .collect();
                 // For a hypothesis, what its fingerprint hashes (`basis`), plus
                 // in full the runs and evidence in it, which `related` does not
@@ -1628,6 +1826,31 @@ pub async fn run(cli: Cli) -> Result<()> {
     let actions: Vec<Action> = changes.iter().map(Action::of).collect();
     report(&actions, &store.commit_written(changes, None)?, cli.json)
 }
+/// Writes `bytes` to `path` atomically (a temporary file, then a rename),
+/// refusing a path inside the notebook's `hyp/` directory, which only hyp
+/// writes, record by record, or inside `.hyp/`, whose journal hyp would
+/// replay as writes.
+fn write_outside(store: &Store, path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    let name = path
+        .file_name()
+        .with_context(|| format!("--output {} names no file", path.display()))?;
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => std::path::Path::new("."),
+    };
+    let parent = parent
+        .canonicalize()
+        .with_context(|| format!("cannot write {}: no such directory", path.display()))?;
+    for own in ["hyp", ".hyp"] {
+        ensure!(
+            !parent.starts_with(store.root.join(own)),
+            "refusing to write {} inside the notebook's {own}/ directory, which only hyp writes",
+            path.display()
+        );
+    }
+    store::atomic_readable(&parent.join(name), bytes)
+        .with_context(|| format!("cannot write {}", path.display()))
+}
 /// With `json`, each row is the entry plus, for a hypothesis, its derived
 /// `state`. A plain hypothesis row shows its judgment, lifecycle and, when
 /// it has one, a `needs-review` marker.
@@ -1679,14 +1902,10 @@ pub fn graph(s: &Snapshot, focus: Option<&str>) -> String {
         }
         if focus.is_none()
             || focus == Some(e.record.id.as_str())
-            || e.record
-                .data
-                .references()
-                .iter()
-                .any(|id| Some(*id) == focus)
+            || e.record.references().iter().any(|id| Some(*id) == focus)
         {
             selected.insert(e.record.id.clone());
-            selected.extend(e.record.data.references().into_iter().map(str::to_string));
+            selected.extend(e.record.references().into_iter().map(str::to_string));
         }
     }
     for e in &s.objects {
@@ -1754,6 +1973,9 @@ pub fn markdown(s: &Snapshot) -> String {
         // As `hyp link --relation` spells it, not as stored.
         if let Data::Link { relation, .. } = &e.record.data {
             data["relation"] = relation.as_str().into();
+        }
+        if !e.record.data_refs.is_empty() {
+            data["data"] = serde_yaml::to_value(&e.record.data_refs).unwrap_or_default();
         }
         out.push_str(&format!(
             "```yaml\n{}```\n\n",

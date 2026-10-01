@@ -22,6 +22,7 @@ pub const DIRECTORIES: &[&str] = &[
     "runs",
     "assessments",
     "gaps",
+    "data",
 ];
 pub use crate::error::Conflict;
 /// An object a write named, by full ID, with its revision after the write
@@ -58,6 +59,12 @@ pub struct Committed {
     pub written: Vec<Written>,
     /// The project after the write.
     pub snapshot: Snapshot,
+    /// The records the write converted, beyond those its changes named:
+    /// the data records it created from legacy evidence attachments and the
+    /// evidence it made reference them (decision-0005); usually empty.
+    pub migrated: Vec<Written>,
+    /// The schema the write raised the notebook to, if it did.
+    pub raised_to: Option<u32>,
 }
 #[derive(Debug, Clone)]
 pub struct Store {
@@ -220,7 +227,7 @@ fn matches_any(s: &Snapshot, id: &str) -> bool {
 /// is `NotFound` (HYPO-0087). Anything else wrong with a reference (the
 /// wrong kind, a prefix, a record the batch deleted) `validate` reports.
 fn references_exist(before: &Snapshot, after: &Snapshot, r: &Record) -> Result<()> {
-    for id in r.data.references() {
+    for id in r.references() {
         if !matches_any(before, id) && !matches_any(after, id) {
             return Err(absent(id).context(format!("the new {} references {id}", r.data.kind())));
         }
@@ -394,6 +401,13 @@ fn check_create(
             "a run's plan is set by the server; omit it and state the experiment's \
              revision in expected.revisions"
         ),
+        Data::Captured {
+            captured_at, size, ..
+        } => ensure!(
+            captured_at.is_empty() && *size == 0,
+            "a data record's captured_at and size are set by the server from the stored \
+             bytes; omit them"
+        ),
         _ => {}
     }
     let default = Expected::default();
@@ -487,8 +501,7 @@ impl References {
         Ok(())
     }
     fn resolve_record(&self, r: &mut Record) -> Result<()> {
-        r.data
-            .references_mut()
+        r.references_mut()
             .into_iter()
             .try_for_each(|id| self.resolve(id))
     }
@@ -552,8 +565,11 @@ fn check_update(old: &Record, new: &Record) -> Result<()> {
         "cannot change object kind"
     );
     ensure!(
-        !matches!(old.data, Data::Assessment { .. } | Data::Run { .. }),
-        "assessments and runs are immutable; create a new record"
+        !old.is_immutable(),
+        "{} is immutable ({}): assessments, runs and data records cannot be changed; \
+         create a new record",
+        old.id,
+        old.data.kind()
     );
     ensure!(
         old.created_at == new.created_at,
@@ -571,13 +587,14 @@ fn check_update(old: &Record, new: &Record) -> Result<()> {
 }
 /// Record `old` with the fields in `set` replaced, as `Change::Patch`
 /// applies it. The ID, kind and creation time cannot change, and
-/// `updated_at` is the server's; assessments and runs are immutable.
+/// `updated_at` is the server's; assessments, runs and data records are
+/// immutable (`Record::is_immutable`).
 fn patched(old: &Record, set: serde_json::Map<String, serde_json::Value>) -> Result<Record> {
     let id = &old.id;
     ensure!(
-        !matches!(old.data, Data::Assessment { .. } | Data::Run { .. }),
-        "{id} is {} {}: assessments and runs are immutable; create a new record",
-        article(old.data.kind()),
+        !old.is_immutable(),
+        "{id} is immutable ({}): assessments, runs and data records cannot be changed; \
+         create a new record",
         old.data.kind()
     );
     let mut fields = serde_json::to_value(old)?;
@@ -605,7 +622,11 @@ fn patched(old: &Record, set: serde_json::Map<String, serde_json::Value>) -> Res
 pub const SCHEMAS: &[(u32, &str)] = &[
     (1, "0.1.0"), // the record fields of hyp 0.1.0
     (2, "0.2.0"), // + a gap's `resolved_by` (HYPO-0076)
+    (3, "0.3.0"), // + data records and `data` references; attachments migrate (decision-0005)
 ];
+/// The schema that introduces data records: raising a notebook to it turns
+/// every evidence attachment into a data record (`migrate_attachments`).
+const DATA_SCHEMA: u32 = 3;
 /// The schema file, relative to `hyp/`; also its key in the journal.
 const CONFIG: &str = "config.toml";
 /// The first schema whose config.toml names the hyp version that reads it
@@ -651,12 +672,17 @@ fn raised(config: Config, needed: u32, schemas: &[(u32, &str)]) -> Result<Config
 /// one (notebooks of schema 3 and later carry it, as only the hyp that wrote
 /// them knows it), otherwise any version newer than this one.
 fn read_config(dir: &Path) -> Result<Config> {
+    read_config_of(dir, SCHEMAS)
+}
+/// `read_config` for a hyp that reads `schemas` (`SCHEMAS`; a parameter so
+/// that a test can play an older hyp).
+fn read_config_of(dir: &Path, schemas: &[(u32, &str)]) -> Result<Config> {
     let path = dir.join(CONFIG);
     let text =
         fs::read_to_string(&path).with_context(|| format!("cannot read {}", path.display()))?;
     let invalid = || format!("invalid {}", path.display());
     let table: toml::Table = toml::from_str(&text).with_context(invalid)?;
-    let (first, last) = (SCHEMAS[0], SCHEMAS[SCHEMAS.len() - 1]);
+    let (first, last) = (schemas[0], schemas[schemas.len() - 1]);
     let version = env!("CARGO_PKG_VERSION");
     if let Some(schema) = table
         .get("schema_version")
@@ -1005,6 +1031,11 @@ impl Store {
             }
         }
         snap.objects.sort_by(|a, b| a.record.id.cmp(&b.record.id));
+        // Each stored file is read and hashed once, however many data
+        // records name it: its length and start, or why it is not intact.
+        let mut blobs: BTreeMap<String, std::result::Result<(usize, Vec<u8>), String>> =
+            BTreeMap::new();
+        let mut previews = BTreeMap::new();
         for entry in &snap.objects {
             for v in snap.validate(&entry.record) {
                 let mut d = Diagnostic::new(Self::path_of(&entry.record), v.code, v.message);
@@ -1013,19 +1044,95 @@ impl Store {
             }
             if let Data::Evidence { attachments, .. } = &entry.record.data {
                 for a in attachments {
-                    let path = self.root.join("hyp").join(&a.path);
-                    let valid = path
-                        .canonicalize()
-                        .ok()
-                        .filter(|p| p.starts_with(self.root.join("hyp/assets")))
-                        .and_then(|p| fs::read(p).ok())
-                        .is_some_and(|bytes| hash(bytes) == a.sha256);
-                    if !valid {
-                        snap.diagnostics.push(Diagnostic::new(
+                    if let Err(e) = self.attachment_bytes(a) {
+                        let mut d = Diagnostic::new(
                             &a.path,
                             Code::Attachment,
-                            "attachment missing, unsafe, or hash mismatch",
-                        ));
+                            format!("attachment missing, unsafe, or hash mismatch: {e:#}"),
+                        );
+                        d.repair = Some(Repair {
+                            note: Some(format!(
+                                "Restore hyp/{} as a regular file with the recorded bytes \
+                                 (sha256 {}), from a backup, version control or the source of \
+                                 the merge or sync; a symlink there must be replaced by a copy \
+                                 of what it points to. hyp check confirms the fix.",
+                                a.path, a.sha256
+                            )),
+                            commands: vec![],
+                        });
+                        snap.diagnostics.push(d);
+                    }
+                }
+            }
+            if let Data::Captured {
+                sha256,
+                size,
+                media_type,
+                ..
+            } = &entry.record.data
+            {
+                // An invalid hash is reported by `validate`; it names no file.
+                if crate::data::is_sha256(sha256) {
+                    let stored = blobs.entry(sha256.clone()).or_insert_with(|| {
+                        // The length and enough of the start for a preview.
+                        let keep = crate::data::PREVIEW_BYTES + 1;
+                        self.blob(sha256)
+                            .map(|b| (b.len(), b[..b.len().min(keep)].to_vec()))
+                            .map_err(|e| format!("{e:#}"))
+                    });
+                    let id = &entry.record.id;
+                    let path = Self::path_of(&entry.record);
+                    let d = match stored {
+                        // Missing or changed bytes: restore them.
+                        Err(why) => {
+                            let mut d = Diagnostic::new(
+                                path,
+                                Code::Attachment,
+                                format!("the bytes of data record {id} are not intact: {why}"),
+                            );
+                            d.repair = Some(Repair {
+                                note: Some(format!(
+                                    "Restore hyp/assets/{sha256} ({size} bytes, {media_type}) as a \
+                                     regular file from a backup, version control or the source \
+                                     of the merge or sync; or capture the original again (hyp \
+                                     capture FILE --origin \"...\"), which stores the same bytes \
+                                     at the same path. hyp check confirms the fix."
+                                )),
+                                commands: vec![],
+                            });
+                            Some(d)
+                        }
+                        // Intact bytes, but the record describes them wrongly:
+                        // the record file is what changed.
+                        Ok((len, _)) if *len as u64 != *size => {
+                            let mut d = Diagnostic::new(
+                                path.clone(),
+                                Code::Invalid,
+                                format!(
+                                    "data record {id} says size {size}, but its stored bytes \
+                                     (intact, sha256 {sha256}) are {len} bytes"
+                                ),
+                            );
+                            d.repair = Some(Repair {
+                                note: Some(format!(
+                                    "The record file {path} was changed, not the bytes: restore \
+                                     it from version control or the source of the merge or sync, \
+                                     or set its size to {len} by hand (hyp cannot change a data \
+                                     record). hyp check confirms the fix."
+                                )),
+                                commands: vec![],
+                            });
+                            Some(d)
+                        }
+                        Ok((_, start)) => {
+                            if media_type.starts_with("text/") {
+                                previews.insert(id.clone(), crate::data::preview(start));
+                            }
+                            None
+                        }
+                    };
+                    if let Some(d) = d {
+                        snap.diagnostics.push(d);
                     }
                 }
             }
@@ -1045,6 +1152,40 @@ impl Store {
                 }
             }
         }
+        // A symlink among the stored files (entries named like a SHA-256,
+        // which hyp reads and writes; it ignores anything else there), named
+        // by a record or not, would make a later capture or migration of
+        // those bytes fail: report it, unless a data record or legacy
+        // attachment check above reported it already.
+        let assets = self.root.join("hyp/assets");
+        let entries = fs::read_dir(&assets)
+            .and_then(|entries| entries.collect::<std::io::Result<Vec<_>>>())
+            .with_context(|| format!("cannot read {}", assets.display()))?;
+        for entry in entries {
+            let shown = format!("hyp/assets/{}", entry.file_name().to_string_lossy());
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let reported = blobs.get(&name).is_some_and(|b| b.is_err())
+                || snap
+                    .diagnostics
+                    .iter()
+                    .any(|d| format!("hyp/{}", d.path) == shown && d.code == Code::Attachment);
+            if crate::data::is_sha256(&name) && entry.file_type()?.is_symlink() && !reported {
+                let mut d = Diagnostic::new(
+                    &shown,
+                    Code::Attachment,
+                    format!("{shown} is a symlink; hyp keeps stored bytes only as regular files"),
+                );
+                d.repair = Some(Repair {
+                    note: Some(format!(
+                        "Replace {shown} with a copy of the file it points to (or remove it if \
+                         nothing needs those bytes). hyp check confirms the fix."
+                    )),
+                    commands: vec![],
+                });
+                snap.diagnostics.push(d);
+            }
+        }
+        snap.previews = previews;
         snap.derive();
         Ok(snap)
     }
@@ -1067,6 +1208,17 @@ impl Store {
         changes: Vec<Change>,
         expected_project: Option<&str>,
     ) -> Result<Committed> {
+        self.commit_planned(|_| Ok(changes), expected_project)
+    }
+    /// `commit_written` with the changes `plan` makes from the project as it
+    /// is under the write lock, for writes that decide what to write by what
+    /// exists (reusing a record rather than duplicating it). No other writer
+    /// can come between that read and the write.
+    fn commit_planned(
+        &self,
+        plan: impl FnOnce(&Snapshot) -> Result<Vec<Change>>,
+        expected_project: Option<&str>,
+    ) -> Result<Committed> {
         let _lock = self.lock()?;
         let before = self.read_unlocked()?;
         before.assert_writable()?;
@@ -1075,6 +1227,7 @@ impl Store {
                 bail!(Conflict::new("project changed; reload and retry"));
             }
         }
+        let changes = plan(&before)?;
         let mut after = before.clone();
         let mut writes = BTreeMap::new();
         let mut created = Vec::new();
@@ -1178,6 +1331,27 @@ impl Store {
                             // Include the complete plan metadata as well as prose in the historical snapshot.
                             plan.body = encode(&e.record)?;
                         }
+                        // Captured bytes are stored before their record: the
+                        // record describes them as they are.
+                        Data::Captured {
+                            sha256,
+                            size,
+                            media_type,
+                            captured_at,
+                            ..
+                        } => {
+                            let bytes = self.blob(sha256).with_context(|| {
+                                format!(
+                                    "a data record describes bytes hyp has stored; capture \
+                                     them with hyp capture FILE --origin \"...\" (sha256 {sha256})"
+                                )
+                            })?;
+                            *size = bytes.len() as u64;
+                            if media_type.is_empty() {
+                                *media_type = crate::data::guess_media_type(None, &bytes);
+                            }
+                            captured_at.clone_from(&record.created_at);
+                        }
                         _ => {}
                     }
                     record
@@ -1261,7 +1435,7 @@ impl Store {
                     let referrers: Vec<&Entry> = after
                         .objects
                         .iter()
-                        .filter(|e| e.record.data.references().contains(&id.as_str()))
+                        .filter(|e| e.record.references().contains(&id.as_str()))
                         .collect();
                     if !referrers.is_empty() {
                         let keep = if old.record.archived {
@@ -1308,6 +1482,34 @@ impl Store {
             });
             after.objects.sort_by(|a, b| a.record.id.cmp(&b.record.id));
         }
+        // Raise the schema to what the records need (decision-0004), in the
+        // same journal as the records, so a crash leaves both or neither.
+        // Only a write raises it, and never lowers it. A notebook at the
+        // data schema has no attachments: the raise converts them, and so
+        // does any later write that finds one (merged from an older branch).
+        let config = self.config()?;
+        let mut migrated = Vec::new();
+        let mut raised_to = None;
+        if !writes.is_empty() {
+            let needed = |after: &Snapshot| {
+                after
+                    .objects
+                    .iter()
+                    .map(|e| e.record.schema())
+                    .max()
+                    .unwrap_or(config.schema_version)
+                    .max(config.schema_version)
+            };
+            if needed(&after) >= DATA_SCHEMA {
+                migrated = self.migrate_attachments(&mut after, &mut writes)?;
+            }
+            let needed = needed(&after);
+            if needed > config.schema_version {
+                raised_to = Some(needed);
+                let raised = raised(config, needed, SCHEMAS)?;
+                writes.insert(CONFIG.to_string(), Some(toml::to_string_pretty(&raised)?));
+            }
+        }
         let known: Vec<(&str, Code)> = before
             .diagnostics
             .iter()
@@ -1342,22 +1544,6 @@ impl Store {
                 }
             }
         }
-        // Raise the schema to what the records need (decision-0004), in the
-        // same journal as the records, so a crash leaves both or neither.
-        // Only a write raises it, and never lowers it.
-        if !writes.is_empty() {
-            let config = self.config()?;
-            let needed = after
-                .objects
-                .iter()
-                .map(|e| e.record.data.schema())
-                .max()
-                .unwrap_or(config.schema_version);
-            if needed > config.schema_version {
-                let config = raised(config, needed, SCHEMAS)?;
-                writes.insert(CONFIG.to_string(), Some(toml::to_string_pretty(&config)?));
-            }
-        }
         // Verify a second time immediately before writing to detect ordinary editor saves.
         if self.read_unlocked()?.revision != before.revision {
             bail!(Conflict::new("files changed during transaction"));
@@ -1378,43 +1564,443 @@ impl Store {
                 reference,
             })
             .collect();
-        Ok(Committed { written, snapshot })
+        let migrated = migrated
+            .into_iter()
+            .filter_map(|id| snapshot.get(&id).map(Written::of))
+            .collect();
+        Ok(Committed {
+            written,
+            snapshot,
+            migrated,
+            raised_to,
+        })
     }
-    /// Imports the file as an asset and attaches it to evidence `id`.
-    pub fn attach(&self, id: &str, path: &Path) -> Result<Committed> {
-        let bytes = fs::read(path)?;
-        ensure!(bytes.len() <= 32 * 1024 * 1024, "attachment exceeds 32 MiB");
-        let sha = hash(&bytes);
-        let rel = format!("assets/{sha}");
-        let snap = self.snapshot()?;
-        let e = snap.find(id)?;
-        let mut record = e.record.clone();
-        if let Data::Evidence { attachments, .. } = &mut record.data {
-            if !attachments.iter().any(|a| a.sha256 == sha) {
-                attachments.push(Attachment {
-                    path: rel.clone(),
-                    sha256: sha,
-                });
+    /// Where the stored bytes with hash `sha256` live, after checking that
+    /// the hash has the form hyp writes (it becomes a file name).
+    fn blob_path(&self, sha256: &str) -> Result<PathBuf> {
+        ensure!(
+            crate::data::is_sha256(sha256),
+            "invalid sha256 {sha256:?}: expected 64 lowercase hex digits"
+        );
+        Ok(self.root.join("hyp/assets").join(sha256))
+    }
+    /// The stored bytes with hash `sha256`, checked: a regular file (not a
+    /// symlink) at `hyp/assets/<sha256>` whose content has that hash.
+    pub fn blob(&self, sha256: &str) -> Result<Vec<u8>> {
+        let path = self.blob_path(sha256)?;
+        let shown = format!("hyp/assets/{sha256}");
+        let meta = match fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                bail!("{shown} is missing")
             }
-        } else {
-            bail!("attachments require evidence");
-        }
-        let dest = self.root.join("hyp").join(rel);
-        if dest.exists() {
-            ensure!(
-                !dest.symlink_metadata()?.file_type().is_symlink(),
-                "attachment is a symlink"
-            );
-        }
-        atomic(&dest, &bytes)?;
-        self.commit_written(
-            vec![Change::Update {
-                record,
-                expected_revision: e.revision.clone(),
-            }],
-            None,
-        )
+            other => other.with_context(|| format!("cannot inspect {shown}"))?,
+        };
+        ensure!(
+            meta.is_file(),
+            "{shown} is not a regular file (a symlink or directory)"
+        );
+        let bytes = fs::read(&path).with_context(|| format!("cannot read {shown}"))?;
+        ensure!(
+            hash(&bytes) == sha256,
+            "{shown} changed: its content no longer has that sha256"
+        );
+        Ok(bytes)
     }
+    /// Stores `bytes` under their hash, once: an intact copy already there is
+    /// left as it is, a changed one is replaced. Content-addressed, so this is
+    /// idempotent and needs no lock; bytes no record names yet are harmless.
+    fn store_blob(&self, bytes: &[u8]) -> Result<String> {
+        let sha256 = hash(bytes);
+        let path = self.blob_path(&sha256)?;
+        if let Ok(meta) = fs::symlink_metadata(&path) {
+            ensure!(
+                !meta.file_type().is_symlink(),
+                "refusing symlink: {}",
+                path.display()
+            );
+            if self.blob(&sha256).is_ok() {
+                return Ok(sha256);
+            }
+        }
+        atomic(&path, bytes).with_context(|| format!("cannot store {}", path.display()))?;
+        Ok(sha256)
+    }
+    /// The bytes of a legacy attachment, checked: a regular file (not a
+    /// symlink) inside `hyp/assets/` with the recorded hash. `read_unlocked`
+    /// reports an attachment that fails this, and the schema-3 migration
+    /// reads its bytes through it.
+    fn attachment_bytes(&self, a: &Attachment) -> Result<Vec<u8>> {
+        let joined = self.root.join("hyp").join(&a.path);
+        let meta = fs::symlink_metadata(&joined)
+            .with_context(|| format!("attachment {} does not exist", a.path))?;
+        ensure!(
+            meta.is_file(),
+            "attachment {} is not a regular file (a symlink or directory)",
+            a.path
+        );
+        let path = joined
+            .canonicalize()
+            .with_context(|| format!("attachment {} does not exist", a.path))?;
+        ensure!(
+            path.starts_with(self.root.join("hyp/assets")),
+            "attachment {} escapes the assets directory",
+            a.path
+        );
+        let bytes = fs::read(&path)?;
+        ensure!(
+            hash(&bytes) == a.sha256,
+            "attachment {} does not match its hash",
+            a.path
+        );
+        Ok(bytes)
+    }
+    /// decision-0005: every evidence attachment in `after` becomes a data
+    /// record, as the write raises the notebook to `DATA_SCHEMA` (or, at it,
+    /// finds one a merge brought in). The result depends only on the
+    /// notebook, never on the clock or chance, so two copies of a notebook
+    /// (parallel worktrees, clones) migrate to the same files and merge
+    /// cleanly: one data record per distinct hash, with the ID
+    /// `migrated_id(sha256)` (an existing record with that ID is reused),
+    /// title "Migrated attachment <first 8 hex digits>", and as its times the
+    /// earliest `created_at` of the evidence holding the bytes. The evidence
+    /// references them first, in attachment order, then its other data
+    /// references, loses its `attachments`, and keeps its `updated_at`, so
+    /// its fingerprint stays the same (`Snapshot::basis`). The records go
+    /// into `writes`, the same journal as the rest of the write. Returns the
+    /// IDs of the records it wrote.
+    fn migrate_attachments(
+        &self,
+        after: &mut Snapshot,
+        writes: &mut BTreeMap<String, Option<String>>,
+    ) -> Result<Vec<String>> {
+        let holders: Vec<Record> = after
+            .objects
+            .iter()
+            .filter(|e| matches!(&e.record.data, Data::Evidence { attachments, .. } if !attachments.is_empty()))
+            .map(|e| e.record.clone())
+            .collect();
+        if holders.is_empty() {
+            return Ok(vec![]);
+        }
+        // Per hash: its first path and the earliest creation time among the
+        // evidence holding it (RFC 3339 times of one notebook; compared as
+        // instants, the text kept as written).
+        let mut first: BTreeMap<String, (String, String)> = BTreeMap::new();
+        for e in &holders {
+            let Data::Evidence { attachments, .. } = &e.data else {
+                unreachable!("only evidence has attachments")
+            };
+            for a in attachments {
+                let earlier = |t: &str, than: &str| match (
+                    chrono::DateTime::parse_from_rfc3339(t),
+                    chrono::DateTime::parse_from_rfc3339(than),
+                ) {
+                    (Ok(t), Ok(than)) => t < than,
+                    _ => t < than,
+                };
+                first
+                    .entry(a.sha256.clone())
+                    .and_modify(|(_, at)| {
+                        if earlier(&e.created_at, at) {
+                            at.clone_from(&e.created_at);
+                        }
+                    })
+                    .or_insert_with(|| (a.path.clone(), e.created_at.clone()));
+            }
+        }
+        let mut written = Vec::new();
+        let mut records = Vec::new();
+        for (sha256, (path, at)) in &first {
+            let id = migrated_id(sha256);
+            if after.get(&id).is_some() {
+                continue;
+            }
+            let bytes = self
+                .attachment_bytes(&Attachment {
+                    path: path.clone(),
+                    sha256: sha256.clone(),
+                })
+                .with_context(|| format!("cannot turn attachment {path} into a data record"))?;
+            // A hand-made attachment may live elsewhere in assets/.
+            self.store_blob(&bytes)?;
+            records.push(Record {
+                id,
+                title: format!("Migrated attachment {}", &sha256[..8]),
+                body: format!(
+                    "Converted from a legacy evidence attachment when the notebook was raised \
+                     to schema {DATA_SCHEMA} (decision-0005). Its times are the creation time \
+                     of the earliest evidence that held it, not of the original attach."
+                ),
+                tags: vec![],
+                data_refs: vec![],
+                archived: false,
+                created_at: at.clone(),
+                updated_at: at.clone(),
+                data: Data::Captured {
+                    origin: format!("migrated from evidence attachment {path}"),
+                    captured_at: at.clone(),
+                    media_type: crate::data::guess_media_type(None, &bytes),
+                    size: bytes.len() as u64,
+                    sha256: sha256.clone(),
+                },
+            });
+        }
+        for mut evidence in holders {
+            let attachments = match &mut evidence.data {
+                Data::Evidence { attachments, .. } => std::mem::take(attachments),
+                _ => unreachable!("only evidence has attachments"),
+            };
+            let mut refs: Vec<String> = Vec::new();
+            let migrated = attachments.iter().map(|a| migrated_id(&a.sha256));
+            for id in migrated.chain(std::mem::take(&mut evidence.data_refs)) {
+                if !refs.contains(&id) {
+                    refs.push(id);
+                }
+            }
+            evidence.data_refs = refs;
+            records.push(evidence);
+        }
+        for r in records {
+            let raw = encode(&r)?;
+            writes.insert(Self::relative(&r), Some(raw.clone()));
+            written.push(r.id.clone());
+            after.objects.retain(|e| e.record.id != r.id);
+            after.objects.push(Entry {
+                record: r,
+                revision: hash(raw),
+            });
+        }
+        after.objects.sort_by(|a, b| a.record.id.cmp(&b.record.id));
+        Ok(written)
+    }
+    /// Stores `c.bytes` once per hash and records them as a new data record
+    /// (decision-0005). Idempotent: when a data record (not archived) already
+    /// has these bytes and the same title, origin, media type and note, that
+    /// one is returned, unchanged, and nothing is written; any difference
+    /// makes a new record, which shares the stored bytes. The lookup happens
+    /// under the write lock, so identical concurrent captures make one record.
+    /// Empty bytes are refused unless `c.allow_empty`: an agent whose command
+    /// failed and printed nothing must not see success.
+    pub fn capture(&self, c: Capture) -> Result<Committed> {
+        let what = c.name.clone().unwrap_or_else(|| "the capture".into());
+        ensure!(c.bytes.len() <= crate::data::LIMIT, "{}", too_large(&what));
+        ensure!(
+            !c.bytes.is_empty() || c.allow_empty,
+            "{what} is empty (0 bytes), so nothing was captured; if the command that \
+             produced it failed, fix that first, or pass --allow-empty to record empty data"
+        );
+        let media_type = c
+            .media_type
+            .unwrap_or_else(|| crate::data::guess_media_type(c.name.as_deref(), &c.bytes));
+        let sha256 = self.store_blob(&c.bytes)?;
+        let mut existing = None;
+        let mut committed = self.commit_planned(
+            |s| {
+                let same = s.objects.iter().find(|e| {
+                    let r = &e.record;
+                    !r.archived
+                        && r.title == c.title
+                        && r.body == c.note
+                        && matches!(&r.data, Data::Captured { origin, media_type: m, sha256: h, .. }
+                            if *origin == c.origin && *m == media_type && *h == sha256)
+                });
+                if let Some(e) = same {
+                    existing = Some(Written {
+                        changed: false,
+                        ..Written::of(e)
+                    });
+                    return Ok(vec![]);
+                }
+                let mut r = Record::new(
+                    c.title,
+                    Data::Captured {
+                        origin: c.origin,
+                        captured_at: String::new(),
+                        media_type,
+                        size: 0,
+                        sha256,
+                    },
+                );
+                r.body = c.note;
+                Ok(vec![Change::Create {
+                    record: r,
+                    expected: None,
+                }])
+            },
+            None,
+        )?;
+        if let Some(w) = existing {
+            committed.written = vec![w];
+        }
+        Ok(committed)
+    }
+    /// `hyp evidence attach`: stores the file's bytes and makes evidence `id`
+    /// reference a data record holding them: one it already references;
+    /// else, when a legacy attachment holds these bytes, the record the
+    /// migration makes for them (`migrated_id`); else an existing one with the
+    /// same bytes (not archived); else a new one (title: the file name;
+    /// origin: the path as given). Decided under the write lock, so
+    /// concurrent attaches of the same bytes share one record. Lists the
+    /// evidence, then the data record. When the evidence holds the bytes
+    /// already (by a data reference, or as a legacy attachment), nothing is
+    /// written and the evidence keeps its `updated_at`; a legacy attachment
+    /// has no data record yet, so then only the evidence is listed.
+    pub fn attach(&self, id: &str, path: &Path) -> Result<Committed> {
+        let file = File::open(path).with_context(|| format!("cannot read {}", path.display()))?;
+        let bytes = read_capped(file, &path.display().to_string())?;
+        let sha256 = self.store_blob(&bytes)?;
+        let mut data_id = String::new();
+        let mut evidence_id = String::new();
+        let mut c = self.commit_planned(
+            |s| {
+                let e = s.find(id)?;
+                ensure!(
+                    matches!(e.record.data, Data::Evidence { .. }),
+                    "attachments require evidence; {} is {} {}",
+                    e.record.id,
+                    article(e.record.data.kind()),
+                    e.record.data.kind()
+                );
+                evidence_id.clone_from(&e.record.id);
+                // It holds these bytes already, as a legacy attachment (hyp
+                // 0.2.0's attach): a no-op, as it was, so no data record yet.
+                if matches!(&e.record.data, Data::Evidence { attachments, .. }
+                    if attachments.iter().any(|a| a.sha256 == sha256))
+                {
+                    return Ok(vec![]);
+                }
+                let holds = |d: &Entry| matches!(&d.record.data, Data::Captured { sha256: h, .. } if *h == sha256);
+                let legacy = s.objects.iter().any(|x| {
+                    matches!(&x.record.data, Data::Evidence { attachments, .. }
+                        if attachments.iter().any(|a| a.sha256 == sha256))
+                });
+                let mut record = e.record.clone();
+                let mut changes = Vec::new();
+                let referenced = record
+                    .data_refs
+                    .iter()
+                    .filter_map(|d| s.get(d))
+                    .find(|d| holds(d))
+                    .map(|d| d.record.id.clone());
+                data_id = match referenced {
+                    Some(d) => d,
+                    None => {
+                        let reused = s
+                            .objects
+                            .iter()
+                            .find(|d| !d.record.archived && holds(d))
+                            .map(|d| d.record.id.clone());
+                        let d = match (legacy, reused) {
+                            // The migration in this same write creates it.
+                            (true, _) => migrated_id(&sha256),
+                            (false, Some(d)) => d,
+                            (false, None) => {
+                                let name =
+                                    path.file_name().map(|n| n.to_string_lossy().into_owned());
+                                let d = Record::new(
+                                    name.clone().unwrap_or_else(|| path.display().to_string()),
+                                    Data::Captured {
+                                        origin: path.display().to_string(),
+                                        captured_at: String::new(),
+                                        media_type: crate::data::guess_media_type(
+                                            name.as_deref(),
+                                            &bytes,
+                                        ),
+                                        size: 0,
+                                        sha256: sha256.clone(),
+                                    },
+                                );
+                                let id = d.id.clone();
+                                changes.push(Change::Create {
+                                    record: d,
+                                    expected: None,
+                                });
+                                id
+                            }
+                        };
+                        record.data_refs.push(d.clone());
+                        d
+                    }
+                };
+                changes.push(Change::Update {
+                    record,
+                    expected_revision: e.revision.clone(),
+                });
+                Ok(changes)
+            },
+            None,
+        )?;
+        // The evidence first (the contract of hyp 0.2.0), then the data record.
+        if data_id.is_empty() {
+            let e = c
+                .snapshot
+                .get(&evidence_id)
+                .with_context(|| format!("{evidence_id} is missing after the write"))?;
+            c.written = vec![Written {
+                changed: false,
+                ..Written::of(e)
+            }];
+            return Ok(c);
+        }
+        // Created by this write: by the attach, or by the migration within it.
+        let created = c.written.iter().chain(&c.migrated).any(|w| w.id == data_id);
+        c.written.retain(|w| w.id != data_id);
+        c.migrated.retain(|w| w.id != data_id);
+        let data = c
+            .snapshot
+            .get(&data_id)
+            .with_context(|| format!("{data_id} is missing after the write"))?;
+        let written = Written {
+            changed: created,
+            ..Written::of(data)
+        };
+        c.written.push(written);
+        Ok(c)
+    }
+}
+/// The ID the schema-3 migration gives the data record for stored bytes with
+/// hash `sha256`: a name-based UUID (version 5) of the hash in hyp's own
+/// namespace, so every copy of a notebook derives the same one.
+pub fn migrated_id(sha256: &str) -> String {
+    /// hyp's namespace for migrated attachments; fixed forever, as the IDs
+    /// derived from it are stored.
+    const NAMESPACE: uuid::Uuid = uuid::uuid!("5c1f4e0a-8d2b-4b7e-9a36-0c0d3a1e7f21");
+    let uuid = uuid::Uuid::new_v5(&NAMESPACE, sha256.as_bytes());
+    format!("{}-{uuid}", Kind::Data.prefix())
+}
+/// The bytes to capture, and what to record about them (`Store::capture`).
+pub struct Capture {
+    pub bytes: Vec<u8>,
+    /// One line.
+    pub title: String,
+    /// Where the bytes came from (`Data::Captured::origin`).
+    pub origin: String,
+    /// None: guessed from `name` and the bytes (`data::guess_media_type`).
+    pub media_type: Option<String>,
+    /// The name of the file the bytes came from, for the guess and errors.
+    pub name: Option<String>,
+    /// The record's body: an optional note.
+    pub note: String,
+    /// Record empty bytes instead of refusing them.
+    pub allow_empty: bool,
+}
+fn too_large(what: &str) -> String {
+    format!(
+        "{what} exceeds {} MiB, the most one capture may hold",
+        crate::data::LIMIT / (1024 * 1024)
+    )
+}
+/// All of `reader` (a file, or stdin for `hyp capture -`), unless it holds
+/// more than `data::LIMIT` bytes; `what` names it in the error.
+pub fn read_capped(reader: impl std::io::Read, what: &str) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    reader
+        .take(crate::data::LIMIT as u64 + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("cannot read {what}"))?;
+    ensure!(bytes.len() <= crate::data::LIMIT, "{}", too_large(what));
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -1447,5 +2033,39 @@ mod tests {
         );
         let text = toml::to_string_pretty(&four).unwrap();
         assert_eq!(toml::from_str::<Config>(&text).unwrap(), four);
+    }
+    /// decision-0004 for schema 3 (HYPO-0090): a notebook raised by a real
+    /// capture is refused up front by a hyp that reads only schemas 1 and 2
+    /// (hyp 0.2.0, played by `read_config_of` with the first two rows), naming
+    /// the version the raise wrote; this hyp reads it.
+    #[test]
+    fn a_hyp_that_reads_schema_2_refuses_a_notebook_raised_by_a_capture() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::init(dir.path()).unwrap();
+        let hyp = store.root.join("hyp");
+        let older = &SCHEMAS[..2];
+        read_config_of(&hyp, older).unwrap();
+        store
+            .capture(Capture {
+                bytes: b"log".to_vec(),
+                title: "Log".into(),
+                origin: "here".into(),
+                media_type: None,
+                name: None,
+                note: String::new(),
+                allow_empty: false,
+            })
+            .unwrap();
+        let err = read_config_of(&hyp, older).unwrap_err();
+        assert_eq!(kind_of(&err), ErrorKind::UnsupportedSchema);
+        let message = err.to_string();
+        for part in [
+            "uses schema 3",
+            "reads schemas 1 to 2",
+            "upgrade hyp to >= 0.3.0",
+        ] {
+            assert!(message.contains(part), "{part:?} in {message}");
+        }
+        assert_eq!(read_config(&hyp).unwrap().schema_version, 3);
     }
 }

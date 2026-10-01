@@ -13,12 +13,11 @@ is no `hyp/` directory in the project root, ask the user before `hyp init`.
 
 ## Method
 
-1. **Start with `hyp status`.** It shows where the investigation stands:
-   per open hypothesis its judgment, whether it needs review, a missing
-   criterion, linked evidence, open gaps and experiments without runs; then
-   unexplained observations, and anything that blocks writes. `hyp search
-   "text"` finds what is already recorded. Continue an existing hypothesis
-   rather than adding a duplicate, and reuse existing evidence with `hyp link`.
+1. **Start with `hyp status`**: per open hypothesis its judgment, needs-review,
+   missing criterion, linked evidence, open gaps and experiments without runs;
+   then unexplained observations and what blocks writes. `hyp search "text"`
+   finds what exists: continue a hypothesis rather than adding a duplicate,
+   and reuse evidence with `hyp link`.
 2. **Record the hypothesis before acting on it.** When you suspect a cause,
    `hyp add` it with a scope before you change code or config because of it.
    Record serious alternatives too and link them with `competes-with`.
@@ -56,8 +55,8 @@ hyp add "Clock skew causes it" --explains E-4c1d9a07 --competes-with H-3f2a9c1e
 ## Commands
 
 IDs look like `H-<uuid>`; the letter gives the kind (H hypothesis, F criterion,
-P prediction, E evidence, L link, X experiment, R run, A assessment, G gap).
-Pass the full ID or an unambiguous prefix: the first 10 characters
+P prediction, E evidence, L link, X experiment, R run, A assessment, G gap,
+D data). Pass the full ID or an unambiguous prefix: the first 10 characters
 (`H-1a2b3c4d`) nearly always are. `hyp <command> --help` documents the rest.
 
 ```bash
@@ -72,7 +71,7 @@ hyp set H-... --lifecycle investigating                    # needs a criterion
 hyp evidence add H-|P-|F-... "Short observation" --source PATH_OR_CMD \
   --locator "lines 10-20" [--against | --qualifies] --reason "Why it matters" \
   --body "Numbers, raw output, the exact command"          # prints E-, then L-
-hyp evidence attach E-... ./capture.log                    # keep the raw file
+hyp capture ./run.log --origin "scp rig:/var/log/run.log"  # raw data, prints D-
 hyp link E-...|H-... H-... --relation supports|competes-with --reason "..."
 hyp experiment add H-... "Short procedure" --targets F-...,P-... --body "..."
 hyp run X-... "Run 1" --outcome observed --evidence E-...
@@ -89,10 +88,13 @@ observation was made, against the hypothesis; `--against`, that it was not.
 `hyp show H-...` groups observations by what they mean for it.
 
 **Titles are one line and short**: the claim, or the observation in a few
-words ("200/200 passes with per-test temp dirs"); details, numbers, raw
-output and command lines go in `--body`, whole logs in `hyp evidence
-attach`. A text argument `-` reads stdin, once per command; for a title,
-its first line is the title and the rest goes to the body.
+words ("200/200 passes with per-test temp dirs"); details, numbers and command
+lines go in `--body`. A text argument `-` reads stdin, once per command; for a
+title, its first line is the title and the rest goes to the body.
+
+**Keep raw data** (whole logs, outputs, files): `hyp capture FILE --origin
+"where from"` or `cmd | hyp capture - --origin "cmd"` stores an immutable `D-`
+record; name it from any record with `--data D-...` (observe, add, run, set).
 
 **IDs from output.** A write prints the full ID of each record it wrote, one
 per line; pass it (or its first 10 characters) on, as in the Example. Do not
@@ -116,8 +118,7 @@ changes on stdin (`hyp apply < step.json`, or a quoted heredoc
  {"op": "create", "record": {"kind": "run", "title": "Run 1", "experiment": "@x", "evidence": ["@e"]}}]
 ```
 
-A `"patch"` changes only the named fields; `hyp apply --help` documents every
-change and what creating an assessment, experiment or run must state.
+`hyp apply --help` documents every change (a `"patch"` sets only named fields).
 
 ## Assessing
 
@@ -139,8 +140,8 @@ hyp assess H-... --reviewed 46d8d8f5c79b --status weakened --confidence 0.3 \
   with `hyp evidence add F-...`; evidence against H alone does not). See
   `hyp assess --help`. `--reason` is always required; `--confidence` 0.0-1.0.
 - The token covers the basis (`.basis` in `hyp --json show`: claim, scope,
-  assumptions, criteria, predictions, links, linked evidence with source
-  and locator, runs, archiving any of them) and the current assessments,
+  assumptions, criteria, predictions, links, linked evidence with source,
+  locator and data, runs, archiving any of them) and the current assessments,
   not closing, tags, experiment status or gaps. `.state.needs_review`: the
   basis changed since; review and assess again. Every assessment changes
   the token, so read again before the next one.
@@ -156,8 +157,7 @@ gets `--untestable-reason "..."` instead of a criterion.
   not help. `kind`: `invalid_input`, `not_found` (`ids` those that match
   nothing), `ambiguous_id` (use a longer prefix), `blocked` (repair files
   first, see Files), `unsupported_schema` (ask the user to upgrade hyp) or `io`.
-- `2` invalid arguments (including `hyp list` filters the listed kind cannot
-  have); see `--help`.
+- `2` invalid arguments (`hyp list` filters included); see `--help`.
 - `3` conflict (`kind` `conflict`, `ids` the records that changed, when
   known): something the write depended on changed since you read it, so
   nothing was written. Re-read, reconsider, retry with fresh values. For

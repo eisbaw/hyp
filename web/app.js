@@ -61,6 +61,19 @@ const all = (kind) =>
     (e) => !e.record.archived && (!kind || e.record.kind === kind),
   );
 const find = (id) => records().find((e) => e.record.id === id);
+// Records whose `data` references name data record `id`, archived ones too:
+// each keeps it from being deleted.
+const dataUsers = (id) =>
+  records().filter((e) => (e.record.data || []).includes(id));
+// A size in bytes for people.
+const bytes = (n) =>
+  n < 1024
+    ? `${n} B`
+    : n < 1048576
+      ? `${(n / 1024).toFixed(1)} KiB`
+      : `${(n / 1048576).toFixed(1)} MiB`;
+// Data records and records of kinds that cannot change are not edited.
+const immutable = (r) => ["assessment", "run", "data"].includes(r.kind);
 const state = (id) => snapshot?.hypotheses[id];
 // What each observation linked to hypothesis `id` means for it, derived by
 // the server (`Snapshot::evidence_bearings`): evidence that supports a
@@ -194,6 +207,7 @@ function render() {
     overview: "Hypotheses",
     experiments: "Experiments",
     evidence: "Evidence",
+    data: "Data",
     matrix: "Evidence matrix",
     graph: "Relationships",
     all: "All records",
@@ -236,6 +250,15 @@ function render() {
       ) +
       `<div class="actions">${button("create:evidence", "＋ Add evidence")}</div>` +
       `<div class="section cards">${all("evidence").map(card).join("") || empty("No observations yet", "Record the first result, including its source.")}</div>`;
+  } else if (view === "data") {
+    content =
+      heading(
+        "THE RAW MATERIAL",
+        "Data",
+        "Captured bytes, with where they came from. Capture with hyp capture; they cannot change.",
+        "04",
+      ) +
+      `<div class="section cards">${all("data").map(card).join("") || empty("No data captured yet", "hyp capture FILE --origin \"where it came from\" keeps a log, output or file here.")}</div>`;
   } else if (view === "all") {
     content =
       heading(
@@ -312,11 +335,11 @@ function bindFilters() {
 function card({ record: r }) {
   const st = state(r.id);
   const rel = related(r.id);
-  return `<article class="card"><div class="card-top"><span class="id">${esc(short(r.id))}</span>${badge(r.kind)}${st ? badge(st.judgment) : ""}${st?.needs_review ? badge("needs review", "review") : ""}${r.archived ? badge("archived") : ""}<span class="badges">${(r.tags || []).map((t) => `<span class="tag">${esc(t)}</span>`).join("")}</span></div><h3>${link(r)}</h3><p class="summary">${esc((r.scope || r.body || r.source || r.conditions || "").slice(0, 210))}</p><div class="card-bottom"><span>${r.kind === "hypothesis" ? `${rel.filter((e) => e.record.kind === "link").length} evidence / relation links &nbsp; · &nbsp; ${rel.filter((e) => e.record.kind === "experiment").length} experiments` : esc(r.source || r.status || r.outcome || r.judgment || (r.relation ? relationName(r.relation) : human(r.kind)))}</span><span>${r.lifecycle ? esc(r.lifecycle) + " &nbsp; · &nbsp; " : ""}${esc((r.updated_at || "").slice(0, 10))} <a class="arrow" aria-label="Open ${esc(r.title)}" href="#record/${esc(r.id)}">↗</a></span></div></article>`;
+  return `<article class="card"><div class="card-top"><span class="id">${esc(short(r.id))}</span>${badge(r.kind)}${st ? badge(st.judgment) : ""}${st?.needs_review ? badge("needs review", "review") : ""}${r.archived ? badge("archived") : ""}<span class="badges">${(r.tags || []).map((t) => `<span class="tag">${esc(t)}</span>`).join("")}</span></div><h3>${link(r)}</h3><p class="summary">${esc((r.scope || r.body || r.source || r.origin || r.conditions || "").slice(0, 210))}</p><div class="card-bottom"><span>${r.kind === "hypothesis" ? `${rel.filter((e) => e.record.kind === "link").length} evidence / relation links &nbsp; · &nbsp; ${rel.filter((e) => e.record.kind === "experiment").length} experiments` : esc(r.kind === "data" ? `${r.media_type} · ${bytes(r.size)} · used by ${dataUsers(r.id).length}` : r.source || r.status || r.outcome || r.judgment || (r.relation ? relationName(r.relation) : human(r.kind)))}</span><span>${r.lifecycle ? esc(r.lifecycle) + " &nbsp; · &nbsp; " : ""}${esc((r.updated_at || "").slice(0, 10))} <a class="arrow" aria-label="Open ${esc(r.title)}" href="#record/${esc(r.id)}">↗</a></span></div></article>`;
 }
 function item(e, extra = "") {
   const r = e.record;
-  return `<div class="detail-item"><div class="item-top"><h3>${link(r)}</h3>${r.kind !== "assessment" && r.kind !== "run" ? button("edit", "Edit", r.id, 'class="mini-button"') : ""}</div><span class="id">${esc(short(r.id))}${r.archived ? " · archived" : ""}</span>${extra}${r.body ? `<div class="notes">${esc(r.body)}</div>` : ""}</div>`;
+  return `<div class="detail-item"><div class="item-top"><h3>${link(r)}</h3>${!immutable(r) ? button("edit", "Edit", r.id, 'class="mini-button"') : ""}</div><span class="id">${esc(short(r.id))}${r.archived ? " · archived" : ""}</span>${extra}${r.body ? `<div class="notes">${esc(r.body)}</div>` : ""}</div>`;
 }
 function section(title, entries, action = "", owner = "") {
   return `<section class="section"><div class="section-head"><h2>${esc(title)} <span class="small">${entries.length}</span></h2>${action ? button("create:" + action, "＋ Add", owner) : ""}</div>${entries.map((e) => item(e)).join("") || '<p class="small">Nothing recorded yet.</p>'}</section>`;
@@ -330,7 +353,13 @@ function detail(id) {
     );
   const r = e.record,
     st = state(id);
-  const top = `<div class="page-title"><div><span class="eyebrow">${esc(human(r.kind))} · ${esc(short(r.id))}</span><h1>${esc(r.title)}</h1><div class="badges">${st ? badge(st.judgment) : ""}${st?.needs_review ? badge("needs review", "review") : ""}${r.lifecycle ? badge(r.lifecycle) : ""}${r.archived ? badge("archived") : ""}</div></div><div class="actions">${!["assessment", "run"].includes(r.kind) ? button("edit", "Edit record", r.id) + button(r.archived ? "restore" : "archive", r.archived ? "Restore" : "Archive", r.id) : ""}${r.archived ? button("delete", "Delete", r.id) : ""}</div></div>`;
+  const top = `<div class="page-title"><div><span class="eyebrow">${esc(human(r.kind))} · ${esc(short(r.id))}</span><h1>${esc(r.title)}</h1><div class="badges">${st ? badge(st.judgment) : ""}${st?.needs_review ? badge("needs review", "review") : ""}${r.lifecycle ? badge(r.lifecycle) : ""}${r.archived ? badge("archived") : ""}</div></div><div class="actions">${!immutable(r) ? button("edit", "Edit record", r.id) : ""}${!["assessment", "run"].includes(r.kind) ? button(r.archived ? "restore" : "archive", r.archived ? "Restore" : "Archive", r.id) : ""}${r.archived ? button("delete", "Delete", r.id) : ""}</div></div>`;
+  // The data records this record references (decision-0005).
+  const dataRefs = section(
+    "Data",
+    (r.data || []).map(find).filter(Boolean),
+  );
+  if (r.kind === "data") return top + dataDetail(e);
   if (r.kind !== "hypothesis") {
     let extra = "";
     if (r.kind === "experiment") {
@@ -363,6 +392,7 @@ function detail(id) {
       top +
       `<div class="panel"><div class="notes">${esc(r.body || "No additional notes.")}</div>${r.source ? `<p class="small">Source: ${esc(r.source)} · ${esc(r.locator)}</p>` : ""}${r.confidence != null ? `<p>Subjective confidence: ${Math.round(r.confidence * 100)}%</p>` : ""}</div>` +
       extra +
+      (r.data?.length ? dataRefs : "") +
       section("Referenced records", references) +
       `<details class="section"><summary>Structured record · ${esc(e.revision.slice(0, 12))}</summary><pre class="raw">${esc(JSON.stringify(r, null, 2))}</pre></details>`
     );
@@ -400,7 +430,7 @@ function detail(id) {
     .filter((e) => e.record.kind === "assessment" && e.record.hypothesis === id)
     .sort((a, b) => b.record.created_at.localeCompare(a.record.created_at));
   const current = st?.assessment_ids?.map(find).filter(Boolean) || [];
-  const left = `<div>${r.scope ? `<div class="panel"><span class="eyebrow">SCOPE & CONTEXT</span><p>${esc(r.scope)}</p>${r.body ? `<div class="notes">${esc(r.body)}</div>` : ""}${r.assumptions ? `<p class="small">Assumptions: ${esc(r.assumptions)}</p>` : ""}</div>` : `<div class="panel notes">${esc(r.body || "Add scope, assumptions and notes to make this claim precise.")}</div>`}${section("What would falsify this?", criteria, "criterion", id)}${section("Predictions", predictions, "prediction", id)}<section class="section"><div class="section-head"><h2>Evidence & interpretation</h2>${button("create:evidence", "＋ Record evidence", id)}</div><p class="small">Evidence on a criterion or prediction is part of this hypothesis's basis. Evidence that meets a falsification criterion counts against it.</p><div class="evidence-columns"><div data-stance="for"><p class="evidence-heading">FOR THIS HYPOTHESIS</p>${evidenceBlock("for") || '<p class="small">No observations for it.</p>'}</div><div data-stance="against"><p class="evidence-heading negative">AGAINST THIS HYPOTHESIS</p>${evidenceBlock("against") || '<p class="small">No observations against it.</p>'}</div></div>${moreEvidence("qualifies", "QUALIFIES THIS HYPOTHESIS")}${moreEvidence("mixed", "MIXED: ITS LINKS DISAGREE")}</section>${section(
+  const left = `<div>${r.scope ? `<div class="panel"><span class="eyebrow">SCOPE & CONTEXT</span><p>${esc(r.scope)}</p>${r.body ? `<div class="notes">${esc(r.body)}</div>` : ""}${r.assumptions ? `<p class="small">Assumptions: ${esc(r.assumptions)}</p>` : ""}</div>` : `<div class="panel notes">${esc(r.body || "Add scope, assumptions and notes to make this claim precise.")}</div>`}${r.data?.length ? dataRefs : ""}${section("What would falsify this?", criteria, "criterion", id)}${section("Predictions", predictions, "prediction", id)}<section class="section"><div class="section-head"><h2>Evidence & interpretation</h2>${button("create:evidence", "＋ Record evidence", id)}</div><p class="small">Evidence on a criterion or prediction is part of this hypothesis's basis. Evidence that meets a falsification criterion counts against it.</p><div class="evidence-columns"><div data-stance="for"><p class="evidence-heading">FOR THIS HYPOTHESIS</p>${evidenceBlock("for") || '<p class="small">No observations for it.</p>'}</div><div data-stance="against"><p class="evidence-heading negative">AGAINST THIS HYPOTHESIS</p>${evidenceBlock("against") || '<p class="small">No observations against it.</p>'}</div></div>${moreEvidence("qualifies", "QUALIFIES THIS HYPOTHESIS")}${moreEvidence("mixed", "MIXED: ITS LINKS DISAGREE")}</section>${section(
     "Experiments",
     owned.filter((e) => e.record.kind === "experiment"),
     "experiment",
@@ -429,6 +459,30 @@ function detail(id) {
   }</section></div>`;
   const side = `<div class="detail-side"><div class="panel"><span class="eyebrow">CURRENT ASSESSMENT</span><h2>${esc(human(st?.judgment || "untested"))}</h2>${current.length > 1 ? '<p class="diagnostics">Conflicting assessment branches. Add an assessment to reconcile them.</p>' : ""}${st?.confidence != null ? `<div class="meta-line"><span>Subjective confidence</span><strong>${Math.round(st.confidence * 100)}%</strong></div>` : ""}<p class="small">${st?.needs_review ? "The underlying record changed. This judgment needs review." : "Judgment is explicit. Evidence never changes it automatically."}</p>${current.map((e) => `<p class="notes">${esc(e.record.body)}</p>`).join("")}<div class="section">${button("create:assessment", "Review hypothesis", id, 'class="primary"')}</div></div><div class="panel section"><span class="eyebrow">NOTEBOOK DETAILS</span><div class="meta-line"><span>Lifecycle</span><strong>${esc(r.lifecycle)}</strong></div><div class="meta-line"><span>Created</span><strong>${esc(r.created_at.slice(0, 10))}</strong></div><p class="small">${r.tags.map((t) => "#" + esc(t)).join(" ")}</p><p class="small">${esc(r.untestable_reason || "")}</p><a href="#graph/${esc(id)}">Explore relationships ↗</a><details><summary class="small">Full ID & revision</summary><pre class="raw">${esc(id)}\n${esc(e.revision)}</pre></details></div></div>`;
   return top + `<div class="detail-grid">${left}${side}</div>`;
+}
+/** A data record: its metadata, a preview of text (escaped, as derived by
+ * the server for text/* media types; the bytes themselves are never served)
+ * and every record that references it. */
+function dataDetail(e) {
+  const r = e.record;
+  const meta = [
+    ["Origin", r.origin],
+    ["Captured", r.captured_at],
+    ["Media type", r.media_type],
+    ["Size", `${bytes(r.size)} (${r.size} bytes)`],
+    ["SHA-256", r.sha256],
+  ]
+    .map(
+      ([k, v]) =>
+        `<div class="meta-line"><span>${esc(k)}</span><strong>${esc(v)}</strong></div>`,
+    )
+    .join("");
+  const preview = snapshot.previews?.[r.id];
+  const shown =
+    preview == null
+      ? `<p class="small">${r.media_type?.startsWith("text/") ? "No preview: the stored bytes are missing or changed (see the checks)." : "No preview for " + esc(r.media_type) + "; hyp data get " + esc(short(r.id)) + " writes the bytes out."}</p>`
+      : `<p class="small">${r.size > preview.length ? "The start of the data:" : "The data:"}</p><pre class="raw preview">${esc(preview)}</pre>`;
+  return `<div class="panel"><span class="eyebrow">CAPTURED DATA · IMMUTABLE</span>${meta}${r.body ? `<div class="notes">${esc(r.body)}</div>` : ""}</div><section class="section"><div class="section-head"><h2>Preview</h2></div>${shown}</section>${section("Referenced by", dataUsers(r.id))}`;
 }
 function experimentQueue() {
   return ["planned", "running", "completed", "cancelled"]

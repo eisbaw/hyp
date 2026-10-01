@@ -252,3 +252,59 @@ async fn sse_delivers_initial_revision_and_security_headers() {
     let text = String::from_utf8(frame.into_data().unwrap().to_vec()).unwrap();
     assert!(text.contains("event: change"));
 }
+/// HYPO-0090: the WebUI gets a text preview of `text/*` data records inside
+/// the snapshot JSON and no route serves stored bytes, so nothing captured
+/// can reach the browser as content of its own type.
+#[tokio::test]
+async fn data_is_previewed_as_json_text_and_its_bytes_are_never_served() {
+    let (_dir, app, store) = app();
+    let capture = |bytes: &[u8], media_type: Option<&str>| {
+        let c = store
+            .capture(hyp::store::Capture {
+                bytes: bytes.to_vec(),
+                title: "Capture".into(),
+                origin: "test".into(),
+                media_type: media_type.map(str::to_string),
+                name: None,
+                note: String::new(),
+                allow_empty: false,
+            })
+            .unwrap();
+        c.written[0].id.clone()
+    };
+    let html = "<script>alert(1)</script>";
+    let text = capture(html.as_bytes(), None);
+    let as_html = capture(b"<b>x</b>", Some("text/html"));
+    let binary = capture(&[0, 255], None);
+    let get = |path: &str| {
+        Request::builder()
+            .uri(path)
+            .header("host", "127.0.0.1:7432")
+            .body(Body::empty())
+            .unwrap()
+    };
+    let response = app.clone().oneshot(get("/api/snapshot")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let content_type = response.headers()["content-type"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        content_type.starts_with("application/json"),
+        "{content_type}"
+    );
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let snapshot: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(snapshot["previews"][&text], html);
+    assert_eq!(snapshot["previews"][&as_html], "<b>x</b>");
+    assert!(snapshot["previews"].get(&binary).is_none());
+    let sha = hyp::model::hash(html);
+    for path in [
+        format!("/assets/{sha}"),
+        format!("/hyp/assets/{sha}"),
+        format!("/api/data/{text}"),
+    ] {
+        let response = app.clone().oneshot(get(&path)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+    }
+}

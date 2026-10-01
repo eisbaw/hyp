@@ -131,6 +131,7 @@ pub fn plain(s: &Snapshot, e: &Entry) -> String {
             }
             field(&mut out, "", "judgment", &judgment);
             footer(&mut out, r);
+            data_section(&mut out, s, r);
             hypothesis(&mut out, s, &r.id, &state.assessment_ids);
         }
         (data, _) => {
@@ -157,19 +158,28 @@ pub fn plain(s: &Snapshot, e: &Entry) -> String {
                 }
             }
             footer(&mut out, r);
+            data_section(&mut out, s, r);
             // Evidence: its links to claims are listed under "Bears on".
             let shown = match data {
                 Data::Evidence { .. } => bears_on(&mut out, s, e),
                 _ => vec![],
             };
-            let refs = active(s, |d| d.references().contains(&r.id.as_str()))
+            // Every referrer of a data record, archived ones too: each keeps
+            // it from being deleted.
+            let every = matches!(data, Data::Captured { .. });
+            let refs = s
+                .objects
+                .iter()
+                .filter(|x| every || !x.record.archived)
+                .filter(|x| x.record.references().contains(&r.id.as_str()))
                 .filter(|x| !shown.contains(&x.record.id.as_str()))
                 .map(|x| {
                     format!(
-                        "  {}  {:11} {}",
+                        "  {}  {:11} {}{}",
                         x.record.id,
                         x.record.data.kind(),
-                        x.record.title
+                        x.record.title,
+                        archived(x)
                     )
                 })
                 .collect();
@@ -177,6 +187,28 @@ pub fn plain(s: &Snapshot, e: &Entry) -> String {
         }
     }
     out.join("\n")
+}
+/// The data records `r` references (`Record::data_refs`), one line each:
+/// ID, media type, size and title; a missing one as such.
+fn data_section(out: &mut Vec<String>, s: &Snapshot, r: &Record) {
+    let lines = r
+        .data_refs
+        .iter()
+        .map(|id| match s.get(id) {
+            Some(d) => match &d.record.data {
+                Data::Captured {
+                    media_type, size, ..
+                } => format!(
+                    "  {id}  {media_type} · {size} bytes  {}{}",
+                    d.record.title,
+                    archived(d)
+                ),
+                _ => format!("  {id}  (not a data record)"),
+            },
+            None => format!("  {id}  (missing)"),
+        })
+        .collect();
+    section(out, "Data", lines);
 }
 fn hypothesis(out: &mut Vec<String>, s: &Snapshot, h: &str, current: &[String]) {
     let owned = |d: &Data| d.owner() == Some(h);
@@ -351,6 +383,9 @@ fn evidence(s: &Snapshot, h: &str) -> Vec<String> {
             }
             if !attachments.is_empty() {
                 provenance.push(format!("{} attachment(s)", attachments.len()));
+            }
+            if !ev.record.data_refs.is_empty() {
+                provenance.push(format!("data {}", ev.record.data_refs.join(", ")));
             }
             group.push(format!("      {}", provenance.join(" · ")));
             bearing_lines(&mut group, "      ", s, h, ev, b);

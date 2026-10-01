@@ -1306,13 +1306,15 @@ fn json_writes_print_what_they_wrote_and_the_new_revisions() {
         ],
     ));
     assert_eq!(w[0].kind, "assessment");
-    // Attach prints the evidence ID, not the file.
+    // Attach prints the evidence ID, then the data record holding the file
+    // (HYPO-0090), not the file.
     let file = p.join("capture.txt");
     std::fs::write(&file, "timeout").unwrap();
-    assert_eq!(
-        ok(p, &["evidence", "attach", &e[..10], file.to_str().unwrap()]),
-        format!("{e}\n")
-    );
+    let out = ok(p, &["evidence", "attach", &e[..10], file.to_str().unwrap()]);
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 2, "{out}");
+    assert_eq!(lines[0], e);
+    assert!(lines[1].starts_with("D-"), "{out}");
     let (w, revision) = written(&ok(
         p,
         &["--json", "evidence", "attach", &e, file.to_str().unwrap()],
@@ -1321,6 +1323,7 @@ fn json_writes_print_what_they_wrote_and_the_new_revisions() {
         (w[0].id.as_str(), w[0].kind.as_str()),
         (e.as_str(), "evidence")
     );
+    assert_eq!((w[1].id.as_str(), w[1].kind.as_str()), (lines[1], "data"));
     // apply: the ID the server assigned, and revisions the next apply can
     // state without a read in between.
     let create =
@@ -3884,17 +3887,17 @@ fn a_notebook_of_a_newer_schema_is_refused_with_the_version_to_upgrade_to() {
             let error: serde_json::Value = serde_json::from_str(&stderr).unwrap();
             assert_eq!(error["kind"], "unsupported_schema", "{stderr}");
             let message = error["error"].as_str().unwrap();
-            for part in ["uses schema 3", "reads schemas 1 to 2", upgrade] {
+            for part in ["uses schema 4", "reads schemas 1 to 3", upgrade] {
                 assert!(message.contains(part), "{part:?} in {message}");
             }
         }
     };
     refused(
-        "schema_version = 3\nname = \"demo\"\nmin_hyp_version = \"0.3.0\"\nnew_setting = true\n",
-        "upgrade hyp to >= 0.3.0",
+        "schema_version = 4\nname = \"demo\"\nmin_hyp_version = \"0.4.0\"\nnew_setting = true\n",
+        "upgrade hyp to >= 0.4.0",
     );
     refused(
-        "schema_version = 3\nname = \"demo\"\n",
+        "schema_version = 4\nname = \"demo\"\n",
         &format!("newer than {}", env!("CARGO_PKG_VERSION")),
     );
     std::fs::write(
