@@ -21,7 +21,7 @@ Omit `--demo` for an empty notebook. `init` creates a `hyp/` data directory and 
 
 ```bash
 nix build                      # result/bin/hyp
-nix flake check                # package tests, formatting, clippy and the jsdom UI test
+nix flake check                # package tests, formatting, clippy, the jsdom and browser UI tests
 nix run . -- --help
 ```
 
@@ -331,7 +331,9 @@ The Rust tests cover semantic workflows, stale writes, concurrent writers, inval
 
 `scripts/dom-test.cjs` drives the real UI forms, HTTP server and SSE in `jsdom`, without a rendering engine; it does not verify visual layout. It runs in `just e2e` and as the `e2e-dom` flake check. Its npm dependencies are pinned in `scripts/package-lock.json` and built by the flake; do not `npm install` them into the tree.
 
-An optional browser suite is in `scripts/browser-test.cjs`. It is not yet wired into the flake (HYPO-0017): install Playwright/Chromium separately and run `node scripts/browser-test.cjs`. Set `HYP_BIN` to test a packaged executable and `CHROMIUM_PATH` to use a system Chromium.
+`scripts/browser-test.cjs` runs the UI in headless Chromium with Playwright: `just browser-test`, and the `e2e-browser` flake check. The flake provides the browser (`PLAYWRIGHT_BROWSERS_PATH`); the npm `playwright` in `scripts/package.json` must match the nixpkgs `playwright-driver` version, so pin both together after a nixpkgs update. Set `HYP_BIN` to test a packaged executable.
+
+`tests/properties/` holds property tests (proptest, stable Rust) of the record format, validation, commits, crash recovery and the review fingerprint. `just test` and the flake check run a few cases each with a fixed seed, so they are reproducible; `just fuzz [SECONDS] [CASES]` runs many cases with fresh seeds. A failing case is saved under `tests/proptest-regressions/` and replayed first; commit it with the fix.
 
 ## Scope of this release
 

@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 0369f12b6682758d43d7e3df7afba76da98ddcc6f446bc7dca9b320e51e585ad # shrinks to r = Record { id: "H-00000000-0000-0000-0000-000000000001", title: "", body: "", tags: [], data_refs: [], archived: false, created_at: "", updated_at: "", data: Hypothesis { scope: "", assumptions: "", lifecycle: Draft, untestable_reason: "\n---\n" } }
+cc 2c1a04035426288bf8b3554b94eb6d853851dbe7359cf011ec9bed2f57b4e4da # shrinks to r = Record { id: "H-00000000-0000-0000-0000-000000000001", title: "", body: "", tags: [], data_refs: [], archived: false, created_at: "", updated_at: "", data: Hypothesis { scope: "", assumptions: "", lifecycle: Draft, untestable_reason: "\n---\n\u{2028}" } }

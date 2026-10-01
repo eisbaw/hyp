@@ -925,11 +925,18 @@ fn read_config_of(dir: &Path, schemas: &[(u32, &str)]) -> Result<Config> {
 pub fn encode(r: &Record) -> Result<String> {
     let mut header = r.clone();
     header.body.clear();
-    Ok(format!(
-        "---\n{}---\n{}",
-        serde_yaml::to_string(&header)?,
-        r.body
-    ))
+    let yaml = serde_yaml::to_string(&header)?;
+    // serde_yaml ends a block scalar that ends in U+2028 or U+2029 (YAML
+    // line breaks) without a line feed; the closing `---` would then not
+    // start a line, and `decode` could not read the file back. Refuse it
+    // rather than write a file that blocks every later write.
+    ensure!(
+        yaml.ends_with('\n'),
+        "{}: a multi-line text field ends with a Unicode line or paragraph separator \
+         (U+2028 or U+2029), which hyp cannot store yet; remove it and retry",
+        r.id
+    );
+    Ok(format!("---\n{yaml}---\n{}", r.body))
 }
 /// An error in the YAML front matter of a record file, its line numbers
 /// counted in the file (line 1 is the opening `---`).
@@ -963,9 +970,12 @@ pub fn decode(s: &str) -> Result<Record> {
     let s = s
         .strip_prefix("---\n")
         .context("file must start with YAML front matter (---)")?;
-    let (header, body) = s
-        .split_once("\n---\n")
+    // The header keeps its last line break: without it, a block scalar
+    // ending the front matter would lose its final newline.
+    let at = s
+        .find("\n---\n")
         .context("missing front matter closing delimiter")?;
+    let (header, body) = (&s[..=at], &s[at + "\n---\n".len()..]);
     let mut r: Record =
         serde_yaml::from_str(header).map_err(|e| FrontMatter(shift_lines(&e.to_string(), 1)))?;
     r.body = body.to_string();
