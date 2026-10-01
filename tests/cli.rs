@@ -3681,14 +3681,25 @@ fn a_rejected_write_names_the_record_and_code_of_each_new_error() {
     // Nothing was stored, so no repair of a stored record applies, nor to a
     // new record that would break its own rules.
     assert_eq!(error["diagnostics"][0]["repair"], serde_json::Value::Null);
+    // A new record's path names no file: `change` (its index in the batch)
+    // and `ref` say which entry it is.
     let out = apply(
         p,
         true,
         &[],
-        r#"[{"op": "create", "record": {"kind": "evidence", "title": "Seen", "source": " "}}]"#,
+        r#"[{"op": "create", "record": {"kind": "hypothesis", "title": "Fine"}},
+            {"op": "create", "record": {"id": "@seen", "kind": "evidence", "title": "Seen", "source": " "}}]"#,
     );
     let error = json_error(&out);
     assert_eq!(error["diagnostics"][0]["code"], "invalid", "{error}");
+    assert_eq!(
+        (
+            &error["diagnostics"][0]["change"],
+            &error["diagnostics"][0]["ref"]
+        ),
+        (&1.into(), &"@seen".into()),
+        "{error}"
+    );
     assert_eq!(
         error["diagnostics"][0]["repair"],
         serde_json::Value::Null,
@@ -3727,8 +3738,8 @@ fn a_rejected_write_names_the_record_and_code_of_each_new_error() {
     ok(p, &["check"]);
 }
 
-/// HYPO-0067: an invalid record (a hand edit emptied a title, a WebUI of an
-/// older hyp stored an unreadable observed_at) blocks every write except its
+/// HYPO-0067: an invalid record (a hand edit emptied a title, or the source
+/// of evidence) blocks every write except its
 /// repair through hyp: a write that changes only invalid records and leaves
 /// each of them valid.
 #[test]
@@ -3764,12 +3775,7 @@ fn an_invalid_record_can_be_repaired_through_hyp() {
     )
     .unwrap();
     let raw = std::fs::read_to_string(&e_file).unwrap();
-    let at = raw
-        .lines()
-        .find(|l| l.starts_with("observed_at:"))
-        .unwrap()
-        .to_string();
-    std::fs::write(&e_file, raw.replace(&at, "observed_at: yesterday")).unwrap();
+    std::fs::write(&e_file, raw.replace("source: ps", "source: ''")).unwrap();
     let d = diagnostics_of(p, &h_path);
     assert_eq!(codes(&d), ["invalid", "no_criterion"], "{d:?}");
     assert!(
@@ -3798,6 +3804,13 @@ fn an_invalid_record_can_be_repaired_through_hyp() {
     let out = apply(p, true, &[], &changes.to_string());
     assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
     assert_eq!(json_error(&out)["kind"], "blocked");
+    // Deleting it needs an archive first, which would leave it invalid: the
+    // error says to repair it, not to archive it.
+    fails(
+        p,
+        &["delete", &h],
+        &format!("archive {h} before deleting it: while invalid records block writes, repair"),
+    );
     // A write to the invalid record that changes nothing leaves it invalid.
     let out = run(p, &["--json", "set", &h]);
     assert_eq!(json_error(&out)["kind"], "blocked", "{}", stderr_of(&out));
@@ -3833,15 +3846,14 @@ fn an_invalid_record_can_be_repaired_through_hyp() {
     fails(p, &["add", "Other"], "1 error blocks writes");
     let d = diagnostics_of(p, &e_path);
     assert_eq!(codes(&d), ["invalid"], "{d:?}");
-    assert!(
-        d[0]["message"]
-            .as_str()
-            .unwrap()
-            .contains("observed_at \"yesterday\""),
-        "{d:?}"
-    );
-    ok(p, &["set", &e, "--observed-at", "2026-09-12"]);
-    assert_eq!(record_of(p, &e)["observed_at"], "2026-09-12");
+    assert_eq!(d[0]["message"], "evidence source is required", "{d:?}");
+    // A repair may change other fields of the record too.
+    let patch = serde_json::json!([{"op": "patch", "id": e,
+        "expected_revision": revision_of(p, &e),
+        "set": {"source": "ps aux", "locator": "02:00", "tags": ["cron"]}}]);
+    let out = apply(p, false, &[], &patch.to_string());
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    assert_eq!(record_of(p, &e)["locator"], "02:00");
     ok(p, &["check"]);
     ok(p, &["add", "Other"]);
 
@@ -3957,23 +3969,102 @@ fn observed_at_is_a_timestamp_or_a_date_and_not_in_the_future() {
             "title": "Obs", "source": "s", "observed_at": observed_at}}])
         .to_string()
     };
-    let out = apply(p, true, &[], &create(&ahead));
-    assert_eq!(
-        json_error(&out)["kind"],
-        "invalid_input",
-        "{}",
-        stderr_of(&out)
-    );
-    // The rule of stored values: what the WebUI or a batch writes too.
-    let out = apply(p, true, &[], &create("yesterday"));
-    let error = json_error(&out);
-    assert_eq!(error["kind"], "invalid_input", "{error}");
-    assert_eq!(error["diagnostics"][0]["code"], "invalid", "{error}");
+    // A batch or the WebUI is refused the same way, as other rejected
+    // writes are: kind invalid_input, a diagnostic naming the change.
+    for (bad, why) in [
+        (ahead.as_str(), "is in the future"),
+        ("yesterday", "neither"),
+    ] {
+        let out = apply(p, true, &[], &create(bad));
+        assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
+        let error = json_error(&out);
+        assert_eq!(error["kind"], "invalid_input", "{error}");
+        let d = &error["diagnostics"][0];
+        assert_eq!(
+            (&d["code"], &d["change"], &d["blocks_writes"]),
+            (&"bad_observed_at".into(), &0.into(), &false.into()),
+            "{error}"
+        );
+        assert!(d["message"].as_str().unwrap().contains(why), "{error}");
+    }
     ok(p, &["check"]);
     // Empty is allowed: when it was observed is not always known.
     let out = apply(p, false, &[], &create(""));
     assert!(out.status.success(), "{}", stderr_of(&out));
+    ok(p, &["set", &e, "--observed-at", ""]);
+    assert_eq!(record_of(p, &e)["observed_at"], "");
     ok(p, &["check"]);
+}
+
+/// HYPO-0043: a stored observed_at hyp cannot read (free text an older
+/// WebUI or batch stored, a datetime-local value without an offset) is a
+/// warning, not an error: nothing derived depends on it, so the notebook
+/// stays writable. The repair keeps the text in the body and clears the
+/// field.
+#[test]
+fn an_unreadable_stored_observed_at_warns_and_does_not_block() {
+    let dir = TempDir::new().unwrap();
+    let p = dir.path();
+    ok(p, &["init"]);
+    let e = ok(
+        p,
+        &[
+            "observe",
+            "Backup ran twice",
+            "--source",
+            "cron.log",
+            "--body",
+            "Two PIDs",
+        ],
+    )
+    .trim()
+    .to_string();
+    let path = format!("hyp/evidence/{e}.md");
+    let file = p.join(&path);
+    let raw = std::fs::read_to_string(&file).unwrap();
+    let at = raw
+        .lines()
+        .find(|l| l.starts_with("observed_at:"))
+        .unwrap()
+        .to_string();
+    std::fs::write(&file, raw.replace(&at, "observed_at: last tuesday night")).unwrap();
+
+    // Writable: other records, and other fields of this one.
+    ok(p, &["observe", "Backup log rotated", "--source", "ls"]);
+    ok(p, &["set", &e, "--tags", "cron"]);
+    // hyp check warns; only --strict fails on it.
+    let d = diagnostics_of(p, &path);
+    assert_eq!(codes(&d), ["bad_observed_at"], "{d:?}");
+    assert_eq!(
+        (&d[0]["severity"], &d[0]["blocks_writes"]),
+        (&"warning".into(), &false.into())
+    );
+    ok(p, &["check"]);
+    let out = run(p, &["--json", "check", "--strict"]);
+    assert_eq!(json_error(&out)["kind"], "check_failed");
+    // A new unreadable value is refused.
+    assert_eq!(
+        run(p, &["set", &e, "--observed-at", "last wednesday"])
+            .status
+            .code(),
+        Some(2)
+    );
+    let patch = serde_json::json!([{"op": "patch", "id": e,
+        "expected_revision": revision_of(p, &e), "set": {"observed_at": "last wednesday"}}]);
+    let out = apply(p, true, &[], &patch.to_string());
+    assert_eq!(
+        json_error(&out)["diagnostics"][0]["code"],
+        "bad_observed_at"
+    );
+    // The repair command keeps the text and clears the field.
+    apply_repair(p, &path);
+    let r = record_of(p, &e);
+    assert_eq!(r["observed_at"], "");
+    assert_eq!(
+        r["body"],
+        "Two PIDs\n\nObserved at (as recorded): last tuesday night"
+    );
+    ok(p, &["check", "--strict"]);
 }
 
 /// HYPO-0025: `hyp run --reviewed` takes the revision of the experiment as
@@ -4879,7 +4970,13 @@ fn observe_prints_what_it_wrote_and_checks_when_it_was_observed() {
         ));
         assert_eq!(record_of(p, &id)["observed_at"], good);
     }
-    for bad in ["yesterday", "2026-13-01", "12/09/2026", ""] {
+    // Empty states that the time is unknown (HYPO-0043).
+    let id = first_line(ok(
+        p,
+        &["observe", "Seen", "--source", "log", "--observed-at", ""],
+    ));
+    assert_eq!(record_of(p, &id)["observed_at"], "");
+    for bad in ["yesterday", "2026-13-01", "12/09/2026"] {
         let out = run(
             p,
             &["observe", "Seen", "--source", "log", "--observed-at", bad],
@@ -4890,7 +4987,7 @@ fn observe_prints_what_it_wrote_and_checks_when_it_was_observed() {
     let (out, tty) = on_terminal(hyp_args(p, &["observe", "Seen", "--source", "log"]), None);
     assert!(out.status.success());
     assert!(tty.contains("created evidence E-"), "{tty}");
-    assert_eq!(unexplained(p).len(), 5);
+    assert_eq!(unexplained(p).len(), 6);
 }
 /// An RFC 3339 timestamp, as `hyp observe` stamps one by default.
 fn chrono_like(s: &str) -> bool {

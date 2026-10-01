@@ -174,7 +174,7 @@ pub enum Command {
         #[arg(long, default_value = "", hide_default_value = true)]
         body: String,
         /// When it was observed: an RFC 3339 timestamp or a date
-        /// (YYYY-MM-DD). Default: now.
+        /// (YYYY-MM-DD), or '' for unknown. Default: now.
         #[arg(long, value_name = "WHEN", value_parser = parse_observed_at)]
         observed_at: Option<String>,
         #[arg(long, value_delimiter = ',', value_name = "DATA", help = DATA)]
@@ -372,7 +372,7 @@ pub enum Command {
         #[arg(long, value_delimiter = ',', value_name = "EVIDENCE")]
         by: Vec<String>,
         /// When evidence was observed: an RFC 3339 timestamp or a date
-        /// (YYYY-MM-DD).
+        /// (YYYY-MM-DD), or '' for unknown.
         #[arg(long, value_name = "WHEN", value_parser = parse_observed_at)]
         observed_at: Option<String>,
         /// Data records the record draws on: D- IDs or unique prefixes,
@@ -697,7 +697,7 @@ pub enum EvidenceCommand {
         #[arg(long, default_value = "", hide_default_value = true)]
         body: String,
         /// When it was observed: an RFC 3339 timestamp or a date
-        /// (YYYY-MM-DD). Default: now.
+        /// (YYYY-MM-DD), or '' for unknown. Default: now.
         #[arg(long, value_name = "WHEN", value_parser = parse_observed_at)]
         observed_at: Option<String>,
         #[arg(long, value_delimiter = ',', value_name = "DATA", help = DATA)]
@@ -750,22 +750,28 @@ pub enum ExperimentCommand {
         /// The review token of the hypothesis as you reviewed it: the 12 hex
         /// digits after "review" on the first line of `hyp show H-…`. It
         /// covers the claim, criteria and predictions this freezes as
-        /// targets; if it changed since, nothing is written and the command
-        /// exits 3. Without it, the targets are frozen as this command reads
-        /// them.
+        /// targets, but also the rest of the basis (linked evidence, links,
+        /// runs) and the current assessments: if any of it changed since,
+        /// nothing is written and the command exits 3; re-read and retry.
+        /// Without it, the targets are frozen as this command reads them.
         #[arg(long, value_name = "TOKEN")]
         reviewed: Option<String>,
     },
 }
 /// A `--observed-at` value: an RFC 3339 timestamp or a date (YYYY-MM-DD),
-/// kept as given (`is_observed_at`, which `hyp check` applies to stored
-/// values). A clap value parser, so anything else is an argument error
-/// (exit 2). A value in the future is refused when written (exit 1).
+/// kept as given (`is_observed_at`), or empty for unknown. A clap value
+/// parser, so anything else is an argument error (exit 2). The write
+/// applies the same rule for every writer, and refuses a value in the
+/// future (`observed_at_refusal`, exit 1).
 fn parse_observed_at(value: &str) -> Result<String, String> {
-    if is_observed_at(value) {
+    if value.is_empty() || is_observed_at(value) {
         Ok(value.to_string())
     } else {
-        Err("expected an RFC 3339 timestamp (2026-09-12T14:03:00Z) or a date (2026-09-12)".into())
+        Err(
+            "expected an RFC 3339 timestamp (2026-09-12T14:03:00Z), a date (2026-09-12), \
+             or '' for unknown"
+                .into(),
+        )
     }
 }
 /// A `--reviewed` value: 12 to 64 hex digits, lowercased, or an error

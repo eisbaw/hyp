@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@implementer-B'
 created_date: '2026-09-30 12:59'
-updated_date: '2026-10-01 08:06'
+updated_date: '2026-10-01 09:31'
 labels:
   - agents
   - validation
@@ -45,4 +45,6 @@ From the agent-UX batch 2 reviews: a gap citing missing evidence is a dangling_r
 (4) Notes items: a gap with a dangling resolved_by gets commands (hyp set G --by <remaining>, or --resolved false); a failing hyp check is kind check_failed; wrong-kind messages now say '<id> is not a criterion' and 'superseded <id> is not an assessment'. Not done: WebUI plain-text 4xx/403 without kind; late-sync attachments; sync conflict copies; Repair.note as plain String.
 
 Review follow-up (mped-architect): repair scope is now decided from the changes right after planning (Store::repair_scope), so a blocked write is reported as blocked before preconditions or other checks; a no-op or still-invalid repair is blocked naming what is wrong; deleting an archived invalid record counts as a repair; migration-converted records are not limited. Diagnostics of a rejected write carry repair null (nothing stored). The blocked hint about repair appears only when a blocking record is changeable.
+
+Review round 2: rejected/blocked write diagnostics about a record a change names carry change (its index) and ref (batch-local reference); delete while blocked says to repair instead of archive; assert_writable runs on one path (commit_planned before planning; repair_scope assumes only invalid records block).
 <!-- SECTION:NOTES:END -->

@@ -444,11 +444,15 @@ values!(Code {
     Cycle => "cycle",
     Inconsistent => "inconsistent",
     NoCriterion => "no_criterion",
+    BadObservedAt => "bad_observed_at",
 });
 impl Code {
+    /// `no_criterion` and `bad_observed_at` (evidence whose stored
+    /// observed_at hyp cannot read as a time) are warnings: nothing derived
+    /// depends on them, so they never block a write.
     pub fn severity(self) -> &'static str {
         match self {
-            Self::NoCriterion => "warning",
+            Self::NoCriterion | Self::BadObservedAt => "warning",
             _ => "error",
         }
     }
@@ -487,7 +491,11 @@ pub struct Repair {
 /// may change. `path` is relative to the project root, always under `hyp/`:
 /// the record's file (`hyp/<directory>/<id>.md`), or for stored bytes no
 /// record file stands for (a legacy attachment, a stray symlink) the file
-/// under `hyp/assets/`.
+/// under `hyp/assets/`. In the error of a rejected write, a diagnostic
+/// about a record one of the write's changes names also has `change`, that
+/// change's index (from 0, in the order given), and `ref`, its batch-local
+/// reference if it gave one: a new record's path names a file that does not
+/// exist.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Diagnostic {
     pub path: String,
@@ -496,6 +504,10 @@ pub struct Diagnostic {
     pub code: Code,
     pub blocks_writes: bool,
     pub repair: Option<Repair>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change: Option<usize>,
+    #[serde(rename = "ref", default, skip_serializing_if = "Option::is_none")]
+    pub reference: Option<String>,
 }
 impl Diagnostic {
     pub fn new(path: impl Into<String>, code: Code, message: impl Into<String>) -> Self {
@@ -506,6 +518,8 @@ impl Diagnostic {
             code,
             blocks_writes: code.blocks_writes(),
             repair: None,
+            change: None,
+            reference: None,
         }
     }
     /// The diagnostic of `v`, a rule the record at `path` breaks.
@@ -655,6 +669,74 @@ pub fn observed_in_future(observed_at: &str, now: chrono::DateTime<Utc>) -> bool
         Err(_) => chrono::NaiveDate::parse_from_str(observed_at, "%Y-%m-%d")
             .is_ok_and(|d| d > latest.date_naive()),
     }
+}
+/// Why a write may not store `observed_at` on evidence whose stored value
+/// is `stored` (None for new evidence), or None if it may. Only a new or
+/// changed value is judged: one already stored (free text an older hyp let
+/// through, a value that was in the future when written by hand) does not
+/// block other changes to its record; `hyp check` warns about an unreadable
+/// one (`observed_at_warning`). Empty means unknown and is always allowed.
+pub fn observed_at_refusal(
+    stored: Option<&str>,
+    observed_at: &str,
+    now: chrono::DateTime<Utc>,
+) -> Option<String> {
+    if stored == Some(observed_at) || observed_at.is_empty() {
+        return None;
+    }
+    if !is_observed_at(observed_at) {
+        return Some(format!(
+            "observed_at {observed_at:?} is neither an RFC 3339 timestamp \
+             (2026-09-12T14:03:00Z) nor a date (2026-09-12); leave it empty when unknown"
+        ));
+    }
+    observed_in_future(observed_at, now).then(|| {
+        format!(
+            "observed_at {observed_at} is in the future (more than a day from now): \
+             give when it was observed"
+        )
+    })
+}
+/// The `bad_observed_at` warning for evidence `r`, at `path`, whose stored
+/// observed_at hyp cannot read as a time, or None. Its repair keeps the text
+/// in the body and clears the field, in one command; with a known time,
+/// set that instead.
+pub fn observed_at_warning(r: &Record, path: String) -> Option<Diagnostic> {
+    let Data::Evidence { observed_at, .. } = &r.data else {
+        return None;
+    };
+    if observed_at.is_empty() || is_observed_at(observed_at) {
+        return None;
+    }
+    let kept = format!("Observed at (as recorded): {observed_at}");
+    let body = match r.body.trim().is_empty() {
+        true => kept,
+        false => format!("{}\n\n{kept}", r.body.trim_end()),
+    };
+    let mut d = Diagnostic::new(
+        path,
+        Code::BadObservedAt,
+        format!(
+            "observed_at {observed_at:?} is neither an RFC 3339 timestamp nor a date \
+             (YYYY-MM-DD); it is kept as text but cannot be read as a time"
+        ),
+    );
+    d.repair = Some(Repair {
+        note: Some(format!(
+            "The command moves the text into the body and clears observed_at (unknown). If \
+             you know when it was observed, set that instead: hyp set {id} --observed-at \
+             YYYY-MM-DD (keep the text with --body first if it says more).",
+            id = r.id
+        )),
+        commands: vec![vec![
+            "hyp".into(),
+            "set".into(),
+            r.id.clone(),
+            format!("--body={body}"),
+            "--observed-at=".into(),
+        ]],
+    });
+    Some(d)
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HypothesisState {
@@ -1279,23 +1361,14 @@ impl Snapshot {
             }
             Data::Evidence {
                 source,
-                observed_at,
                 attachments,
                 ..
             } => {
+                // An unreadable observed_at is a warning (`observed_at_warning`)
+                // and refused only when written (`observed_at_refusal`).
                 out.require(!source.trim().is_empty(), Invalid, || {
                     "evidence source is required".into()
                 });
-                out.require(
-                    observed_at.is_empty() || is_observed_at(observed_at),
-                    Invalid,
-                    || {
-                        format!(
-                            "observed_at {observed_at:?} is neither an RFC 3339 timestamp \
-                             (2026-09-12T14:03:00Z) nor a date (2026-09-12)"
-                        )
-                    },
-                );
                 for a in attachments {
                     out.require(
                         a.path.starts_with("assets/")

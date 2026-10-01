@@ -5,7 +5,7 @@ status: In Progress
 assignee:
   - '@implementer-B'
 created_date: '2026-09-30 11:27'
-updated_date: '2026-10-01 08:06'
+updated_date: '2026-10-01 09:30'
 labels:
   - validation
   - cli
@@ -40,4 +40,6 @@ HYPO-0091 added hyp observe --observed-at with a clap value parser (cli.rs parse
 A write from any writer (CLI, apply, WebUI) refuses a new or changed observed_at more than a day after now (covers HYPO-0093 AC #2); hyp check does not judge the clock.
 
 AC #3 (WebUI date input) is the WebUI lane. The server rejects datetime-local values without an offset (YYYY-MM-DDTHH:MM), so the form must send a date or an RFC 3339 timestamp.
+
+Review round 2 (P1): a stored unreadable observed_at no longer blocks writes. hyp check reports it as the warning bad_observed_at (blocks_writes false; --strict fails), with a repair command that moves the text into the body and clears the field (hyp set E --body=... --observed-at=). Writes refuse a new or changed unreadable or future value for every writer (model::observed_at_refusal), kind invalid_input with a bad_observed_at diagnostic. --observed-at '' clears it (unknown) on observe, evidence add and set.
 <!-- SECTION:NOTES:END -->

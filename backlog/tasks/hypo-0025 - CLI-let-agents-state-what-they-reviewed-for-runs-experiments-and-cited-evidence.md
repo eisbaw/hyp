@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@implementer-B'
 created_date: '2026-09-30 01:18'
-updated_date: '2026-10-01 08:06'
+updated_date: '2026-10-01 09:32'
 labels:
   - cli
   - agents
@@ -43,4 +43,6 @@ Per decision-0003 (linked-only citations), AC #2 (cited evidence reviewed outsid
 hyp run --reviewed REVISION takes the experiment revision; plain hyp show line 1 now ends with 'revision <12 hex>' for every non-hypothesis record. Cited evidence is named, not frozen, so it is not covered.
 
 AC #3 decision: both optional. The frozen content is stored in the record itself, so nothing is lost (unlike a judgment); requiring it would break every existing caller. Mismatch exits 3 (conflict, ids the record); a malformed value exits 1. README Preconditions and the skill updated.
+
+Review round 2 (P2.3): kept the hypothesis review token for experiment add --reviewed and documented precisely (README Preconditions, --help) that any basis or assessment change since the review conflicts, also one the experiment would not freeze; per-target precision stays available via expected.revisions in hyp apply.
 <!-- SECTION:NOTES:END -->
