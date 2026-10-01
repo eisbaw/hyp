@@ -1,0 +1,33 @@
+# Thin wrapper: all checks live in the flake (`nix flake check`), so CI and a
+# developer run the same thing. aarch64-linux is not built here.
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+# No id-token: nothing here logs in to FlakeHub.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  flake-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: DeterminateSystems/nix-installer-action@main
+        with:
+          diagnostic-endpoint: ""
+      # Optional speed-up only: if this cache breaks, CI gets slower, not red.
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+        with:
+          use-flakehub: disabled
+          diagnostic-endpoint: ""
+      - run: nix flake check -L
