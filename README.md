@@ -228,10 +228,10 @@ Lifecycle is **draft / investigating / paused / closed**. Assessment is **untest
 
 Run `hyp web [--port 7432]`. The server binds to IPv4 loopback only. Browse manually to the printed URL; it does not automatically launch a browser.
 
-- Hypothesis overview: search, assessment/tag filters, needs-review and archived records.
-- Hypothesis detail: falsification criteria, predictions, evidence by what it means for the hypothesis (for, against, qualifying; evidence that meets a falsification criterion counts against), each observation once with all its links, experiments, gaps and assessment history.
-- Experiment queue and immutable runs.
-- Reusable evidence and interpretations.
+- Hypothesis overview: search, assessment/tag filters, needs-review and archived records, and the unexplained observations `hyp status` lists.
+- Hypothesis detail: falsification criteria, predictions, evidence by what it means for the hypothesis (for, against, qualifying; evidence that meets a falsification criterion counts against), each observation once with all its links, experiments with their runs (outcome, cited evidence), gaps, assessment history, and relationships named from the hypothesis's side.
+- Experiment queue and immutable runs: an experiment page lists its frozen targets and marks those changed since; a run page shows its outcome, frozen plan and cited evidence. Record pages label referenced records by role; link pages show the direction.
+- Reusable evidence and interpretations: an evidence page lists the hypotheses it bears on with their stance (as `hyp show E-…`) and says when none explains it; "Explain with a new hypothesis" creates one linked to it (supports) in the same write. Editing an interpretation cannot change its ends.
 - Evidence matrix to compare alternative hypotheses, each cell by what the observation means for that hypothesis.
 - Focused relationship graph with navigable nodes.
 - Create/edit/archive/restore/delete forms, plus advanced JSON editing for mutable records.

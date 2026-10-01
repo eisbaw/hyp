@@ -1,9 +1,11 @@
 ---
 id: HYPO-0041
 title: 'WebUI: relationship card names the page''s own hypothesis on the ''to'' side'
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - '@implementer-A'
 created_date: '2026-09-30 11:26'
+updated_date: '2026-10-01 08:34'
 labels:
   - webui
   - bug
@@ -19,6 +21,13 @@ Browser test-drive 2026-09-30 (headless Brave, demo notebook). On the page of th
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Relationship cards name the other end of the link on both the from and the to page
-- [ ] #2 DOM test covers both sides
+- [x] #1 Relationship cards name the other end of the link on both the from and the to page
+- [x] #2 DOM test covers both sides
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+- web/app.js detail(): the Relationships card names the other end: 'This hypothesis <rel> <to>' on the from page, '<from> <rel> this hypothesis' on the to page.
+- DOM test relationshipEnds() covers both pages; red when the to side names its own hypothesis.
+<!-- SECTION:NOTES:END -->

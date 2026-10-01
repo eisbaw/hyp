@@ -21,6 +21,9 @@ body {
   background: var(--paper);
   color: var(--ink);
   font: 14px/1.55 var(--sans);
+  /* Titles, IDs and sources often hold paths and identifiers without
+     spaces: break them anywhere rather than widen the page (HYPO-0042). */
+  overflow-wrap: anywhere;
 }
 button,
 input,
@@ -546,6 +549,37 @@ input[type="checkbox"] {
 }
 .bearing {
   margin-top: 8px;
+}
+.context {
+  font-size: 12px;
+  margin: -8px 0 16px;
+}
+.interpretations {
+  list-style: none;
+  padding: 0;
+}
+.interpretations li {
+  margin: 4px 0;
+}
+.detail-item .badges {
+  margin-top: 8px;
+}
+.run,
+.unexplained {
+  margin: 8px 0;
+  font-size: 12px;
+}
+.direction {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 14px;
+  margin: 29px 0;
+}
+.direction .end {
+  display: grid;
+  gap: 3px;
+  flex: 1 1 200px;
 }
 .evidence-heading.negative {
   color: #aa6a52;

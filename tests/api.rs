@@ -155,6 +155,49 @@ async fn a_judgment_without_evidence_is_unprocessable() {
     let (status, body) = post(&app, change("untested")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
 }
+/// The WebUI's snapshot carries `unexplained` (HYPO-0092), the IDs of
+/// `Snapshot::unexplained`, in the answer to a read and to a write.
+#[tokio::test]
+async fn snapshot_lists_unexplained_observations() {
+    let (_dir, app, _store) = app();
+    let read = |app: axum::Router| async move {
+        let response = app
+            .oneshot(req("GET", "/api/snapshot", serde_json::Value::Null))
+            .await
+            .unwrap();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+    };
+    let none = serde_json::json!([]);
+    assert_eq!(read(app.clone()).await["unexplained"], none);
+    let e = "E-00000000-0000-4000-8000-000000000001";
+    let h = "H-00000000-0000-4000-8000-000000000002";
+    let evidence = serde_json::json!({"id":e,"kind":"evidence","title":"Blip","source":"scope"});
+    let (status, written) = post(
+        &app,
+        serde_json::json!({"changes":[{"op":"create","record":evidence}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{written}");
+    assert_eq!(written["unexplained"], serde_json::json!([e]));
+    assert_eq!(
+        read(app.clone()).await["unexplained"],
+        serde_json::json!([e])
+    );
+    let hypothesis = serde_json::json!({"id":h,"kind":"hypothesis","title":"Explains the blip"});
+    let link = serde_json::json!({"kind":"link","title":"explains","body":"It would cause it","from":e,"to":h,"relation":"supports"});
+    let (status, body) = post(
+        &app,
+        serde_json::json!({"changes":[
+            {"op":"create","record":hypothesis},
+            {"op":"create","record":link},
+        ]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["unexplained"], none);
+    assert_eq!(read(app).await["unexplained"], none);
+}
 #[tokio::test]
 async fn rejects_foreign_host_origin_and_missing_token() {
     let (_dir, app, store) = app();

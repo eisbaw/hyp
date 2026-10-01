@@ -138,6 +138,247 @@ async function save(w) {
   );
   assert.equal(w.document.querySelector("#form-error").textContent, "");
 }
+const listed = (kind) => JSON.parse(cli("--json", "list", "--kind", kind));
+/** The demo record of `kind` whose title starts with `title`. */
+function demo(kind, title) {
+  const e = listed(kind).find((e) => e.record.title.startsWith(title));
+  assert.ok(e, `demo ${kind} ${title}`);
+  return e.record;
+}
+async function open(w, id, title) {
+  w.location.hash = "record/" + id;
+  await wait(() => h1(w) === title, "page of " + title);
+}
+const main$ = (w) => w.document.querySelector("main");
+const section$ = (w, name) =>
+  w.document.querySelector(`[data-section="${name}"]`);
+const href = (id) => `a[href="#record/${id}"]`;
+/** HYPO-0041: a relationship card names the other end of the link on the
+ * page of either end, never the page's own hypothesis. */
+async function relationshipEnds(w) {
+  const cache = demo("hypothesis", "DMA timeout is caused by cache");
+  const bus = demo("hypothesis", "DMA timeout is caused by bus");
+  await open(w, bus.id, bus.title);
+  const to = w.document.querySelector('[data-direction="to"]');
+  assert.ok(to, "incoming relationship on the 'to' page");
+  assert.ok(to.querySelector(href(cache.id)), to.innerHTML);
+  assert.equal(to.querySelector(href(bus.id)), null, "names itself");
+  assert.equal(to.textContent, `${cache.title} competes-with this hypothesis`);
+  await open(w, cache.id, cache.title);
+  const from = w.document.querySelector('[data-direction="from"]');
+  assert.ok(from.querySelector(href(bus.id)), from.innerHTML);
+  assert.equal(from.textContent, `This hypothesis competes-with ${bus.title}`);
+}
+/** HYPO-0037 and HYPO-0045: runs on the hypothesis page; frozen targets,
+ * status, outcome, roles and directions on the record pages. */
+async function recordPages(w) {
+  const cache = demo("hypothesis", "DMA timeout is caused by cache");
+  const bus = demo("hypothesis", "DMA timeout is caused by bus");
+  const x = demo("experiment", "Run 10,000 transfers");
+  const run = demo("run", "Cache-disabled run");
+  const ev = demo("evidence", "Timeout reproduced");
+  const p = demo("prediction", "Clean + invalidate");
+  await open(w, cache.id, cache.title);
+  const runLine = w.document.querySelector(`[data-run="${run.id}"]`);
+  assert.ok(runLine, "the experiment's run on the hypothesis page");
+  assert.ok(runLine.textContent.includes("observed"), runLine.textContent);
+  assert.ok(runLine.querySelector(href(ev.id)), "the run's cited evidence");
+  // Every frozen target; a target edited since is marked.
+  cli("set", p.id, "--title", "Clean + invalidate removes every failure");
+  await open(w, x.id, x.title);
+  await wait(
+    () =>
+      section$(w, "targets")?.querySelector(`[data-target="${p.id}"]`)
+        ?.dataset.changed === "true",
+    "changed target marked",
+  );
+  const targets = [...section$(w, "targets").querySelectorAll("[data-target]")];
+  assert.deepEqual(
+    targets.map((t) => [t.dataset.target, t.dataset.changed]),
+    x.targets.map((t) => [t.id, String(t.id === p.id)]),
+  );
+  const changed = section$(w, "targets").querySelector(
+    `[data-target="${p.id}"]`,
+  ).textContent;
+  for (const part of ["changed since frozen", "Frozen as: Clean + invalidate eliminates failures"])
+    assert.ok(changed.includes(part), part + " in " + changed);
+  const badges = () => w.document.querySelector(".page-title .badges").textContent;
+  assert.ok(badges().includes("completed"), "experiment status: " + badges());
+  const page = () => main$(w).textContent;
+  assert.ok(page().includes("Hypothesis under test"), page());
+  assert.ok(!page().includes("Referenced records"));
+  // The structured record leaves out the frozen copies shown above.
+  const raw = w.document.querySelector("details.section pre.raw").textContent;
+  assert.ok(!raw.includes("untestable_reason"), raw);
+  await open(w, run.id, run.title);
+  assert.ok(badges().includes("observed"), "run outcome: " + badges());
+  for (const part of ["Frozen plan", "Plan: the experiment it ran", "Cited evidence", "Runs are history"])
+    assert.ok(page().includes(part), part + " in " + page());
+  // A link page shows its direction.
+  const competes = listed("link").find(
+    (e) => e.record.relation === "competes_with",
+  ).record;
+  await open(w, competes.id, competes.title);
+  const dir = w.document.querySelector(".direction");
+  assert.ok(dir, "direction panel");
+  assert.ok(dir.textContent.includes("FROM") && dir.textContent.includes("competes-with"));
+  const ends = [...dir.querySelectorAll(".end a")].map((a) => a.getAttribute("href"));
+  assert.deepEqual(ends, [`#record/${cache.id}`, `#record/${bus.id}`]);
+  // Evidence cards show their interpretations; experiment cards their hypothesis.
+  w.location.hash = "evidence";
+  await wait(() => h1(w) === "Evidence", "evidence view");
+  const evCard = [...w.document.querySelectorAll(".card")].find((c) =>
+    c.textContent.includes(ev.title),
+  );
+  const lines = [...evCard.querySelectorAll(".interpretations li")].map(
+    (li) => li.textContent,
+  );
+  assert.deepEqual(lines.sort(), [
+    `against ${cache.title} contradicts H`,
+    `qualifies ${bus.title} qualifies H`,
+  ]);
+  w.location.hash = "experiments";
+  await wait(() => h1(w) === "Experiments", "experiments view");
+  assert.ok(main$(w).textContent.includes("Tests " + cache.title));
+  // Editing an interpretation keeps its ends, in the form and in JSON.
+  const interpretation = listed("link").find(
+    (e) => e.record.from === ev.id && e.record.to === cache.id,
+  );
+  await open(w, ev.id, ev.title);
+  click(w, `[data-section="bears-on"] [data-action="edit"][data-id="${interpretation.record.id}"]`);
+  assert.equal(w.document.querySelector("#editor-title").textContent, "Edit interpretation");
+  assert.equal(w.document.querySelector('[name="from"]'), null);
+  assert.equal(w.document.querySelector('[name="to"]'), null);
+  field(w, "body", "Edited without touching its ends");
+  await save(w);
+  await wait(() => h1(w) === interpretation.record.title, "link page after edit");
+  const edited = JSON.parse(cli("--json", "show", interpretation.record.id)).entry.record;
+  assert.deepEqual(
+    [edited.from, edited.to, edited.body],
+    [ev.id, cache.id, "Edited without touching its ends"],
+  );
+  click(w, `[data-action="edit"][data-id="${interpretation.record.id}"]`);
+  field(w, "advanced", JSON.stringify({ ...edited, to: bus.id }, null, 2));
+  click(w, 'button[type="submit"]');
+  await wait(() => formError(w).includes("ends of a link cannot change"), "ends kept");
+  click(w, "#cancel-editor");
+  assert.equal(JSON.parse(cli("--json", "show", edited.id)).entry.record.to, cache.id);
+}
+/** HYPO-0092: unexplained observations on the overview, what an observation
+ * bears on, and a hypothesis created to explain one, linked in one write. */
+async function observations(w) {
+  const ev = demo("evidence", "Timeout reproduced");
+  const cache = demo("hypothesis", "DMA timeout is caused by cache");
+  const statusSet = () =>
+    JSON.parse(cli("--json", "status")).unexplained_observations.map((o) => o.id);
+  const overviewSet = () =>
+    [...w.document.querySelectorAll("#unexplained .detail-item h3 a")].map((a) =>
+      a.getAttribute("href").replace("#record/", ""),
+    );
+  const blip = cli("observe", "Unexplained bus blip", "--source", "scope capture 7");
+  w.location.hash = "overview";
+  await wait(
+    () => h1(w) === "Hypotheses" && overviewSet().includes(blip),
+    "unexplained observation on the overview",
+  );
+  assert.deepEqual(overviewSet(), statusSet());
+  // What the demo observation bears on, and how.
+  await open(w, ev.id, ev.title);
+  const bears = section$(w, "bears-on");
+  assert.ok(bears.querySelector(href(cache.id)), bears.innerHTML);
+  assert.ok(bears.textContent.includes("against") && bears.textContent.includes("qualifies"));
+  assert.ok(!bears.textContent.includes("No live hypothesis accounts"));
+  await open(w, blip, "Unexplained bus blip");
+  assert.ok(
+    section$(w, "bears-on").textContent.includes("No live hypothesis accounts for this observation"),
+  );
+  click(w, `[data-section="bears-on"] [data-action="create:hypothesis"][data-id="${blip}"]`);
+  assert.ok(w.document.querySelector(`[data-explains="${blip}"]`));
+  field(w, "title", "USB bursts starve the DMA");
+  field(w, "reason", "A blip on the scope matches a USB burst");
+  await save(w);
+  await wait(() => h1(w) === "USB bursts starve the DMA", "explaining hypothesis");
+  const h = demo("hypothesis", "USB bursts starve the DMA");
+  const links = listed("link").filter((e) => e.record.from === blip);
+  assert.deepEqual(
+    links.map((e) => [e.record.to, e.record.relation, e.record.body]),
+    [[h.id, "supports", "A blip on the scope matches a USB burst"]],
+  );
+  await open(w, blip, "Unexplained bus blip");
+  const now = section$(w, "bears-on");
+  assert.ok(now.querySelector(href(h.id)) && now.textContent.includes("for"));
+  assert.ok(!now.textContent.includes("No live hypothesis accounts"));
+  w.location.hash = "overview";
+  await wait(() => h1(w) === "Hypotheses", "overview again");
+  assert.ok(!overviewSet().includes(blip));
+  // An observation deleted while its hypothesis is being written: the save
+  // fails rather than create the hypothesis without its link.
+  const gone = cli("observe", "Deleted before the save", "--source", "scope");
+  await open(w, gone, "Deleted before the save");
+  click(w, `[data-section="bears-on"] [data-action="create:hypothesis"]`);
+  // Deleted while the form is still untouched, so the page takes the new
+  // snapshot (the page behind the form says so) before the author types.
+  cli("archive", gone);
+  cli("delete", gone);
+  await wait(
+    () => main$(w).textContent.includes("Record not found"),
+    "page refreshed behind the form",
+  );
+  field(w, "title", "Explains an observation that is gone");
+  click(w, 'button[type="submit"]');
+  await wait(() => formError(w).includes(gone), "save rejected: " + formError(w));
+  assert.ok(!listed("hypothesis").some((e) => e.record.title.startsWith("Explains an observation")));
+  click(w, "#cancel-editor");
+  await wait(() => !w.document.querySelector("#editor").open, "closed");
+  assert.deepEqual(overviewSet(), statusSet());
+}
+/** HYPO-0042: a title made of one long path wraps instead of widening the
+ * page. jsdom has no layout, so this checks the rule that wraps it applies
+ * to the title on the overview card and the record page. */
+async function longTitles(w) {
+  const title =
+    "/nix/store/0r1whf0bmjajadz5xils4bpzz84nckv3-firmware-0.8/lib/dma/controllers/stm32h7/channel_timeout_regression.c";
+  const id = cli("add", title);
+  await open(w, id, title);
+  const wraps = (el) => w.getComputedStyle(el).overflowWrap;
+  assert.equal(wraps(w.document.querySelector("h1")), "anywhere");
+  w.location.hash = "overview";
+  await wait(
+    () => h1(w) === "Hypotheses" && main$(w).textContent.includes(title),
+    "long title card",
+  );
+  const cardTitle = [...w.document.querySelectorAll(".card h3 a")].find(
+    (a) => a.textContent === title,
+  );
+  assert.equal(wraps(cardTitle), "anywhere");
+  assert.equal(wraps(w.document.querySelector(".card .id")), "anywhere");
+}
+/** Answers the page's snapshot reads with `answer` (given the real read)
+ * while a CLI write makes it read, until it shows `shown`; then reads work
+ * again but no server event says so, and the page must recover itself. */
+async function missedByServer(w, answer, shown) {
+  const real = w.fetch;
+  w.fetch = async (u, o) =>
+    String(u).includes("/api/snapshot") ? answer(() => real(u, o)) : real(u, o);
+  try {
+    cli("add", "Write that makes the page read: " + shown);
+    await wait(
+      () => w.document.querySelector("#notice").textContent.includes(shown),
+      shown + " shown",
+    );
+    // Every event of that write, up to the server's next 2 s poll, is
+    // answered so too; after it nothing announces that reads work again.
+    await new Promise((r) => setTimeout(r, 2500));
+  } finally {
+    w.fetch = real;
+  }
+  await wait(
+    () =>
+      w.document.querySelector("#notice").hidden &&
+      w.document.querySelector("#connection").textContent === "Live",
+    "recovery without a server event after " + shown,
+  );
+}
 async function main() {
   cli("init", "--demo");
   server = spawn(bin, ["--project", root, "web", "--port", "0"]);
@@ -164,6 +405,12 @@ async function main() {
       "DMA timeout is caused by cache coherency",
     ),
   );
+  await relationshipEnds(w);
+  await recordPages(w);
+  await observations(w);
+  await longTitles(w);
+  w.location.hash = "overview";
+  await wait(() => h1(w) === "Hypotheses", "back to the overview");
   click(w, "#new");
   field(w, "title", "GUI hypothesis");
   field(w, "scope", "DOM + actual HTTP server");
@@ -408,6 +655,16 @@ async function main() {
   field(w, "evidence", demoEvidence.record.id);
   await save(w);
   await wait(() => h1(w) === "Cites shared evidence", "shared evidence");
+  // The assessment it replaces is listed under its role (HYPO-0045).
+  const replaced = listed("assessment").find(
+    (e) => e.record.title === "Reviewed the output",
+  );
+  assert.ok(
+    [...w.document.querySelectorAll("section.section")]
+      .find((s) => s.querySelector("h2")?.textContent.startsWith("Supersedes"))
+      ?.querySelector(href(replaced.record.id)),
+    "superseded assessment listed",
+  );
   assert.equal(
     JSON.parse(cli("--json", "show", h.record.id)).state.needs_review,
     false,
@@ -599,6 +856,32 @@ async function main() {
     () => w.document.querySelector("#notice").hidden,
     "repair clears the notice",
   );
+  // A state only the page's read saw (the project unreadable or invalid
+  // briefly, valid again before the server's next poll) gets no event
+  // afterwards: the page retries on its own.
+  await missedByServer(
+    w,
+    async () =>
+      new Response(JSON.stringify({ error: "briefly unreadable" }), {
+        status: 422,
+      }),
+    "briefly unreadable",
+  );
+  await missedByServer(
+    w,
+    async (read) => {
+      const s = await (await read()).json();
+      s.diagnostics.push({
+        path: "hyp/hypotheses/briefly-invalid.md",
+        code: "malformed",
+        severity: "error",
+        blocks_writes: true,
+        message: "briefly invalid",
+      });
+      return new Response(JSON.stringify(s), { status: 200 });
+    },
+    "briefly invalid",
+  );
   const hypDir = path.join(root, "hyp");
   fs.renameSync(hypDir, hypDir + ".moved");
   await wait(
@@ -631,7 +914,7 @@ async function main() {
   );
   assert.deepEqual(errors, []);
   console.log(
-    "PASS: DOM forms, real HTTP writes, CLI↔UI SSE updates, editor changes, two tabs, dirty-form preservation, conflicts by status, saves despite unrelated writes, stale assessment rejected, evidence required and linked-only, criteria, evidence interpretations, criterion-meeting evidence counted against, falsification assessment, experiment and run, all views, captured data with escaped text previews, malformed-file recovery, saves and CLI repair despite a dangling link, unavailable-project cause and offline export.",
+    "PASS: relationships named from both ends, runs on the hypothesis page, frozen targets marked when changed, record status/outcome/roles/direction, evidence card interpretations, interpretation ends fixed, unexplained observations and bears-on, hypothesis created from an observation in one write, long titles wrap, DOM forms, real HTTP writes, CLI↔UI SSE updates, editor changes, two tabs, dirty-form preservation, conflicts by status, saves despite unrelated writes, stale assessment rejected, evidence required and linked-only, criteria, evidence interpretations, criterion-meeting evidence counted against, falsification assessment, experiment and run, all views, captured data with escaped text previews, malformed-file recovery, saves and CLI repair despite a dangling link, unavailable-project cause, recovery from reads the server never saw fail and offline export.",
   );
 }
 main()

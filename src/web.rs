@@ -15,7 +15,7 @@ use axum::{
     routing::{get, post},
 };
 use notify::Watcher;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{convert::Infallible, sync::Arc, time::Duration};
 use tokio::sync::watch;
 use tokio_stream::{StreamExt, wrappers::WatchStream};
@@ -98,12 +98,37 @@ async fn js() -> impl IntoResponse {
 async fn session(State(s): State<Arc<AppState>>) -> Json<serde_json::Value> {
     Json(serde_json::json!({"token":s.token}))
 }
-async fn snapshot(State(s): State<Arc<AppState>>) -> std::result::Result<Json<Snapshot>, ApiError> {
+/// The snapshot as the WebUI reads it: every field of `Snapshot`, plus what
+/// the UI shows that only the server derives. Built for each answer, never
+/// stored; `hyp export --format json` prints the plain `Snapshot`.
+#[derive(Serialize)]
+struct WebSnapshot<'a> {
+    #[serde(flatten)]
+    snapshot: &'a Snapshot,
+    /// The IDs of `Snapshot::unexplained`, the observations `hyp status`
+    /// lists as unexplained, in project order. `Snapshot` must not get a
+    /// field of this name: flattened, the JSON would hold the key twice.
+    unexplained: Vec<&'a str>,
+}
+impl<'a> WebSnapshot<'a> {
+    fn of(snapshot: &'a Snapshot) -> Self {
+        let unexplained = snapshot
+            .unexplained()
+            .into_iter()
+            .map(|e| e.record.id.as_str())
+            .collect();
+        Self {
+            snapshot,
+            unexplained,
+        }
+    }
+}
+async fn snapshot(State(s): State<Arc<AppState>>) -> std::result::Result<Response, ApiError> {
     let store = s.store.clone();
     let snap = tokio::task::spawn_blocking(move || store.snapshot())
         .await
         .map_err(anyhow::Error::from)??;
-    Ok(Json(snap))
+    Ok(Json(WebSnapshot::of(&snap)).into_response())
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -119,7 +144,7 @@ async fn mutate(
     State(s): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(tx): Json<Transaction>,
-) -> std::result::Result<Json<Snapshot>, ApiError> {
+) -> std::result::Result<Response, ApiError> {
     if headers.get("x-hyp-token").and_then(|v| v.to_str().ok()) != Some(s.token.as_str()) {
         return Err(ApiError {
             status: StatusCode::FORBIDDEN,
@@ -136,7 +161,7 @@ async fn mutate(
     .await
     .map_err(anyhow::Error::from)??;
     s.events.send_replace(snap.revision.clone());
-    Ok(Json(snap))
+    Ok(Json(WebSnapshot::of(&snap)).into_response())
 }
 async fn events(
     State(s): State<Arc<AppState>>,
@@ -248,7 +273,7 @@ fn changes_files(event: &notify::Event) -> bool {
     }
 }
 pub fn export_html(s: &Snapshot) -> Result<String> {
-    let json = serde_json::to_string(s)?
+    let json = serde_json::to_string(&WebSnapshot::of(s))?
         .replace('<', "\\u003c")
         .replace('>', "\\u003e")
         .replace('&', "\\u0026");
