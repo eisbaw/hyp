@@ -1,15 +1,18 @@
 //! The error kinds of the machine contract (decision-0002, HYPO-0078).
 //! `hyp --json` prints a failed command's error as `{"error", "kind"}`, plus
 //! `ids` for a conflict whose failing records are known or a `not_found`
-//! naming the IDs that matched nothing, and the WebUI API
-//! answers with the same body. The kind comes from the error's type anywhere
-//! in its chain, decided where the error arises, never from message text.
+//! naming the IDs that matched nothing, and `diagnostics` for a write
+//! rejected or blocked for what `hyp check` reports (HYPO-0067); the WebUI
+//! API answers with the same body. The kind comes from the error's type
+//! anywhere in its chain, decided where the error arises, never from message
+//! text.
+use crate::model::Diagnostic;
 use serde::Serialize;
 
 /// What an agent does next: re-read and retry (`Conflict`), fix the input
 /// (`InvalidInput`, `NotFound`, `AmbiguousId`), repair files first
-/// (`Blocked`), upgrade hyp (`UnsupportedSchema`), or look at the file
-/// system (`Io`).
+/// (`Blocked`), repair what `hyp check` found (`CheckFailed`), upgrade hyp
+/// (`UnsupportedSchema`), or look at the file system (`Io`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorKind {
@@ -22,8 +25,12 @@ pub enum ErrorKind {
     NotFound,
     /// An ID prefix matches more than one record.
     AmbiguousId,
-    /// A diagnostic blocks every write (`Code::blocks_writes`).
+    /// A diagnostic blocks every write (`Code::blocks_writes`); an invalid
+    /// record blocks every write but its repair.
     Blocked,
+    /// `hyp check` found errors (with `--strict`, also warnings), which it
+    /// lists on stdout. Nothing about the command was wrong.
+    CheckFailed,
     /// The notebook uses a schema newer than this hyp reads (decision-0004):
     /// nothing is read or written until hyp is upgraded.
     UnsupportedSchema,
@@ -32,13 +39,15 @@ pub enum ErrorKind {
 }
 
 /// An error whose kind its source decided, with the IDs it is about when
-/// known (`not_found`: the given IDs that matched nothing). `Conflict` has
-/// its own type.
+/// known (`not_found`: the given IDs that matched nothing), and the
+/// diagnostics, as `hyp --json check` prints them, that rejected or blocked
+/// a write. `Conflict` has its own type.
 #[derive(Debug)]
 pub struct Classified {
     pub kind: ErrorKind,
     pub message: String,
     pub ids: Vec<String>,
+    pub diagnostics: Vec<Diagnostic>,
 }
 impl Classified {
     pub fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
@@ -46,6 +55,18 @@ impl Classified {
             kind,
             message: message.into(),
             ids: vec![],
+            diagnostics: vec![],
+        }
+    }
+    /// An error of `kind` about `diagnostics`.
+    pub fn about(
+        kind: ErrorKind,
+        message: impl Into<String>,
+        diagnostics: Vec<Diagnostic>,
+    ) -> Self {
+        Self {
+            diagnostics,
+            ..Self::new(kind, message)
         }
     }
     /// A `NotFound` for `id`, which matched no record.
@@ -125,16 +146,21 @@ pub fn kind_of(err: &anyhow::Error) -> ErrorKind {
 
 /// `{"error": message, "kind": kind}`, with `"ids"` when the error that
 /// decided the kind names records (a conflict's failed statements, a
-/// `not_found`'s unmatched IDs): what `hyp --json` prints on stderr and the
-/// API answers.
+/// `not_found`'s unmatched IDs), and `"diagnostics"` when it carries them
+/// (the errors a rejected write would add, or those blocking writes): what
+/// `hyp --json` prints on stderr and the API answers.
 pub fn to_json(err: &anyhow::Error) -> serde_json::Value {
     let mut body = serde_json::json!({"error": format!("{err:#}"), "kind": kind_of(err)});
-    let ids = match Conflict::find(err) {
-        Some(conflict) => &conflict.ids,
-        None => Classified::find(err).map_or(&[][..], |c| &c.ids),
+    let (ids, diagnostics) = match (Conflict::find(err), Classified::find(err)) {
+        (Some(conflict), _) => (&conflict.ids[..], &[][..]),
+        (None, Some(c)) => (&c.ids[..], &c.diagnostics[..]),
+        (None, None) => (&[][..], &[][..]),
     };
     if !ids.is_empty() {
         body["ids"] = serde_json::json!(ids);
+    }
+    if !diagnostics.is_empty() {
+        body["diagnostics"] = serde_json::json!(diagnostics);
     }
     body
 }

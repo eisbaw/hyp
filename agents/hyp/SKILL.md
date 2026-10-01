@@ -62,7 +62,7 @@ D data). Pass the full ID or an unambiguous prefix: the first 10 characters
 ```bash
 hyp status                     # start here: where each hypothesis stands
 hyp list [--needs-review]      # hypotheses; --kind KIND or --all for others
-hyp show H-...                 # summary for reading; line 1 has the review token
+hyp show H-...                 # summary; line 1 ends with the review token (H) or revision
 hyp --json show H-...          # .entry .state .basis .related .evidence .runs
 hyp add "Title" --scope "where it applies" --tags a,b --body "Details"
 hyp falsify-if H-... "Observation that would falsify it"
@@ -70,11 +70,11 @@ hyp predict H-... "Expected observation" --conditions "..."
 hyp set H-... --lifecycle investigating                    # needs a criterion
 hyp evidence add H-|P-|F-... "Short observation" --source PATH_OR_CMD \
   --locator "lines 10-20" [--against | --qualifies] --reason "Why it matters" \
-  --body "Numbers, raw output, the exact command"          # prints E-, then L-
+  --body "Raw output, the command" --observed-at 2026-09-12  # E-, then L-
 hyp capture ./run.log --origin "scp rig:/var/log/run.log"  # raw data, prints D-
 hyp link E-...|H-... H-... --relation supports|competes-with --reason "..."
-hyp experiment add H-... "Short procedure" --targets F-...,P-... --body "..."
-hyp run X-... "Run 1" --outcome observed --evidence E-...
+hyp experiment add H-... "Procedure" --targets F-...,P-... --reviewed TOKEN
+hyp run X-... "Run 1" --outcome observed --evidence E-... --reviewed REVISION
 hyp gap H-... "Open question"
 hyp set G-... --resolved true --by E-...,E-...             # what answered it
 hyp check                      # validate every file; see Files
@@ -87,10 +87,9 @@ criterion, `hyp evidence add F-...` (supports) records that the refuting
 observation was made, against the hypothesis; `--against`, that it was not.
 `hyp show H-...` groups observations by what they mean for it.
 
-**Titles are one line and short**: the claim, or the observation in a few
-words ("200/200 passes with per-test temp dirs"); details, numbers and command
-lines go in `--body`. A text argument `-` reads stdin, once per command; for a
-title, its first line is the title and the rest goes to the body.
+**Titles are one line and short**: the claim or observation in a few words
+("200/200 passes with per-test temp dirs"); details, numbers, commands go in
+`--body`. `-` reads stdin; for a title, line 1 is the title, the rest the body.
 
 **Keep raw data** (whole logs, outputs, files): `hyp capture FILE --origin
 "where from"` or `cmd | hyp capture - --origin "cmd"` stores an immutable `D-`
@@ -132,7 +131,8 @@ hyp assess H-... --reviewed 46d8d8f5c79b --status weakened --confidence 0.3 \
 - `--reviewed` takes the review token of the state you reviewed: the 12
   hex digits after `review` on line 1 of `hyp show H-...` (or 12 or more of
   `.state.review_token` with `--json`). Take it from the output you actually
-  reviewed, never from a second read.
+  reviewed, never from a second read. So does `hyp experiment add`; `hyp run
+  --reviewed` takes line 1 of `hyp show X-...` read after setting it running.
 - Cite only evidence linked to the hypothesis or its criteria or predictions.
   For other evidence, `hyp link E-... H-...` first, then review again.
 - Every judgment except `untested` needs `--evidence`; `falsified` also
@@ -155,8 +155,8 @@ gets `--untestable-reason "..."` instead of a criterion.
 - `0` success, also for a write that changed nothing.
 - `1` the input or project is wrong. Fix the cause; retrying unchanged will
   not help. `kind`: `invalid_input`, `not_found` (`ids` those that match
-  nothing), `ambiguous_id` (use a longer prefix), `blocked` (repair files
-  first, see Files), `unsupported_schema` (ask the user to upgrade hyp) or `io`.
+  nothing), `ambiguous_id` (longer prefix), `blocked` (repair files first, see
+  Files), `check_failed`, `unsupported_schema` (ask the user to upgrade) or `io`.
 - `2` invalid arguments (`hyp list` filters included); see `--help`.
 - `3` conflict (`kind` `conflict`, `ids` the records that changed, when
   known): something the write depended on changed since you read it, so
@@ -172,12 +172,12 @@ Errors go to stderr (`--json`: `{"error", "kind"}`); decide by `kind`, not text.
 
 Never edit files under `hyp/` directly; use `hyp set ID` (`--title`, `--body`,
 `--tags`, ...); leave `hyp edit` to people. After an editor, merge or sync
-touched `hyp/`, run `hyp check`. A diagnostic has a `code` and may carry a
-repair (`.repair.note`; `.repair.commands`, argv arrays to run in the project
-directory). Read the note first: prefer restoring a missing record (a sync may
-bring it) over deleting what refers to it. `malformed`, `attachment` and
-`invalid` block every write: fix them by hand. `changed_bytes` (found only by
-`hyp check`) blocks writes and assessments that rely on those bytes.
+touched `hyp/`, run `hyp check`. A diagnostic's `path` and `code` identify it;
+its repair: `.repair.note`, then `.repair.commands` (argv, in the project dir).
+Prefer restoring a missing record (a sync may bring it) over deleting what
+refers to it. `malformed`, `attachment` block every write: fix them by hand;
+`invalid` all but `hyp set ID ...` making it valid. `changed_bytes` blocks
+writes relying on its bytes. A write adding a problem is refused (`.diagnostics`).
 
 ## Example
 

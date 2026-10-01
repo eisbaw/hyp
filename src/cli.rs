@@ -272,6 +272,14 @@ pub enum Command {
         /// What was done and seen ('-' reads stdin).
         #[arg(long, default_value = "", hide_default_value = true)]
         body: String,
+        /// The revision of the experiment as you reviewed it: the 12 hex
+        /// digits after "revision" on the first line of `hyp show X-…`
+        /// (.entry.revision with --json, whole or its first 12 or more hex
+        /// digits). If the experiment changed since, nothing is written and
+        /// the command exits 3. Without it, the plan is frozen as this
+        /// command reads it.
+        #[arg(long, value_name = "REVISION")]
+        reviewed: Option<String>,
         #[arg(long, value_delimiter = ',', value_name = "DATA", help = DATA)]
         data: Vec<String>,
     },
@@ -363,6 +371,10 @@ pub enum Command {
         /// be resolved (with --resolved true, or already).
         #[arg(long, value_delimiter = ',', value_name = "EVIDENCE")]
         by: Vec<String>,
+        /// When evidence was observed: an RFC 3339 timestamp or a date
+        /// (YYYY-MM-DD).
+        #[arg(long, value_name = "WHEN", value_parser = parse_observed_at)]
+        observed_at: Option<String>,
         /// Data records the record draws on: D- IDs or unique prefixes,
         /// comma-separated or repeated, replacing earlier ones. Not for
         /// assessments, runs or data records, which cannot change.
@@ -684,6 +696,10 @@ pub enum EvidenceCommand {
         /// The observation in detail ('-' reads stdin).
         #[arg(long, default_value = "", hide_default_value = true)]
         body: String,
+        /// When it was observed: an RFC 3339 timestamp or a date
+        /// (YYYY-MM-DD). Default: now.
+        #[arg(long, value_name = "WHEN", value_parser = parse_observed_at)]
+        observed_at: Option<String>,
         #[arg(long, value_delimiter = ',', value_name = "DATA", help = DATA)]
         data: Vec<String>,
     },
@@ -731,19 +747,76 @@ pub enum ExperimentCommand {
         /// The procedure ('-' reads stdin).
         #[arg(long, default_value = "", hide_default_value = true)]
         body: String,
+        /// The review token of the hypothesis as you reviewed it: the 12 hex
+        /// digits after "review" on the first line of `hyp show H-…`. It
+        /// covers the claim, criteria and predictions this freezes as
+        /// targets; if it changed since, nothing is written and the command
+        /// exits 3. Without it, the targets are frozen as this command reads
+        /// them.
+        #[arg(long, value_name = "TOKEN")]
+        reviewed: Option<String>,
     },
 }
 /// A `--observed-at` value: an RFC 3339 timestamp or a date (YYYY-MM-DD),
-/// kept as given. A clap value parser, so anything else is an argument
-/// error (exit 2).
+/// kept as given (`is_observed_at`, which `hyp check` applies to stored
+/// values). A clap value parser, so anything else is an argument error
+/// (exit 2). A value in the future is refused when written (exit 1).
 fn parse_observed_at(value: &str) -> Result<String, String> {
-    let valid = chrono::DateTime::parse_from_rfc3339(value).is_ok()
-        || chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok();
-    if valid {
+    if is_observed_at(value) {
         Ok(value.to_string())
     } else {
         Err("expected an RFC 3339 timestamp (2026-09-12T14:03:00Z) or a date (2026-09-12)".into())
     }
+}
+/// A `--reviewed` value: 12 to 64 hex digits, lowercased, or an error
+/// saying it must be `what`. A prefix of 12 hex digits (48 bits) is ample to
+/// detect a change.
+fn reviewed_hex(value: &str, what: String) -> Result<String> {
+    let value = value.to_ascii_lowercase();
+    ensure!(
+        (12..=64).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_hexdigit()),
+        "--reviewed must be {what}"
+    );
+    Ok(value)
+}
+/// The `--reviewed` review token of hypothesis `h` (`reviewed_hex`).
+fn review_token(h: &str, value: &str) -> Result<String> {
+    reviewed_hex(
+        value,
+        format!(
+            "the review token that `hyp show {h}` prints after \"review\" on its first line, \
+             or the first 12 or more hex digits of .state.review_token of `hyp --json show {h}`"
+        ),
+    )
+}
+/// Fails with a `Conflict` unless hypothesis `h`'s review token in `s`
+/// starts with `reviewed`: the agent's review covers the time up to this
+/// command's read, and the preconditions the command states cover the time
+/// from it to the write. `again` says what to do after re-reading.
+fn unchanged_since_review(s: &Snapshot, h: &str, reviewed: &str, again: &str) -> Result<()> {
+    let state = s
+        .hypotheses
+        .get(h)
+        .with_context(|| format!("no derived state for hypothesis {h}"))?;
+    if state
+        .review_token
+        .to_ascii_lowercase()
+        .starts_with(reviewed)
+    {
+        return Ok(());
+    }
+    Err(Conflict::on(
+        vec![h.to_string()],
+        format!(
+            "hypothesis {h} changed since you reviewed it (its basis or its current \
+             assessments; the review token differs), so nothing was written. \
+             `hyp show {h}` lists its basis now (criteria, predictions, linked \
+             evidence, runs, links to other hypotheses) and its current \
+             assessments: compare them with what you reviewed, then {again} \
+             with the review token it prints"
+        ),
+    )
+    .into())
 }
 /// A `--confidence` value: any number here, so that one out of range gets
 /// `confidence_in_range`'s hint.
@@ -1346,6 +1419,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 qualifies,
                 reason,
                 body,
+                observed_at,
                 data,
             } => {
                 let target = find_kind(&s, "<HYPOTHESIS>", &h, &CLAIM)?;
@@ -1355,7 +1429,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     Data::Evidence {
                         source,
                         locator,
-                        observed_at: chrono::Utc::now().to_rfc3339(),
+                        observed_at: observed_at.unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
                         attachments: vec![],
                     },
                 )?;
@@ -1393,9 +1467,17 @@ pub async fn run(cli: Cli) -> Result<()> {
                     title,
                     targets,
                     body,
+                    reviewed,
                 },
         } => {
             let hypothesis = hypothesis(&s, &h)?;
+            // The targets are the hypothesis and its own criteria and
+            // predictions (`validate` rejects others), whose content its
+            // review token covers.
+            if let Some(reviewed) = reviewed {
+                let reviewed = review_token(&hypothesis, &reviewed)?;
+                unchanged_since_review(&s, &hypothesis, &reviewed, "plan the experiment again")?;
+            }
             let targets = find_all(&s, "--targets", &targets, &CLAIM)?
                 .iter()
                 .map(|id| s.find(id).map(Entry::frozen))
@@ -1417,6 +1499,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             outcome,
             evidence,
             body,
+            reviewed,
             data,
         } => {
             let e = s.find(&find_kind(
@@ -1425,6 +1508,29 @@ pub async fn run(cli: Cli) -> Result<()> {
                 &experiment,
                 &[Kind::Experiment],
             )?)?;
+            if let Some(reviewed) = reviewed {
+                let x = &e.record.id;
+                let reviewed = reviewed_hex(
+                    &reviewed,
+                    format!(
+                        "the revision that `hyp show {x}` prints after \"revision\" on its \
+                         first line, or the first 12 or more hex digits of .entry.revision of \
+                         `hyp --json show {x}`"
+                    ),
+                )?;
+                if !e.revision.starts_with(&reviewed) {
+                    return Err(Conflict::on(
+                        vec![x.clone()],
+                        format!(
+                            "experiment {x} changed since you reviewed it (its revision \
+                             differs), so nothing was written. `hyp show {x}` shows it now: \
+                             compare its plan with what you ran, then record the run again \
+                             with the revision it prints"
+                        ),
+                    )
+                    .into());
+                }
+            }
             let r = titled(
                 title,
                 body,
@@ -1465,40 +1571,9 @@ pub async fn run(cli: Cli) -> Result<()> {
             data,
         } => {
             let h = hypothesis(&s, &h)?;
-            // A prefix of 12 hex digits (48 bits) is ample to detect a change.
-            let reviewed = reviewed.to_ascii_lowercase();
-            ensure!(
-                (12..=64).contains(&reviewed.len())
-                    && reviewed.bytes().all(|b| b.is_ascii_hexdigit()),
-                "--reviewed must be the review token that `hyp show {h}` prints after \
-                 \"review\" on its first line, or the first 12 or more hex digits of \
-                 .state.review_token of `hyp --json show {h}`"
-            );
+            let reviewed = review_token(&h, &reviewed)?;
             confidence_in_range(confidence)?;
-            let state = s
-                .hypotheses
-                .get(&h)
-                .with_context(|| format!("no derived state for hypothesis {h}"))?;
-            // The token covers the agent's review up to this command's read;
-            // the preconditions stated below cover this read up to the write.
-            if !state
-                .review_token
-                .to_ascii_lowercase()
-                .starts_with(&reviewed)
-            {
-                return Err(Conflict::on(
-                    vec![h.clone()],
-                    format!(
-                        "hypothesis {h} changed since you reviewed it (its basis or its current \
-                     assessments; the review token differs), so nothing was written. \
-                     `hyp show {h}` lists its basis now (criteria, predictions, linked \
-                     evidence, runs, links to other hypotheses) and its current \
-                     assessments: compare them with what you reviewed, then assess again \
-                     with the review token it prints"
-                    ),
-                )
-                .into());
-            }
+            unchanged_since_review(&s, &h, &reviewed, "assess again")?;
             let mut r = Record::new(
                 format!("Assessment: {status}"),
                 Data::Assessment {
@@ -1527,6 +1602,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             tags,
             resolved,
             by,
+            observed_at,
             data,
         } => {
             let e = s.find(&id)?;
@@ -1597,6 +1673,12 @@ pub async fn run(cli: Cli) -> Result<()> {
                     e.record.id
                 );
                 *resolved_by = find_all(&s, "--by", &by, &[Kind::Evidence])?;
+            }
+            if let Some(when) = observed_at {
+                let Data::Evidence { observed_at, .. } = &mut r.data else {
+                    anyhow::bail!("--observed-at only applies to evidence");
+                };
+                *observed_at = when;
             }
             if !data.is_empty() {
                 r.data_refs = data_refs(&s, &data)?;
@@ -1796,13 +1878,31 @@ pub async fn run(cli: Cli) -> Result<()> {
                     n => println!("Checked {n} objects"),
                 }
             }
-            ensure!(
-                !s.diagnostics
+            let count = |severity: &str| {
+                s.diagnostics
                     .iter()
-                    .any(|d| strict || d.severity == "error"),
-                "validation failed"
-            );
-            return Ok(());
+                    .filter(|d| d.severity == severity)
+                    .count()
+            };
+            let (errors, warnings) = (count("error"), count("warning"));
+            let plural = |n: usize, what: &str| match n {
+                1 => format!("1 {what}"),
+                n => format!("{n} {what}s"),
+            };
+            let found = match (errors, strict && warnings > 0) {
+                (0, false) => return Ok(()),
+                (0, true) => plural(warnings, "warning"),
+                (_, false) => plural(errors, "error"),
+                (_, true) => format!(
+                    "{} and {}",
+                    plural(errors, "error"),
+                    plural(warnings, "warning")
+                ),
+            };
+            anyhow::bail!(crate::error::Classified::new(
+                crate::error::ErrorKind::CheckFailed,
+                format!("hyp check found {found} (listed on stdout)"),
+            ));
         }
         Command::Graph { focus } => {
             let focus = focus

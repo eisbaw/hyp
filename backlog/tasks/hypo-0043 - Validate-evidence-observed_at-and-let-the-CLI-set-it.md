@@ -1,10 +1,11 @@
 ---
 id: HYPO-0043
 title: Validate evidence observed_at (and let the CLI set it)
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - '@implementer-B'
 created_date: '2026-09-30 11:27'
-updated_date: '2026-09-30 21:25'
+updated_date: '2026-10-01 08:06'
 labels:
   - validation
   - cli
@@ -22,8 +23,8 @@ Browser test-drive 2026-09-30. The WebUI evidence form saves any text as observe
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 validate() requires observed_at to be empty or an RFC 3339 timestamp or a date (YYYY-MM-DD); hyp check reports invalid values
-- [ ] #2 hyp evidence add accepts --observed-at
+- [x] #1 validate() requires observed_at to be empty or an RFC 3339 timestamp or a date (YYYY-MM-DD); hyp check reports invalid values
+- [x] #2 hyp evidence add accepts --observed-at
 - [ ] #3 The WebUI uses a date/datetime input
 <!-- AC:END -->
 
@@ -33,4 +34,10 @@ Browser test-drive 2026-09-30. The WebUI evidence form saves any text as observe
 Interactive terminal test-drive 2026-09-30 (xterm+tmux, first-time user, release build of fda0faa). Confirmed as a paper cut in the exact scenario tested: evidence about 'the night of 2026-09-12' is stamped with the recording time.
 
 HYPO-0091 added hyp observe --observed-at with a clap value parser (cli.rs parse_observed_at: RFC 3339 or YYYY-MM-DD, stored as given, exit 2 otherwise). Reuse it for hyp evidence add --observed-at (AC #2); stored records are still not validated (AC #1).
+
+2026-10-01 implementation (implementer B): model::is_observed_at (RFC 3339, or exactly YYYY-MM-DD) is shared by the CLI value parser and validate(); hyp check reports any other non-empty stored value as invalid (blocks writes; repairable with hyp set E --observed-at, see HYPO-0067). hyp evidence add --observed-at and hyp set E --observed-at added.
+
+A write from any writer (CLI, apply, WebUI) refuses a new or changed observed_at more than a day after now (covers HYPO-0093 AC #2); hyp check does not judge the clock.
+
+AC #3 (WebUI date input) is the WebUI lane. The server rejects datetime-local values without an offset (YYYY-MM-DDTHH:MM), so the form must send a date or an RFC 3339 timestamp.
 <!-- SECTION:NOTES:END -->

@@ -129,11 +129,16 @@ fn lock_file(path: &Path, options: &OpenOptions) -> Result<File> {
     }
     Ok(file)
 }
+/// The path the diagnostics of legacy attachment `a` name: its file, as
+/// every diagnostic path, relative to the project root.
+fn attachment_shown(a: &Attachment) -> String {
+    format!("hyp/{}", a.path)
+}
 /// The diagnostic for legacy attachment `a` whose bytes are not intact
 /// (`code`: `Attachment` or `ChangedBytes`), `why` saying how.
 fn attachment_diagnostic(a: &Attachment, code: Code, why: &str) -> Diagnostic {
     let mut d = Diagnostic::new(
-        &a.path,
+        attachment_shown(a),
         code,
         format!("attachment missing, unsafe, or hash mismatch: {why}"),
     );
@@ -211,6 +216,18 @@ fn until_restored(code: Code) -> &'static str {
              stored bytes)."
         }
         _ => "",
+    }
+}
+/// Errors for an error message: how many, then each as `path (code):
+/// message`, its identity first.
+fn listed(errors: &[Diagnostic]) -> String {
+    let each: Vec<String> = errors
+        .iter()
+        .map(|d| format!("{} ({}): {}", d.path, d.code, d.message))
+        .collect();
+    match errors.len() {
+        1 => format!("1 error: {}", each[0]),
+        n => format!("{n} errors: {}", each.join("; ")),
     }
 }
 /// Whether `err` comes from lacking write access: a read-only file system
@@ -1242,6 +1259,63 @@ impl Store {
     fn path_of(r: &Record) -> String {
         format!("hyp/{}", Self::relative(r))
     }
+    /// The records `changes` repair, by full ID; empty when nothing blocks
+    /// writes. Fails as blocked (`Snapshot::assert_writable`) unless only
+    /// invalid records block (`Code::Invalid`, `Snapshot::blocking` of
+    /// `before`) and every change updates, patches, archives or deletes one
+    /// of them. Decided from the changes alone, before any of them is
+    /// checked, so a blocked write is told so first; `assert_repaired` then
+    /// requires each repaired record to be valid (or deleted). Records a
+    /// migration of legacy attachments converts on the way are not changes,
+    /// and not limited.
+    fn repair_scope(before: &Snapshot, changes: &[Change]) -> Result<Vec<String>> {
+        let blocking = before.blocking();
+        if blocking.is_empty() {
+            return Ok(vec![]);
+        }
+        if blocking.iter().any(|d| d.code != Code::Invalid) {
+            before.assert_writable()?;
+        }
+        let invalid: BTreeSet<&str> = blocking.iter().map(|d| d.path.as_str()).collect();
+        let repaired = |id: &str| {
+            before
+                .find(id)
+                .ok()
+                .filter(|e| invalid.contains(Self::path_of(&e.record).as_str()))
+                .map(|e| e.record.id.clone())
+        };
+        let ids: Option<Vec<String>> = changes
+            .iter()
+            .map(|change| match change {
+                Change::Create { .. } => None,
+                Change::Update { record, .. } => repaired(&record.id),
+                Change::Patch { id, .. }
+                | Change::Archive { id, .. }
+                | Change::Delete { id, .. } => repaired(id),
+            })
+            .collect();
+        match ids {
+            Some(ids) if !ids.is_empty() => Ok(ids),
+            _ => before.assert_writable().map(|()| vec![]),
+        }
+    }
+    /// Fails, as blocked, while `still` lists rules that records a repair
+    /// changed still break.
+    fn assert_repaired(still: Vec<Diagnostic>) -> Result<()> {
+        if still.is_empty() {
+            return Ok(());
+        }
+        bail!(Classified::about(
+            ErrorKind::Blocked,
+            format!(
+                "nothing was written: while invalid records block writes, only a write that \
+                 leaves each record it changes valid (or deletes it) is accepted, and this one \
+                 leaves {}",
+                listed(&still)
+            ),
+            still,
+        ));
+    }
     /// The file a journal entry writes: a record file, or `config.toml` when
     /// the write raises the schema.
     fn target(&self, relative: &str) -> Result<PathBuf> {
@@ -1466,8 +1540,7 @@ impl Store {
         let mut previews = BTreeMap::new();
         for entry in &snap.objects {
             for v in snap.validate(&entry.record) {
-                let mut d = Diagnostic::new(Self::path_of(&entry.record), v.code, v.message);
-                d.repair = v.repair;
+                let d = Diagnostic::of(Self::path_of(&entry.record), v);
                 snap.diagnostics.push(d);
             }
             if let Data::Evidence { attachments, .. } = &entry.record.data {
@@ -1557,7 +1630,7 @@ impl Store {
                     && !snap.has_active_criterion(&entry.record.id)
                 {
                     snap.diagnostics.push(Diagnostic::new(
-                        &entry.record.id,
+                        Self::path_of(&entry.record),
                         Code::NoCriterion,
                         "no active falsification criterion",
                     ));
@@ -1586,7 +1659,7 @@ impl Store {
                 || snap
                     .diagnostics
                     .iter()
-                    .any(|d| format!("hyp/{}", d.path) == shown && d.code == Code::Attachment);
+                    .any(|d| d.path == shown && d.code == Code::Attachment);
             if crate::data::is_sha256(&name) && entry.file_type()?.is_symlink() && !reported {
                 let mut d = Diagnostic::new(
                     &shown,
@@ -1616,13 +1689,16 @@ impl Store {
     /// no-op is still listed.
     ///
     /// Diagnostics that block writes (malformed files, broken attachments,
-    /// invalid records) reject every write. Stored bytes are checked by
-    /// metadata there (`Verify::Metadata`); those a change newly cites are
-    /// hashed as well (`verify_cited`). Other errors, between loaded
-    /// records, arrive from merges, syncs and hand edits; a write is accepted
-    /// if it adds no error, identified by `Diagnostic::identity`, that the
-    /// project did not already have. So a write may repair such errors, and
-    /// an unrelated write that leaves them as they are is not blocked by them.
+    /// invalid records) reject every write, except that invalid records
+    /// alone let a write through that repairs them (`repair_scope`).
+    /// Stored bytes are checked by metadata there (`Verify::Metadata`);
+    /// those a change newly cites are hashed as well (`verify_cited`). Other
+    /// errors, between loaded records, arrive from merges, syncs and hand
+    /// edits; a write is accepted if it adds no error, identified by
+    /// `Diagnostic::identity`, that the project did not already have, and a
+    /// rejected one names each it would add. So a write may repair such
+    /// errors, and an unrelated write that leaves them as they are is not
+    /// blocked by them.
     pub fn commit_written(
         &self,
         changes: Vec<Change>,
@@ -1643,13 +1719,19 @@ impl Store {
         // Read 1 of 2. Stored bytes are checked by metadata here; those the
         // write newly relies on are hashed below (`verify_cited`).
         let (before, files) = self.read_unlocked()?;
-        before.assert_writable()?;
+        // Invalid records block every write but their repair, which is
+        // known only once the changes are; other blocking errors block
+        // before anything else.
+        if before.blocking().iter().any(|d| d.code != Code::Invalid) {
+            before.assert_writable()?;
+        }
+        let changes = plan(&before)?;
+        let repaired = Self::repair_scope(&before, &changes)?;
         if let Some(expected) = expected_project {
             if expected != before.revision {
                 bail!(Conflict::new("project changed; reload and retry"));
             }
         }
-        let changes = plan(&before)?;
         let mut after = before.clone();
         let mut writes = BTreeMap::new();
         let mut created = Vec::new();
@@ -1886,6 +1968,17 @@ impl Store {
                 }
             };
             let mut record = record;
+            // An observation cannot have been made yet. Only a new or changed
+            // value is checked: a stored one does not become wrong with time.
+            if let Data::Evidence { observed_at, .. } = &record.data {
+                let stored = after.get(&record.id).map(|e| &e.record.data);
+                let unchanged = matches!(stored, Some(Data::Evidence { observed_at: old, .. }) if old == observed_at);
+                ensure!(
+                    unchanged || !observed_in_future(observed_at, chrono::Utc::now()),
+                    "observed_at {observed_at} is in the future (more than a day from now): \
+                     give when it was observed"
+                );
+            }
             // An update or archive that changes nothing but updated_at is not
             // written, so the file and its revision stay as they are.
             if let Some(old) = after.get(&record.id) {
@@ -1950,16 +2043,34 @@ impl Store {
             .filter(|d| d.severity == "error")
             .map(Diagnostic::identity)
             .collect();
+        // Errors the write would add, and those repaired records still have.
+        let (mut added, mut still) = (Vec::new(), Vec::new());
         for e in &after.objects {
             let path = Self::path_of(&e.record);
-            if let Some(v) = after
-                .validate(&e.record)
-                .into_iter()
-                .find(|v| !known.contains(&(path.as_str(), v.code)))
-            {
-                return Err(v.into());
+            let repairing = repaired.contains(&e.record.id);
+            for v in after.validate(&e.record) {
+                if !known.contains(&(path.as_str(), v.code)) {
+                    // Nothing is stored: no repair for a stored record applies.
+                    added.push(Diagnostic {
+                        repair: None,
+                        ..Diagnostic::of(&path, v)
+                    });
+                } else if repairing && v.code == Code::Invalid {
+                    still.push(Diagnostic::of(&path, v));
+                }
             }
         }
+        if !added.is_empty() {
+            bail!(Classified::about(
+                ErrorKind::InvalidInput,
+                format!(
+                    "nothing was written: the write would add {}",
+                    listed(&added)
+                ),
+                added,
+            ));
+        }
+        Self::assert_repaired(still)?;
         self.verify_cited(&before, &after, &writes, &mut verified)?;
         // Check the files once more immediately before writing, to detect an
         // editor save or a sync meanwhile: their bytes, not parsed again.
@@ -2166,7 +2277,10 @@ impl Store {
                     }
                 }
                 Data::Evidence { attachments, .. } => {
-                    for a in attachments.iter().filter(|a| !reported.contains(&a.path)) {
+                    for a in attachments
+                        .iter()
+                        .filter(|a| !reported.contains(&attachment_shown(a)))
+                    {
                         let result = match self.attachment_path(a) {
                             Err(e) => Err((Code::Attachment, format!("{e:#}"))),
                             Ok(path) => check(&path, &a.sha256, &a.path),
