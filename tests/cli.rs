@@ -4627,8 +4627,8 @@ fn a_notebook_of_a_newer_schema_is_refused_with_the_version_to_upgrade_to() {
         }
     };
     refused(
-        "schema_version = 4\nname = \"demo\"\nmin_hyp_version = \"0.4.0\"\nnew_setting = true\n",
-        "upgrade hyp to >= 0.4.0",
+        "schema_version = 4\nname = \"demo\"\nmin_hyp_version = \"0.5.0\"\nnew_setting = true\n",
+        "upgrade hyp to >= 0.5.0",
     );
     refused(
         "schema_version = 4\nname = \"demo\"\n",

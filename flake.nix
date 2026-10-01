@@ -39,7 +39,7 @@
         in {
           default = pkgs.rustPlatform.buildRustPackage {
             pname = "hyp";
-            version = "0.3.0";
+            version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
             src = pkgs.lib.cleanSource self;
             cargoLock.lockFile = ./Cargo.lock;
             preBuild = ''

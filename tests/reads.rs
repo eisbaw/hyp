@@ -227,7 +227,7 @@ fn a_write_waits_for_a_read_in_progress_before_applying() {
 
 /// A read that finds a journal rolls it forward only under the write lock,
 /// as writers do: a journal next to a held write lock may be one a writer
-/// (one that does not take the apply lock: hyp 0.3.0) is applying, and
+/// (one that does not take the apply lock: hyp before commit 9a62a67) is applying, and
 /// replaying it would undo what that writer writes after it.
 #[test]
 fn a_read_that_finds_a_journal_waits_for_the_write_lock() {
