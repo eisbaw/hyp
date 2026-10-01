@@ -5,7 +5,7 @@ status: In Progress
 assignee:
   - '@implementer-A'
 created_date: '2026-09-30 21:25'
-updated_date: '2026-10-01 09:05'
+updated_date: '2026-10-01 10:30'
 labels:
   - webui
   - agents
@@ -36,4 +36,6 @@ HYPO-0091 added observation-first work to the CLI: hyp observe, hyp add --explai
 
 - After review: the observation a new hypothesis explains is fixed when the form opens, so the save always sends the link and fails (the server names the missing ID) if the observation was deleted meanwhile, instead of creating the hypothesis without it. DOM test covers it (red with a save-time lookup).
 - Also in this change: the page re-reads every 2 s while its last read failed or showed blocking diagnostics, and drops answers older than the latest read; this fixed the intermittent 'recovery' timeouts of the DOM test (a state only the page's read saw got no server event afterwards).
+
+- Review fixes: the derived list is now Snapshot::unexplained_observations (IDs, model.rs derive), so hyp export --format json carries it too; the WebSnapshot wrapper is gone. Recovery root cause fixed server-side: every read the server makes publishes what it saw (announce in src/web.rs), so a state only a client read saw is followed by an event when the project is valid again (tests/api.rs reads_publish_what_they_saw_so_recovery_is_announced, red without it). The client re-read is a bounded backstop (2 s apart, at most 15 in a row). Writes adopt their answer through adopt(), which also invalidates reads on their way (DOM test olderReadAfterSave, red without it).
 <!-- SECTION:NOTES:END -->

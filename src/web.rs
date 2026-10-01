@@ -15,7 +15,7 @@ use axum::{
     routing::{get, post},
 };
 use notify::Watcher;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::{convert::Infallible, sync::Arc, time::Duration};
 use tokio::sync::watch;
 use tokio_stream::{StreamExt, wrappers::WatchStream};
@@ -98,37 +98,40 @@ async fn js() -> impl IntoResponse {
 async fn session(State(s): State<Arc<AppState>>) -> Json<serde_json::Value> {
     Json(serde_json::json!({"token":s.token}))
 }
-/// The snapshot as the WebUI reads it: every field of `Snapshot`, plus what
-/// the UI shows that only the server derives. Built for each answer, never
-/// stored; `hyp export --format json` prints the plain `Snapshot`.
-#[derive(Serialize)]
-struct WebSnapshot<'a> {
-    #[serde(flatten)]
-    snapshot: &'a Snapshot,
-    /// The IDs of `Snapshot::unexplained`, the observations `hyp status`
-    /// lists as unexplained, in project order. `Snapshot` must not get a
-    /// field of this name: flattened, the JSON would hold the key twice.
-    unexplained: Vec<&'a str>,
-}
-impl<'a> WebSnapshot<'a> {
-    fn of(snapshot: &'a Snapshot) -> Self {
-        let unexplained = snapshot
-            .unexplained()
-            .into_iter()
-            .map(|e| e.record.id.as_str())
-            .collect();
-        Self {
-            snapshot,
-            unexplained,
+/// What the change events carry when the project cannot be read.
+const UNAVAILABLE: &str = "unavailable";
+/// Publishes `seen`, a revision or `UNAVAILABLE`, to the change events if it
+/// differs from the last one published. Every read the server makes calls
+/// it, not only the monitor's polls: otherwise a state only a client's read
+/// saw (the project invalid or unreadable between two polls) was never
+/// published, the poll that then saw the project as before announced
+/// nothing, and that client kept showing the failure. A read that publishes
+/// an older revision than a concurrent one is corrected by the monitor's
+/// next poll.
+fn announce(events: &watch::Sender<String>, seen: &str) {
+    events.send_if_modified(|last| {
+        let changed = last != seen;
+        if changed {
+            seen.clone_into(last);
         }
-    }
+        changed
+    });
 }
-async fn snapshot(State(s): State<Arc<AppState>>) -> std::result::Result<Response, ApiError> {
-    let store = s.store.clone();
-    let snap = tokio::task::spawn_blocking(move || store.snapshot())
+/// `Store::snapshot` off the async runtime, announcing what it saw.
+async fn read(state: &AppState) -> Result<Snapshot> {
+    let store = state.store.clone();
+    let result = tokio::task::spawn_blocking(move || store.snapshot())
         .await
-        .map_err(anyhow::Error::from)??;
-    Ok(Json(WebSnapshot::of(&snap)).into_response())
+        .map_err(anyhow::Error::from)
+        .and_then(|snapshot| snapshot);
+    match &result {
+        Ok(snap) => announce(&state.events, &snap.revision),
+        Err(_) => announce(&state.events, UNAVAILABLE),
+    }
+    result
+}
+async fn snapshot(State(s): State<Arc<AppState>>) -> std::result::Result<Json<Snapshot>, ApiError> {
+    Ok(Json(read(&s).await?))
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -144,7 +147,7 @@ async fn mutate(
     State(s): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(tx): Json<Transaction>,
-) -> std::result::Result<Response, ApiError> {
+) -> std::result::Result<Json<Snapshot>, ApiError> {
     if headers.get("x-hyp-token").and_then(|v| v.to_str().ok()) != Some(s.token.as_str()) {
         return Err(ApiError {
             status: StatusCode::FORBIDDEN,
@@ -160,8 +163,8 @@ async fn mutate(
     })
     .await
     .map_err(anyhow::Error::from)??;
-    s.events.send_replace(snap.revision.clone());
-    Ok(Json(WebSnapshot::of(&snap)).into_response())
+    announce(&s.events, &snap.revision);
+    Ok(Json(snap))
 }
 async fn events(
     State(s): State<Arc<AppState>>,
@@ -171,11 +174,7 @@ async fn events(
     Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
 }
 async fn report(State(s): State<Arc<AppState>>) -> std::result::Result<Html<String>, ApiError> {
-    let store = s.store.clone();
-    let html = tokio::task::spawn_blocking(move || export_html(&store.snapshot()?))
-        .await
-        .map_err(anyhow::Error::from)??;
-    Ok(Html(html))
+    Ok(Html(export_html(&read(&s).await?)?))
 }
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
@@ -221,18 +220,12 @@ pub async fn serve(store: Store, port: u16) -> Result<()> {
         let mut last_error: Option<String> = None;
         loop {
             tokio::select! {_ = tick.tick()=>{},event=rx.recv()=>{if event.is_none(){break;}tokio::time::sleep(Duration::from_millis(120)).await;while rx.try_recv().is_ok(){}}}
-            let store = monitor.store.clone();
-            let result = tokio::task::spawn_blocking(move || store.snapshot())
-                .await
-                .map_err(anyhow::Error::from)
-                .and_then(|snapshot| snapshot);
-            match result {
-                Ok(snap) => {
+            // `read` announces what it saw. Clients re-fetch /api/snapshot,
+            // whose error body carries the cause.
+            match read(&monitor).await {
+                Ok(_) => {
                     if let Some(cause) = last_error.take() {
                         eprintln!("hyp web: project readable again (was: {cause})");
-                    }
-                    if *monitor.events.borrow() != snap.revision {
-                        monitor.events.send_replace(snap.revision);
                     }
                 }
                 Err(err) => {
@@ -241,8 +234,6 @@ pub async fn serve(store: Store, port: u16) -> Result<()> {
                         eprintln!("hyp web: cannot read project: {cause}");
                     }
                     last_error = Some(cause);
-                    // Clients re-fetch /api/snapshot, whose error body carries the cause.
-                    monitor.events.send_replace("unavailable".into());
                 }
             }
         }
@@ -273,7 +264,7 @@ fn changes_files(event: &notify::Event) -> bool {
     }
 }
 pub fn export_html(s: &Snapshot) -> Result<String> {
-    let json = serde_json::to_string(&WebSnapshot::of(s))?
+    let json = serde_json::to_string(s)?
         .replace('<', "\\u003c")
         .replace('>', "\\u003e")
         .replace('&', "\\u0026");

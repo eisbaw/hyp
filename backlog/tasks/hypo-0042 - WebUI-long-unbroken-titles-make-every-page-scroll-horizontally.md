@@ -5,7 +5,7 @@ status: In Progress
 assignee:
   - '@implementer-A'
 created_date: '2026-09-30 11:26'
-updated_date: '2026-10-01 08:34'
+updated_date: '2026-10-01 10:30'
 labels:
   - webui
   - bug
@@ -32,4 +32,6 @@ Browser test-drive 2026-09-30. A hypothesis title with a ~95-character path (no 
 - DOM test longTitles(): a 115-character path title; asserts the computed overflow-wrap of the record h1, the overview card title and the card ID (jsdom has no layout); red without the rule.
 - Real browser (headless Brave on the exported report, a 390 px srcdoc iframe since headless clamps windows to 500 px): with the rule, scrollWidth equals clientWidth on overview, evidence, hypothesis and evidence pages, matrix, graph, all, experiments, data at 390 and 1440 px; without it 669-745 px at 390. The export hides edit buttons, so the live page's action buttons were not in that measurement.
 - Follow-up for the Playwright suite (scripts/browser-test.cjs, implementer C): assert no horizontal scroll with a long-path title at 390 and 1440.
+
+- Review fix: the body-wide overflow-wrap: anywhere was inherited by buttons and badges, so at 390 px 'Edit record'/'Archive' broke one letter per line beside a long title, and 'Edit' broke at 1440. Buttons, badges, tags and meta-line labels now use overflow-wrap: normal; .section-head wraps. Live Brave via the DevTools MCP, all views at 390 and 1440: with the old rule re-inserted via CSSOM, buttons broke on 7 views at 390 and 1 at 1440 (Edit button 39x190 px); with the fix none, and scrollWidth equals clientWidth on every view. DOM test asserts the computed overflow-wrap of a button, a badge and a meta-line label.
 <!-- SECTION:NOTES:END -->

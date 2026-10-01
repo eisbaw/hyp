@@ -25,6 +25,12 @@ body {
      spaces: break them anywhere rather than widen the page (HYPO-0042). */
   overflow-wrap: anywhere;
 }
+/* Controls and labels are short words: never break inside them. */
+button,
+.badge,
+.tag {
+  overflow-wrap: normal;
+}
 button,
 input,
 select,
@@ -458,6 +464,7 @@ input[type="checkbox"] {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
   gap: 12px;
   margin-bottom: 15px;
 }
@@ -502,6 +509,7 @@ input[type="checkbox"] {
 }
 .meta-line span {
   color: var(--muted);
+  overflow-wrap: normal;
 }
 .actions {
   display: flex;

@@ -22,10 +22,12 @@ let snapshot = null,
   pending = false,
   connected = false,
   retry = null,
+  retries = 0,
   reads = 0;
-// How long after a failed read the next one is tried; the server's own
-// reconciliation poll is every 2 s.
+// The backstop re-read (`retrySoon`): how long after a failed or blocked
+// read, and how many times in a row; the server's own poll is every 2 s.
 const RETRY_MS = 2000;
+const RETRY_LIMIT = 15;
 let filters = {
   query: "",
   status: "",
@@ -102,7 +104,7 @@ const bearsOn = (id) =>
   });
 // Observations no live hypothesis accounts for, the set `hyp status` lists
 // (`Snapshot::unexplained`, derived by the server).
-const unexplainedIds = () => snapshot?.unexplained || [];
+const unexplainedIds = () => snapshot?.unexplained_observations || [];
 const isUnexplained = (id) => unexplainedIds().includes(id);
 const runsOf = (experiment) =>
   all("run").filter((e) => e.record.experiment === experiment);
@@ -182,16 +184,25 @@ async function fetchJSON(url, options) {
   }
   return data;
 }
-/** Reads again in `RETRY_MS`, once however often it is asked. The server
- * announces only the states its own polls saw: a read of a state it missed
- * (the project unreadable or invalid only briefly, between two polls) gets
- * no event when the project is valid again, so the page asks itself until
- * a read shows a valid project. */
+/** A backstop, not the way the page learns of recovery: the server
+ * announces every state any read of it saw (`announce` in src/web.rs), so
+ * an event follows when the project is valid again. Should that event be
+ * lost (the event stream reconnecting, say), the page reads again itself,
+ * `RETRY_MS` apart and at most `RETRY_LIMIT` times in a row, then waits
+ * for the next event. Asked repeatedly, it keeps one timer. */
 function retrySoon() {
-  retry ??= setTimeout(() => {
+  if (retry || retries >= RETRY_LIMIT) return;
+  retries += 1;
+  retry = setTimeout(() => {
     retry = null;
     refresh();
   }, RETRY_MS);
+}
+/** Takes `next` as the page's state: from a read, or the answer to a
+ * write. Any read still on its way is older and is then ignored. */
+function adopt(next) {
+  reads += 1;
+  snapshot = next;
 }
 async function refresh() {
   if (readOnly) return;
@@ -204,7 +215,7 @@ async function refresh() {
     const blocking = next.diagnostics.filter((d) => d.blocks_writes);
     if (blocking.length) {
       if (!snapshot) {
-        snapshot = next;
+        adopt(next);
         render();
       }
       notice(
@@ -228,7 +239,8 @@ async function refresh() {
       return;
     }
     const changed = !snapshot || snapshot.revision !== next.revision;
-    snapshot = next;
+    adopt(next);
+    retries = 0;
     if (!pending) notice(repairNotice(next));
     if (connected) connectivity("Live", true);
     if (changed) render();
@@ -439,9 +451,9 @@ function card({ record: r }) {
   const rel = related(r.id);
   return `<article class="card"><div class="card-top"><span class="id">${esc(short(r.id))}</span>${badge(r.kind)}${st ? badge(st.judgment) : ""}${st?.needs_review ? badge("needs review", "review") : ""}${r.archived ? badge("archived") : ""}<span class="badges">${(r.tags || []).map((t) => `<span class="tag">${esc(t)}</span>`).join("")}</span></div><h3>${link(r)}</h3><p class="summary">${esc((r.scope || r.body || r.source || r.origin || r.conditions || "").slice(0, 210))}</p>${cardContext(r)}<div class="card-bottom"><span>${r.kind === "hypothesis" ? `${rel.filter((e) => e.record.kind === "link").length} evidence / relation links &nbsp; · &nbsp; ${rel.filter((e) => e.record.kind === "experiment").length} experiments` : esc(r.kind === "data" ? `${r.media_type} · ${bytes(r.size)} · used by ${dataUsers(r.id).length}` : r.source || r.status || r.outcome || r.judgment || (r.relation ? relationName(r.relation) : human(r.kind)))}</span><span>${r.lifecycle ? esc(r.lifecycle) + " &nbsp; · &nbsp; " : ""}${esc((r.updated_at || "").slice(0, 10))} <a class="arrow" aria-label="Open ${esc(r.title)}" href="#record/${esc(r.id)}">↗</a></span></div></article>`;
 }
-function item(e, extra = "") {
+function item(e, extra = "", withBody = true) {
   const r = e.record;
-  return `<div class="detail-item"><div class="item-top"><h3>${link(r)}</h3>${!immutable(r) ? button("edit", "Edit", r.id, 'class="mini-button"') : ""}</div><span class="id">${esc(short(r.id))}${r.archived ? " · archived" : ""}</span>${extra}${r.body ? `<div class="notes">${esc(r.body)}</div>` : ""}</div>`;
+  return `<div class="detail-item"><div class="item-top"><h3>${link(r)}</h3>${!immutable(r) ? button("edit", "Edit", r.id, 'class="mini-button"') : ""}</div><span class="id">${esc(short(r.id))}${r.archived ? " · archived" : ""}</span>${extra}${withBody && r.body ? `<div class="notes">${esc(r.body)}</div>` : ""}</div>`;
 }
 function section(title, entries, action = "", owner = "", render = item) {
   return `<section class="section"><div class="section-head"><h2>${esc(title)} <span class="small">${entries.length}</span></h2>${action ? button("create:" + action, "＋ Add", owner) : ""}</div>${entries.map((e) => render(e)).join("") || '<p class="small">Nothing recorded yet.</p>'}</section>`;
@@ -522,16 +534,36 @@ function targetsSection(x) {
       now && now.record.title !== t.title
         ? `<p class="small">Frozen as: ${esc(t.title)}</p>`
         : "";
-    return `<div class="detail-item target" data-target="${esc(t.id)}" data-changed="${changed}"><div class="item-top"><h3>${now ? link(now.record) : esc(t.title)}</h3><span class="badges">${now ? badge(now.record.kind) : ""}${mark}</span></div><span class="id">${esc(short(t.id))} · frozen revision ${esc(t.revision.slice(0, 12))}</span>${renamed}${changed ? `<details><summary class="small">Frozen content</summary><pre class="raw">${esc(t.body)}</pre></details>` : ""}</div>`;
+    return `<div class="detail-item target" data-target="${esc(t.id)}" data-changed="${changed}"><div class="item-top"><h3>${now ? link(now.record) : esc(t.title)}</h3><span class="badges">${now ? badge(now.record.kind) : ""}${mark}</span></div><span class="id">${esc(short(t.id))} · frozen revision ${esc(t.revision.slice(0, 12))}</span>${renamed}${changed ? `<details><summary class="small">Frozen content</summary>${frozenFields(t.body)}</details>` : ""}</div>`;
   });
   return `<section class="section" data-section="targets"><div class="section-head"><h2>Frozen targets <span class="small">${rows.length}</span></h2></div><p class="small">What this experiment tests, as it was when planned. A changed target needs a new experiment.</p>${rows.join("") || '<p class="small">No targets.</p>'}</section>`;
+}
+/** A frozen copy of a record (`Entry::frozen`: the record as JSON) as its
+ * fields; text that is not a JSON record (older notebooks) as it is. */
+function frozenFields(body) {
+  let r;
+  try {
+    r = JSON.parse(body);
+  } catch {
+    r = null;
+  }
+  if (!r || typeof r !== "object")
+    return `<pre class="raw">${esc(body)}</pre>`;
+  const skip = ["id", "kind", "archived", "created_at", "updated_at"];
+  return Object.entries(r)
+    .filter(([k, v]) => !skip.includes(k) && v !== "" && !(Array.isArray(v) && !v.length))
+    .map(
+      ([k, v]) =>
+        `<div class="meta-line"><span>${esc(human(k))}</span><strong class="notes">${esc(Array.isArray(v) ? v.join(", ") : v)}</strong></div>`,
+    )
+    .join("");
 }
 /** A run's plan: the experiment as it was when the run was recorded. */
 function planSection(run) {
   const p = run.plan || {};
   const now = find(p.id);
   const changed = !now || now.revision !== p.revision;
-  return `<section class="section" data-section="plan" data-changed="${changed}"><div class="section-head"><h2>Frozen plan</h2></div><p class="small">${changed ? "The experiment has changed since this run; this is the plan as it ran." : "The experiment is unchanged since this run."} Revision ${esc((p.revision || "").slice(0, 12))}.</p><details><summary class="small">${esc(p.title)}</summary><pre class="raw">${esc(p.body)}</pre></details></section>`;
+  return `<section class="section" data-section="plan" data-changed="${changed}"><div class="section-head"><h2>Frozen plan</h2></div><p class="small">${changed ? "The experiment has changed since this run; this is the plan as it ran." : "The experiment is unchanged since this run."} Revision ${esc((p.revision || "").slice(0, 12))}.</p><details><summary class="small">${esc(p.title)}</summary>${frozenFields(p.body)}</details></section>`;
 }
 /** A link's direction: from, relation, to. */
 function directionPanel(r) {
@@ -552,6 +584,7 @@ function bearsOnSection(id) {
             `<div class="bearing"><a class="small" href="#record/${esc(x.link)}">${esc(x.meaning)}</a><p class="small">${esc(find(x.link)?.record.body)}</p>${button("edit", "Edit interpretation", x.link, 'class="mini-button"')}</div>`,
         )
         .join("")}`,
+      false,
     ),
   );
   const none = isUnexplained(id)
@@ -615,7 +648,7 @@ function detail(id) {
       : "";
     return (
       top +
-      `<div class="panel"><div class="notes">${esc(r.body || "No additional notes.")}</div>${r.source ? `<p class="small">Source: ${esc(r.source)} · ${esc(r.locator)}</p>` : ""}${r.confidence != null ? `<p>Subjective confidence: ${Math.round(r.confidence * 100)}%</p>` : ""}${history}</div>` +
+      `<div class="panel"><div class="notes">${esc(r.body || "No additional notes.")}</div>${r.source ? `<p class="small">Source: ${esc(r.source)}${r.locator ? " · " + esc(r.locator) : ""}</p>` : ""}${r.confidence != null ? `<p>Subjective confidence: ${Math.round(r.confidence * 100)}%</p>` : ""}${history}</div>` +
       extra +
       (r.data?.length ? dataRefs : "") +
       roles(r) +
@@ -953,10 +986,14 @@ function formFields(kind, owner, r = {}) {
         "A URL, project-relative path, or description of the observation source.",
       ) +
       field("locator", "Precise locator", r.locator || "") +
+      // RFC 3339 with an offset (toISOString: UTC) or a date; empty means
+      // unknown. Only a new record defaults to now: an edit keeps "unknown".
       field(
         "observed_at",
         "Observation date",
-        r.observed_at || new Date().toISOString(),
+        r.id ? r.observed_at || "" : new Date().toISOString(),
+        "text",
+        "An RFC 3339 timestamp with offset, or YYYY-MM-DD; empty if unknown.",
       );
     if (!r.id)
       f +=
@@ -1259,7 +1296,7 @@ async function save(ev) {
           fd.get("reason") || EXPLAINS_REASON,
         ),
       });
-    snapshot = await transact(changes);
+    adopt(await transact(changes));
     dirty = false;
     pending = false;
     $("#editor").close();
@@ -1308,14 +1345,16 @@ async function action(e) {
   )
     return;
   try {
-    snapshot = await transact([
-      {
-        op: action === "delete" ? "delete" : "archive",
-        id,
-        expected_revision: entry.revision,
-        ...(action === "delete" ? {} : { archived: action === "archive" }),
-      },
-    ]);
+    adopt(
+      await transact([
+        {
+          op: action === "delete" ? "delete" : "archive",
+          id,
+          expected_revision: entry.revision,
+          ...(action === "delete" ? {} : { archived: action === "archive" }),
+        },
+      ]),
+    );
     toast(
       action === "restore"
         ? "Restored"

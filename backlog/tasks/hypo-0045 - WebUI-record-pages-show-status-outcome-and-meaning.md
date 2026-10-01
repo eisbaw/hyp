@@ -5,7 +5,7 @@ status: In Progress
 assignee:
   - '@implementer-A'
 created_date: '2026-09-30 11:27'
-updated_date: '2026-10-01 09:04'
+updated_date: '2026-10-01 10:31'
 labels:
   - webui
   - ux
@@ -36,4 +36,6 @@ Browser test-drive 2026-09-30. Experiment detail hides its status; run detail hi
 - DOM test recordPages(): each part red when reverted.
 
 - After review: assessments list what they supersede; a reference to a missing record shows its ID marked missing instead of being hidden; link pages show the relation once (in the direction panel).
+
+- Review fixes: the Source line has no separator when the locator is empty; Bears on items leave out the hypothesis body; frozen copies (targets, run plan) render as fields, raw text only when not JSON. Evidence form: observed_at defaults to now only for a new record; editing evidence whose observed_at is empty keeps it empty (DOM test, red without it).
 <!-- SECTION:NOTES:END -->

@@ -12,6 +12,8 @@ const root = fs.mkdtempSync(path.join(os.tmpdir(), "hyp-dom-"));
 const cli = (...args) =>
   execFileSync(bin, ["--project", root, ...args], { encoding: "utf8" }).trim();
 let server;
+// While true, the test's EventSource drops the server's change events.
+let muted = false;
 const windows = [],
   streams = [],
   errors = [];
@@ -66,7 +68,7 @@ function options(url) {
               while ((i = text.indexOf("\n\n")) >= 0) {
                 const event = text.slice(0, i);
                 text = text.slice(i + 2);
-                if (event.includes("event: change"))
+                if (event.includes("event: change") && !muted)
                   this.listeners.change?.({ data: event });
               }
             }
@@ -342,6 +344,13 @@ async function longTitles(w) {
   await open(w, id, title);
   const wraps = (el) => w.getComputedStyle(el).overflowWrap;
   assert.equal(wraps(w.document.querySelector("h1")), "anywhere");
+  // Buttons and badges are words: they must not break ("Edi/t") beside it.
+  for (const selector of [
+    `[data-action="edit"][data-id="${id}"]`,
+    ".page-title .badge",
+    ".meta-line span",
+  ])
+    assert.equal(wraps(w.document.querySelector(selector)), "normal", selector);
   w.location.hash = "overview";
   await wait(
     () => h1(w) === "Hypotheses" && main$(w).textContent.includes(title),
@@ -353,10 +362,35 @@ async function longTitles(w) {
   assert.equal(wraps(cardTitle), "anywhere");
   assert.equal(wraps(w.document.querySelector(".card .id")), "anywhere");
 }
-/** Answers the page's snapshot reads with `answer` (given the real read)
- * while a CLI write makes it read, until it shows `shown`; then reads work
- * again but no server event says so, and the page must recover itself. */
-async function missedByServer(w, answer, shown) {
+/** An observation whose time is unknown (`observed_at` empty) stays so when
+ * the WebUI edits something else: only a new record defaults to now. */
+async function unknownObservedAt(w) {
+  w.location.hash = "evidence";
+  await wait(() => h1(w) === "Evidence", "evidence view");
+  click(w, '[data-action="create:evidence"]');
+  assert.ok(w.document.querySelector('[name="observed_at"]').value, "new: now");
+  field(w, "title", "Seen at an unknown time");
+  field(w, "source", "memory");
+  field(w, "observed_at", "");
+  await save(w);
+  await wait(() => h1(w) === "Seen at an unknown time", "evidence saved");
+  const e = demo("evidence", "Seen at an unknown time");
+  assert.equal(e.observed_at, "");
+  click(w, `[data-action="edit"][data-id="${e.id}"]`);
+  assert.equal(w.document.querySelector('[name="observed_at"]').value, "");
+  field(w, "title", "Seen at a time nobody noted");
+  await save(w);
+  await wait(() => h1(w) === "Seen at a time nobody noted", "evidence edited");
+  assert.equal(demo("evidence", "Seen at a time nobody noted").observed_at, "");
+}
+/** The backstop re-read (`retrySoon` in app.js): the page's snapshot reads
+ * are answered with `answer` (given the real read) until it shows `shown`;
+ * then reads work again while the server's events are dropped, so only the
+ * page's own re-read can recover it. */
+async function recoversWithoutEvents(w, answer, shown) {
+  // A re-read still pending from an earlier failure could recover the page
+  // instead of the one this failure schedules.
+  await wait(() => w.eval("retry === null"), "no re-read pending");
   const real = w.fetch;
   w.fetch = async (u, o) =>
     String(u).includes("/api/snapshot") ? answer(() => real(u, o)) : real(u, o);
@@ -366,18 +400,57 @@ async function missedByServer(w, answer, shown) {
       () => w.document.querySelector("#notice").textContent.includes(shown),
       shown + " shown",
     );
-    // Every event of that write, up to the server's next 2 s poll, is
-    // answered so too; after it nothing announces that reads work again.
-    await new Promise((r) => setTimeout(r, 2500));
+    muted = true;
   } finally {
     w.fetch = real;
   }
-  await wait(
-    () =>
-      w.document.querySelector("#notice").hidden &&
-      w.document.querySelector("#connection").textContent === "Live",
-    "recovery without a server event after " + shown,
-  );
+  try {
+    await wait(
+      () =>
+        w.document.querySelector("#notice").hidden &&
+        w.document.querySelector("#connection").textContent === "Live",
+      "recovery without a server event after " + shown,
+    );
+  } finally {
+    muted = false;
+  }
+}
+/** A read answered after a save must not replace the save's newer
+ * snapshot (`adopt` in app.js). The read is held until the save is done;
+ * events are dropped meanwhile, so no later read hides the effect. */
+async function olderReadAfterSave(w) {
+  const real = w.fetch;
+  let release, held = 0;
+  const gate = new Promise((r) => (release = r));
+  w.fetch = async (u, o) => {
+    if (!String(u).includes("/api/snapshot")) return real(u, o);
+    const res = await real(u, o);
+    const body = await res.text();
+    held += 1;
+    await gate;
+    return new Response(body, { status: res.status });
+  };
+  try {
+    cli("add", "Write whose read is held back");
+    await wait(() => held > 0, "a read held back");
+    muted = true;
+    w.fetch = real;
+    click(w, "#new");
+    field(w, "title", "Saved while an older read was on its way");
+    await save(w);
+    await wait(
+      () => h1(w) === "Saved while an older read was on its way",
+      "saved record shown",
+    );
+    release();
+    // The held answer is delivered now; give the page time to take it.
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(h1(w), "Saved while an older read was on its way");
+  } finally {
+    w.fetch = real;
+    release();
+    muted = false;
+  }
 }
 async function main() {
   cli("init", "--demo");
@@ -409,6 +482,7 @@ async function main() {
   await recordPages(w);
   await observations(w);
   await longTitles(w);
+  await unknownObservedAt(w);
   w.location.hash = "overview";
   await wait(() => h1(w) === "Hypotheses", "back to the overview");
   click(w, "#new");
@@ -856,10 +930,9 @@ async function main() {
     () => w.document.querySelector("#notice").hidden,
     "repair clears the notice",
   );
-  // A state only the page's read saw (the project unreadable or invalid
-  // briefly, valid again before the server's next poll) gets no event
-  // afterwards: the page retries on its own.
-  await missedByServer(
+  // Should the event that a project is valid again be lost, the page reads
+  // again itself (the server announces it: tests/api.rs).
+  await recoversWithoutEvents(
     w,
     async () =>
       new Response(JSON.stringify({ error: "briefly unreadable" }), {
@@ -867,7 +940,7 @@ async function main() {
       }),
     "briefly unreadable",
   );
-  await missedByServer(
+  await recoversWithoutEvents(
     w,
     async (read) => {
       const s = await (await read()).json();
@@ -882,6 +955,7 @@ async function main() {
     },
     "briefly invalid",
   );
+  await olderReadAfterSave(w);
   const hypDir = path.join(root, "hyp");
   fs.renameSync(hypDir, hypDir + ".moved");
   await wait(
@@ -914,7 +988,7 @@ async function main() {
   );
   assert.deepEqual(errors, []);
   console.log(
-    "PASS: relationships named from both ends, runs on the hypothesis page, frozen targets marked when changed, record status/outcome/roles/direction, evidence card interpretations, interpretation ends fixed, unexplained observations and bears-on, hypothesis created from an observation in one write, long titles wrap, DOM forms, real HTTP writes, CLI↔UI SSE updates, editor changes, two tabs, dirty-form preservation, conflicts by status, saves despite unrelated writes, stale assessment rejected, evidence required and linked-only, criteria, evidence interpretations, criterion-meeting evidence counted against, falsification assessment, experiment and run, all views, captured data with escaped text previews, malformed-file recovery, saves and CLI repair despite a dangling link, unavailable-project cause, recovery from reads the server never saw fail and offline export.",
+    "PASS: relationships named from both ends, runs on the hypothesis page, frozen targets marked when changed, record status/outcome/roles/direction, evidence card interpretations, interpretation ends fixed, unexplained observations and bears-on, hypothesis created from an observation in one write, long titles wrap while controls do not, unknown observation time kept on edit, DOM forms, real HTTP writes, CLI↔UI SSE updates, editor changes, two tabs, dirty-form preservation, conflicts by status, saves despite unrelated writes, stale assessment rejected, evidence required and linked-only, criteria, evidence interpretations, criterion-meeting evidence counted against, falsification assessment, experiment and run, all views, captured data with escaped text previews, malformed-file recovery, saves and CLI repair despite a dangling link, unavailable-project cause, recovery when an event is lost, an older read not replacing a save, and offline export.",
   );
 }
 main()
