@@ -560,6 +560,103 @@ fn referenced_bytes_are_in_the_basis_and_broken_bytes_block_writes() {
     assert_eq!(read(&blob), "timeout at 8,142\n");
 }
 
+/// HYPO-0004: ordinary reads check stored bytes by metadata only, so bytes
+/// changed in place to others of the same length go unnoticed by them (and
+/// do not block unrelated writes). `hyp check` hashes every stored file and
+/// reports them as `changed_bytes`, which says it does not block every
+/// write; a write that newly cites them is refused, and so is an assessment
+/// whose basis holds them; `hyp data get` refuses to return them; a write
+/// that drops the citation goes through.
+#[test]
+fn bytes_changed_in_place_are_caught_by_check_and_by_writes_that_cite_them() {
+    let project = demo();
+    let p = project.path();
+    let e = first(p, "evidence");
+    let h = hypothesis_titled(p, "DMA timeout is caused by cache coherency");
+    let file = p.join("run.log");
+    std::fs::write(&file, "timeout at 8,142\n").unwrap();
+    let d = id_of(ok(
+        p,
+        &["capture", file.to_str().unwrap(), "--origin", "rig"],
+    ));
+    ok(p, &["set", &h, "--data", &d]);
+    let blob = p.join("hyp/assets").join(sha256(b"timeout at 8,142\n"));
+    std::fs::write(&blob, "timeout at 9,999\n").unwrap();
+
+    // Not seen by an ordinary read; an unrelated write goes through.
+    let status = json(&ok(p, &["--json", "status"]));
+    assert!(!status.to_string().contains("not intact"), "{status:#}");
+    ok(p, &["add", "Unrelated"]);
+
+    // hyp check hashes, and finds it.
+    let out = run(p, &["--json", "check"]);
+    assert_eq!(out.status.code(), Some(1));
+    let diagnostics = json(&String::from_utf8(out.stdout).unwrap());
+    let d0 = diagnostics
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["code"] == "changed_bytes")
+        .unwrap_or_else(|| panic!("{diagnostics:#}"));
+    assert_eq!(d0["path"], format!("hyp/data/{d}.md"));
+    assert_eq!(d0["blocks_writes"], false, "{d0}");
+    assert!(d0["message"].as_str().unwrap().contains("changed"), "{d0}");
+    let note = d0["repair"]["note"].as_str().unwrap();
+    assert!(note.contains("refuses writes that newly cite"), "{note}");
+
+    // An assessment of a hypothesis whose basis cites the bytes is refused.
+    let token = shown(p, &h)["state"]["review_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let out = run(
+        p,
+        &[
+            "--json",
+            "assess",
+            &h,
+            "--reviewed",
+            &token,
+            "--status",
+            "untested",
+            "--reason",
+            "Not yet",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
+    let message = json_error(&out)["error"].as_str().unwrap().to_string();
+    assert!(
+        message.contains("cannot assess") && message.contains(&d),
+        "{message}"
+    );
+
+    // A write that newly cites the bytes is refused, naming them.
+    let out = run(p, &["--json", "set", &e, "--data", &d]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
+    let message = json_error(&out)["error"].as_str().unwrap().to_string();
+    assert!(
+        message.contains(&d) && message.contains("not intact"),
+        "{message}"
+    );
+    let out = run(
+        p,
+        &["observe", "Seen again", "--source", "rig", "--data", &d],
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
+    // Nor are they returned.
+    let out = run(p, &["data", "get", &d]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty());
+    // Dropping the citation is not blocked by the broken bytes.
+    let other = p.join("other.log");
+    std::fs::write(&other, "other").unwrap();
+    let d2 = id_of(ok(
+        p,
+        &["capture", other.to_str().unwrap(), "--origin", "rig"],
+    ));
+    ok(p, &["set", &h, "--data", &d2]);
+}
+
 /// `hyp data get` writes the bytes back exactly, to stdout or a file.
 #[test]
 fn data_get_round_trips_the_bytes() {

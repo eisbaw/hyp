@@ -4,7 +4,7 @@ title: Replace unmaintained dependencies serde_yaml and fs2
 status: To Do
 assignee: []
 created_date: '2026-09-29 22:15'
-updated_date: '2026-09-29 22:30'
+updated_date: '2026-10-01 00:35'
 labels:
   - dependencies
 dependencies:
@@ -31,4 +31,6 @@ Front matter is the durable on-disk format, so a replacement YAML crate must pro
 
 <!-- SECTION:NOTES:BEGIN -->
 Do this together with HYPO-0009 (and HYPO-0005) so users see a single needs-review wave. If HYPO-0009 makes the fingerprint semantic, the byte-identical requirement in AC#3 can be relaxed. Check RustSec before choosing a YAML crate (serde_yml reportedly has an advisory; verify).
+
+HYPO-0004: reads take fs2's shared lock (FileExt::lock_shared, called by path because std's inherent File::lock_shared, stable since Rust 1.89, shadows it and is newer than the MSRV 1.85). Replacing fs2 with std file locks needs the MSRV raised to 1.89.
 <!-- SECTION:NOTES:END -->

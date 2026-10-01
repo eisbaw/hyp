@@ -203,12 +203,14 @@ async fn rejects_foreign_host_origin_and_missing_token() {
 async fn report_does_not_block_the_runtime_while_the_store_is_locked() {
     use fs2::FileExt;
     let (_dir, app, store) = app();
+    // Reads wait only for a transaction being applied (HYPO-0004), which
+    // holds the apply lock exclusively.
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(store.root.join(".hyp/write.lock"))
+        .open(store.root.join(".hyp/apply.lock"))
         .unwrap();
     lock.lock_exclusive().unwrap();
     let holder = std::thread::spawn(move || {

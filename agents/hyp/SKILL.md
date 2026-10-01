@@ -173,11 +173,11 @@ Errors go to stderr (`--json`: `{"error", "kind"}`); decide by `kind`, not text.
 Never edit files under `hyp/` directly; use `hyp set ID` (`--title`, `--body`,
 `--tags`, ...); leave `hyp edit` to people. After an editor, merge or sync
 touched `hyp/`, run `hyp check`. A diagnostic has a `code` and may carry a
-repair (`hyp --json check`: `.repair.note`; `.repair.commands`, argv arrays to
-run in the project directory). Read the note first: a missing record may still
-be arriving from a sync or merge, so prefer restoring it over deleting what
-refers to it (a delete is final without version control). Only `malformed`,
-`attachment` and `invalid` block writes: restore or fix those files by hand.
+repair (`.repair.note`; `.repair.commands`, argv arrays to run in the project
+directory). Read the note first: prefer restoring a missing record (a sync may
+bring it) over deleting what refers to it. `malformed`, `attachment` and
+`invalid` block every write: fix them by hand. `changed_bytes` (found only by
+`hyp check`) blocks writes and assessments that rely on those bytes.
 
 ## Example
 

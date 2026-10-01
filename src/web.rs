@@ -178,8 +178,12 @@ pub async fn serve(store: Store, port: u16) -> Result<()> {
     });
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-        if let Err(err) = event {
-            eprintln!("hyp web: file watcher error (changes are still polled every 2 s): {err}");
+        match event {
+            Err(err) => {
+                eprintln!("hyp web: file watcher error (changes are still polled every 2 s): {err}")
+            }
+            Ok(event) if !changes_files(&event) => return,
+            Ok(_) => {}
         }
         // Fails only after the monitor stopped, when nobody needs the wake-up.
         let _ = tx.send(());
@@ -231,6 +235,18 @@ pub async fn serve(store: Store, port: u16) -> Result<()> {
     drop(watcher);
     Ok(())
 }
+/// Whether a file event may mean the project changed. On Linux, notify also
+/// reports files being opened and read (inotify `IN_OPEN`), which every
+/// snapshot does: counting those, each read woke the monitor for another
+/// read, and an idle `hyp web` kept a core busy (HYPO-0004). Of the access
+/// events only closing a file written to counts.
+fn changes_files(event: &notify::Event) -> bool {
+    use notify::event::{AccessKind, AccessMode, EventKind};
+    match event.kind {
+        EventKind::Access(access) => access == AccessKind::Close(AccessMode::Write),
+        _ => true,
+    }
+}
 pub fn export_html(s: &Snapshot) -> Result<String> {
     let json = serde_json::to_string(s)?
         .replace('<', "\\u003c")
@@ -248,4 +264,33 @@ pub fn export_html(s: &Snapshot) -> Result<String> {
                 include_str!("../web/app.js")
             ),
         ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::changes_files;
+    use notify::event::{AccessKind, AccessMode, CreateKind, EventKind, ModifyKind, RemoveKind};
+
+    #[test]
+    fn reading_files_is_not_a_change_but_writing_them_is() {
+        let event = |kind| notify::Event::new(kind);
+        for read in [
+            AccessKind::Open(AccessMode::Any),
+            AccessKind::Read,
+            AccessKind::Close(AccessMode::Read),
+            AccessKind::Any,
+        ] {
+            assert!(!changes_files(&event(EventKind::Access(read))), "{read:?}");
+        }
+        for change in [
+            EventKind::Access(AccessKind::Close(AccessMode::Write)),
+            EventKind::Create(CreateKind::File),
+            EventKind::Modify(ModifyKind::Any),
+            EventKind::Remove(RemoveKind::File),
+            EventKind::Any,
+            EventKind::Other,
+        ] {
+            assert!(changes_files(&event(change)), "{change:?}");
+        }
+    }
 }

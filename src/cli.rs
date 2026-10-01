@@ -1147,7 +1147,12 @@ pub async fn run(cli: Cli) -> Result<()> {
     if let Command::Web { port } = cli.command {
         return web::serve(store, port).await;
     }
-    let s = store.snapshot()?;
+    // `hyp check` also hashes every stored byte; other commands check stored
+    // bytes by metadata only (`store::Verify`, HYPO-0004).
+    let s = match cli.command {
+        Command::Check { .. } => store.read(store::Verify::Content)?,
+        _ => store.snapshot()?,
+    };
     let mut changes = Vec::new();
     match cli.command {
         Command::Add {

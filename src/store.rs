@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail, ensure};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -25,6 +25,206 @@ pub const DIRECTORIES: &[&str] = &[
     "data",
 ];
 pub use crate::error::Conflict;
+/// How much of the stored bytes (`hyp/assets/`) a read checks (HYPO-0004).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verify {
+    /// Metadata only: each stored file a record names exists as a regular
+    /// file inside `hyp/assets/`, and a data record's size matches its
+    /// length (a mismatch is then hashed, to tell changed bytes from a
+    /// changed record). Of the content, only the first
+    /// `data::PREVIEW_BYTES` of `text/*` data are read, for previews. Bytes
+    /// changed in place to other bytes of the same length go unnoticed here;
+    /// `hyp check` (`Content`) reports them (`Code::ChangedBytes`), a write
+    /// that newly cites them or assesses a basis citing them hashes them
+    /// (`Store::verify_cited`, `Store::verify_basis`), and `hyp data get`
+    /// hashes what it returns. Every read but `hyp check`.
+    Metadata,
+    /// Also hashes every stored file once: `hyp check`.
+    Content,
+}
+// The locks (advisory, `flock`), all under `.hyp/`. Every holder of more
+// than one takes them in the order WRITE_LOCK, GATE_LOCK, APPLY_LOCK and
+// never waits for one while holding a later one, so they cannot deadlock.
+//
+// - A write holds WRITE_LOCK for its whole commit, then GATE_LOCK and
+//   APPLY_LOCK, both exclusively, while it writes its journal, applies it
+//   and removes it.
+// - A read takes GATE_LOCK exclusively, then APPLY_LOCK shared, releases
+//   GATE_LOCK and reads the record files and the metadata of stored bytes.
+//   It never waits for a whole write; it waits while a journal is applied,
+//   and while a writer waits to apply one, which waits for the reads in
+//   progress. So a read is held up by the longest read in progress when a
+//   writer queues; `hyp check` therefore hashes stored bytes after letting
+//   go (`Store::read`). A read sees each transaction whole or not at all.
+// - A read that finds a journal (under APPLY_LOCK shared, so a crashed
+//   write's, or one an older hyp that does not take APPLY_LOCK is
+//   applying) lets go and rolls it forward as a writer does: WRITE_LOCK,
+//   then GATE_LOCK and APPLY_LOCK.
+//
+// GATE_LOCK gives writers precedence: `flock` favours no one, so with reads
+// that always overlap, a writer waiting only for APPLY_LOCK might never
+// get it. A writer waiting for APPLY_LOCK holds GATE_LOCK, so new reads
+// queue behind it and it waits only for the reads in progress.
+//
+// On NFS, `flock` is emulated with POSIX locks, and an exclusive one needs a
+// file open for writing: a read that could open GATE_LOCK only read-only
+// goes without it there (`read_lock`), losing only writer precedence.
+/// Held exclusively by a writer for its whole commit: writers take turns.
+/// Reads take it only to roll a journal forward.
+const WRITE_LOCK: &str = ".hyp/write.lock";
+/// Held exclusively by a writer from before it waits for `APPLY_LOCK` until
+/// it has applied its journal, and by a read only while it takes
+/// `APPLY_LOCK` shared: reads queue behind a waiting writer.
+const GATE_LOCK: &str = ".hyp/gate.lock";
+/// Held exclusively while a journal is written and applied (or a crashed
+/// one rolled forward), and shared by every read while it reads.
+const APPLY_LOCK: &str = ".hyp/apply.lock";
+const LOCKS: [&str; 3] = [WRITE_LOCK, GATE_LOCK, APPLY_LOCK];
+/// A write's journal: present only while it is applied, or after a crash
+/// until the next writer or reader rolls it forward.
+const JOURNAL: &str = ".hyp/transaction.json";
+/// What the files of a notebook held when read: `config.toml` and each
+/// record file, by path relative to `hyp/`, mapped to the hash of its
+/// content (or why it could not be read). A commit compares it just before
+/// writing, to notice an editor or sync that saved a file meanwhile.
+type Files = BTreeMap<String, String>;
+#[cfg(test)]
+thread_local! {
+    /// How many full reads (`Store::read_unlocked`) this thread made.
+    static FULL_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+#[cfg(unix)]
+fn is_bad_fd(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(libc::EBADF)
+}
+#[cfg(not(unix))]
+fn is_bad_fd(_: &std::io::Error) -> bool {
+    false
+}
+/// Opens the lock file at `path` with `options`, refusing anything but a
+/// regular file: a symlink could point anywhere, and opening a FIFO
+/// read-only would wait forever. It is opened non-blocking and without
+/// following a symlink, then checked, so nothing can swap it in between.
+fn lock_file(path: &Path, options: &OpenOptions) -> Result<File> {
+    let refuse = || {
+        anyhow::anyhow!(
+            "{} is not a regular file (a symlink, FIFO or directory); hyp keeps its locks as \
+             regular files: remove it, and hyp creates it again",
+            path.display()
+        )
+    };
+    let mut options = options.clone();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    let file = match options.open(path) {
+        #[cfg(unix)]
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Err(refuse()),
+        other => other.with_context(|| format!("cannot open {}", path.display()))?,
+    };
+    if !file.metadata()?.is_file() {
+        return Err(refuse());
+    }
+    Ok(file)
+}
+/// The diagnostic for legacy attachment `a` whose bytes are not intact
+/// (`code`: `Attachment` or `ChangedBytes`), `why` saying how.
+fn attachment_diagnostic(a: &Attachment, code: Code, why: &str) -> Diagnostic {
+    let mut d = Diagnostic::new(
+        &a.path,
+        code,
+        format!("attachment missing, unsafe, or hash mismatch: {why}"),
+    );
+    d.repair = Some(Repair {
+        note: Some(format!(
+            "Restore hyp/{} as a regular file with the recorded bytes (sha256 {}), from a \
+             backup, version control or the source of the merge or sync; a symlink there must \
+             be replaced by a copy of what it points to. hyp check confirms the fix.{}",
+            a.path,
+            a.sha256,
+            until_restored(code)
+        )),
+        commands: vec![],
+    });
+    d
+}
+/// The diagnostic for data record `r` whose stored bytes are not intact
+/// (`code`: `Attachment` or `ChangedBytes`), `why` saying how.
+fn data_diagnostic(r: &Record, code: Code, why: &str) -> Diagnostic {
+    let Data::Captured {
+        sha256,
+        size,
+        media_type,
+        ..
+    } = &r.data
+    else {
+        unreachable!("only data records have stored bytes")
+    };
+    let what = match code {
+        Code::ChangedBytes => {
+            "changed in place (to bytes of the same length, which only hyp check notices)"
+        }
+        _ => "not intact",
+    };
+    let mut d = Diagnostic::new(
+        Store::path_of(r),
+        code,
+        format!("the bytes of data record {} are {what}: {why}", r.id),
+    );
+    d.repair = Some(Repair {
+        note: Some(format!(
+            "Restore hyp/assets/{sha256} ({size} bytes, {media_type}) as a regular file from a \
+             backup, version control or the source of the merge or sync; or capture the \
+             original again (hyp capture FILE --origin \"...\"), which stores the same bytes at \
+             the same path. hyp check confirms the fix.{}",
+            until_restored(code)
+        )),
+        commands: vec![],
+    });
+    d
+}
+/// The SHA-256 of the file at `path`, read in pieces: `hyp check` hashes
+/// every stored file without holding one whole in memory.
+fn hash_file(path: &Path) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0; 1 << 20];
+    loop {
+        match file.read(&mut buffer)? {
+            0 => return Ok(format!("{:x}", hasher.finalize())),
+            n => hasher.update(&buffer[..n]),
+        }
+    }
+}
+/// What the repair note of a stored-bytes diagnostic adds for `code`: for
+/// bytes changed in place (`Code::ChangedBytes`), what hyp refuses until
+/// they are restored.
+fn until_restored(code: Code) -> &'static str {
+    match code {
+        Code::ChangedBytes => {
+            " Until then hyp refuses writes that newly cite these bytes and assessments \
+             whose basis holds them; other writes go on (ordinary reads do not hash \
+             stored bytes)."
+        }
+        _ => "",
+    }
+}
+/// Whether `err` comes from lacking write access: a read-only file system
+/// or missing permissions. Reads go on without writing then.
+fn cannot_write(err: &anyhow::Error) -> bool {
+    err.chain()
+        .filter_map(|e| e.downcast_ref::<std::io::Error>())
+        .any(|e| {
+            matches!(
+                e.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
+            )
+        })
+}
 /// An object a write named, by full ID, with its revision after the write
 /// (None once deleted): what write commands print with `--json`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -65,6 +265,12 @@ pub struct Committed {
     pub migrated: Vec<Written>,
     /// The schema the write raised the notebook to, if it did.
     pub raised_to: Option<u32>,
+}
+/// The locks a writer holds while it applies a journal (`Store::applying`).
+/// Fields drop in order: `APPLY_LOCK`, then `GATE_LOCK`.
+struct Applying {
+    _apply: File,
+    _gate: File,
 }
 #[derive(Debug, Clone)]
 pub struct Store {
@@ -859,7 +1065,7 @@ impl Store {
                 safe_dir(&path.join("hyp"))?;
                 read_config(&path.join("hyp"))?;
                 let store = Self { root: path };
-                store.ensure_layout()?;
+                store.ensure_layout_if_writable()?;
                 return Ok(store);
             }
             if !path.pop() {
@@ -884,28 +1090,150 @@ impl Store {
             atomic(&gitignore, b"*\n")
                 .with_context(|| format!("cannot write {}", gitignore.display()))?;
         }
+        // Created here, so that a notebook later made read-only still has
+        // them for reads to lock (`read_lock`).
+        for name in LOCKS {
+            self.open_lock(name)?;
+        }
         Ok(())
     }
+    /// `ensure_layout` where hyp may write; false (and nothing created) on
+    /// read-only media or without write permission, where reads go on with
+    /// what is there and a write fails with the cause. Other problems (a
+    /// symlink or file in place of a directory) are errors either way.
+    fn ensure_layout_if_writable(&self) -> Result<bool> {
+        match self.ensure_layout() {
+            Ok(()) => Ok(true),
+            Err(e) if cannot_write(&e) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+    /// Opens lock file `name` (`WRITE_LOCK`, `GATE_LOCK` or `APPLY_LOCK`),
+    /// creating it if needed, for reading and writing (`lock_file`).
+    fn open_lock(&self, name: &str) -> Result<File> {
+        let path = self.root.join(name);
+        let mut options = OpenOptions::new();
+        options.create(true).truncate(false).read(true).write(true);
+        lock_file(&path, &options).map_err(|e| {
+            if cannot_write(&e) {
+                e.context(format!(
+                    "cannot open {}: hyp needs write access to {}; nothing was written",
+                    path.display(),
+                    self.root.join(".hyp").display()
+                ))
+            } else {
+                e
+            }
+        })
+    }
+    /// The write lock, held for a whole commit, after rolling forward a
+    /// journal a crashed write left.
     fn lock(&self) -> Result<File> {
         self.ensure_layout()?;
-        let path = self.root.join(".hyp/write.lock");
-        if path.symlink_metadata().is_ok() {
-            ensure!(
-                !path.symlink_metadata()?.file_type().is_symlink(),
-                "lock is a symlink"
-            );
-        }
-        let f = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&path)
-            .with_context(|| format!("cannot open {}", path.display()))?;
+        let f = self.open_lock(WRITE_LOCK)?;
         f.lock_exclusive()
-            .with_context(|| format!("cannot lock {}", path.display()))?;
-        self.recover()?;
+            .with_context(|| format!("cannot lock {WRITE_LOCK}"))?;
+        if self.root.join(JOURNAL).exists() {
+            let _applying = self.applying()?;
+            self.recover()?;
+        }
         Ok(f)
+    }
+    /// `GATE_LOCK`, then `APPLY_LOCK`, both exclusively: what a writer holds
+    /// (already holding `WRITE_LOCK`) to write, apply and remove a journal.
+    /// No read is in progress, and new reads wait, until it is dropped.
+    fn applying(&self) -> Result<Applying> {
+        let gate = self.open_lock(GATE_LOCK)?;
+        gate.lock_exclusive()
+            .with_context(|| format!("cannot lock {GATE_LOCK}"))?;
+        let apply = self.open_lock(APPLY_LOCK)?;
+        apply
+            .lock_exclusive()
+            .with_context(|| format!("cannot lock {APPLY_LOCK}"))?;
+        Ok(Applying {
+            _apply: apply,
+            _gate: gate,
+        })
+    }
+    /// Lock file `name` for a read: opened (and created) for writing where
+    /// hyp may write (`writable`), else read-only (locks need no write
+    /// access); None if it does not exist and cannot be created.
+    fn lock_for_read(&self, name: &str, writable: bool) -> Result<Option<File>> {
+        let path = self.root.join(name);
+        match writable.then(|| self.open_lock(name)) {
+            Some(Ok(f)) => return Ok(Some(f)),
+            Some(Err(e)) if !cannot_write(&e) => return Err(e),
+            _ => {}
+        }
+        match lock_file(&path, OpenOptions::new().read(true)) {
+            Ok(f) => Ok(Some(f)),
+            Err(e)
+                if e.downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+    /// The lock a read holds while it reads (dropping the file releases it):
+    /// `APPLY_LOCK` shared, taken through `GATE_LOCK` (see the lock order
+    /// above), so no transaction is applied meanwhile. A journal seen under
+    /// it is rolled forward under the write lock (`lock`) before reading.
+    ///
+    /// Where hyp cannot write (read-only media, another user's notebook),
+    /// the lock files are opened read-only. `ensure_layout` creates them
+    /// wherever hyp has written, so they are missing only where hyp never
+    /// could write, as in a copy without `.hyp/` on read-only media: then
+    /// the read takes no lock, as nothing writes there through hyp. A
+    /// journal there cannot be rolled forward, and is an error.
+    fn read_lock(&self) -> Result<Option<File>> {
+        let journal = self.root.join(JOURNAL);
+        loop {
+            let writable = self.ensure_layout_if_writable()?;
+            let gate = self.lock_for_read(GATE_LOCK, writable)?;
+            let Some(apply) = self.lock_for_read(APPLY_LOCK, writable)? else {
+                ensure!(
+                    !journal.exists(),
+                    "{} holds a write that did not finish, and hyp cannot roll it forward \
+                     without write access to {}: run any hyp command there with write access",
+                    journal.display(),
+                    self.root.display()
+                );
+                return Ok(None);
+            };
+            let gate = match gate.map(|g| g.lock_exclusive().map(|()| g)) {
+                Some(Ok(g)) => Some(g),
+                // NFS emulates flock with POSIX locks, and an exclusive one
+                // needs a file open for writing: on a read-only NFS mount the
+                // read goes without the gate, losing only writer precedence.
+                Some(Err(e)) if is_bad_fd(&e) => None,
+                Some(Err(e)) => {
+                    return Err(e).with_context(|| format!("cannot lock {GATE_LOCK}"));
+                }
+                None => None,
+            };
+            // fs2's, not std's `File::lock_shared` (Rust 1.89, newer than the MSRV).
+            FileExt::lock_shared(&apply).with_context(|| format!("cannot lock {APPLY_LOCK}"))?;
+            drop(gate);
+            if !journal.exists() {
+                return Ok(Some(apply));
+            }
+            drop(apply);
+            // Rolled forward as a writer would, then read under the shared
+            // lock like any other read.
+            if let Err(e) = self.lock() {
+                return Err(if cannot_write(&e) {
+                    e.context(format!(
+                        "{} holds a write that did not finish; rolling it forward needs write \
+                         access",
+                        journal.display()
+                    ))
+                } else {
+                    e
+                });
+            }
+        }
     }
     fn relative(r: &Record) -> String {
         format!("{}/{}.md", r.data.directory(), r.id)
@@ -946,8 +1274,12 @@ impl Store {
         }
         Ok(path)
     }
+    /// Rolls the journal forward, if there is one: writes each file it
+    /// holds (atomically, one by one) and then removes it. Idempotent, so a
+    /// crash here is recovered by the next call. Only with `WRITE_LOCK`
+    /// held and `applying`.
     fn recover(&self) -> Result<()> {
-        let journal = self.root.join(".hyp/transaction.json");
+        let journal = self.root.join(JOURNAL);
         if !journal.exists() {
             return Ok(());
         }
@@ -959,56 +1291,150 @@ impl Store {
             &fs::read(&journal).with_context(|| format!("cannot read {}", journal.display()))?,
         )
         .with_context(|| format!("invalid {}", journal.display()))?;
+        // What to do when a step fails: the journal stays, and the next hyp
+        // with write access rolls it forward again.
+        let retry = || {
+            format!(
+                "the journal {} stays; run any hyp command with write access to {} to \
+                 finish this write",
+                journal.display(),
+                self.root.display()
+            )
+        };
         for (relative, body) in &writes {
             let path = self.target(relative)?;
-            match body {
-                Some(s) => atomic(&path, s.as_bytes())?,
-                None => {
-                    if path.exists() {
-                        fs::remove_file(&path)?;
-                        File::open(path.parent().unwrap())?.sync_all()?;
-                    }
-                }
-            }
+            let applied = match body {
+                Some(s) => atomic(&path, s.as_bytes()),
+                None if path.exists() => fs::remove_file(&path)
+                    .and_then(|()| File::open(path.parent().unwrap())?.sync_all())
+                    .map_err(anyhow::Error::from),
+                None => Ok(()),
+            };
+            applied.with_context(|| format!("cannot apply {}; {}", path.display(), retry()))?;
         }
-        fs::remove_file(&journal)?;
-        File::open(journal.parent().unwrap())?.sync_all()?;
+        fs::remove_file(&journal)
+            .and_then(|()| File::open(journal.parent().unwrap())?.sync_all())
+            .with_context(|| {
+                format!(
+                    "cannot remove the journal {} after applying it (its files are written); \
+                     hyp needs write access to {} to remove it",
+                    journal.display(),
+                    self.root.join(".hyp").display()
+                )
+            })?;
         Ok(())
     }
+    /// The project as it is, its stored bytes checked by metadata only
+    /// (`Verify::Metadata`): what every command but `hyp check` reads.
     pub fn snapshot(&self) -> Result<Snapshot> {
-        let _lock = self.lock()?;
-        self.read_unlocked()
+        self.read(Verify::Metadata)
+    }
+    /// The project as it is, its stored bytes checked as `verify` says.
+    /// Holds `APPLY_LOCK` shared while it reads (`read_lock`), not the write
+    /// lock: a read waits only while a journal is applied or a writer waits
+    /// to apply one, and a writer waits only for the reads in progress when
+    /// it is ready to apply (see the lock order at `WRITE_LOCK`). A read
+    /// that finds a crashed write's journal takes the write lock to roll it
+    /// forward.
+    pub fn read(&self, verify: Verify) -> Result<Snapshot> {
+        let (mut snap, _) = {
+            let _lock = self.read_lock()?;
+            self.read_unlocked()?
+        };
+        // After the lock is released: hashing a large notebook takes long, and
+        // a writer waiting for the reads in progress would hold up every new
+        // read meanwhile. Stored bytes are named by their hash and never
+        // rewritten in place by hyp, so what was listed under the lock is
+        // what is hashed (`hash_stored`).
+        if verify == Verify::Content {
+            self.hash_stored(&mut snap);
+        }
+        Ok(snap)
     }
     /// The notebook's config; fails for a schema this hyp does not read.
     fn config(&self) -> Result<Config> {
         read_config(&self.root.join("hyp"))
     }
-    fn read_unlocked(&self) -> Result<Snapshot> {
+    /// The record files of `dir` (one of `DIRECTORIES`), sorted by name:
+    /// each `.md` file with its content, or why it cannot be read. A missing
+    /// directory has none: copies drop empty directories, and on read-only
+    /// media they cannot be recreated (`ensure_layout_if_writable`).
+    fn record_files(&self, dir: &str) -> Result<Vec<(PathBuf, Result<String>)>> {
+        let path = self.root.join("hyp").join(dir);
+        match fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+            _ => safe_dir(&path)?,
+        }
+        let mut files = fs::read_dir(&path)
+            .and_then(|entries| entries.collect::<std::io::Result<Vec<_>>>())
+            .with_context(|| format!("cannot read {}", path.display()))?;
+        files.sort_by_key(|f| f.file_name());
+        Ok(files
+            .into_iter()
+            .filter(|f| f.path().extension().is_some_and(|x| x == "md"))
+            .map(|f| {
+                let content = (|| -> Result<String> {
+                    ensure!(f.file_type()?.is_file(), "record is not a regular file");
+                    Ok(fs::read_to_string(f.path())?)
+                })();
+                (f.path(), content)
+            })
+            .collect())
+    }
+    /// The `Files` of the notebook: config.toml and every record file,
+    /// hashed, not parsed. Stored bytes are not read.
+    fn files(&self) -> Result<Files> {
+        let mut files = self.config_files()?;
+        for dir in DIRECTORIES {
+            for (path, content) in self.record_files(dir)? {
+                files.insert(Self::file_key(dir, &path), Self::file_hash(&content));
+            }
+        }
+        Ok(files)
+    }
+    /// `Files` with only config.toml in it, to which the records are added.
+    fn config_files(&self) -> Result<Files> {
+        let config = self.root.join("hyp").join(CONFIG);
+        let bytes =
+            fs::read(&config).with_context(|| format!("cannot read {}", config.display()))?;
+        Ok(Files::from([(CONFIG.to_string(), hash(bytes))]))
+    }
+    fn file_key(dir: &str, path: &Path) -> String {
+        format!(
+            "{dir}/{}",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        )
+    }
+    fn file_hash(content: &Result<String>) -> String {
+        match content {
+            Ok(raw) => hash(raw),
+            Err(e) => format!("unreadable: {e:#}"),
+        }
+    }
+    /// The project, its stored bytes checked as `verify` says, and the
+    /// `Files` it was read from. The caller holds a lock: the read lock
+    /// (`read_lock`) or the write lock.
+    fn read_unlocked(&self) -> Result<(Snapshot, Files)> {
+        #[cfg(test)]
+        FULL_READS.with(|n| n.set(n.get() + 1));
         // Another hyp may have raised the schema since `open` (a long-running
         // `hyp web`): refuse rather than report its records as malformed.
         self.config()?;
+        let mut files = self.config_files()?;
         let mut snap = Snapshot::default();
         for dir in DIRECTORIES {
-            let path = self.root.join("hyp").join(dir);
-            let mut files = fs::read_dir(&path)
-                .and_then(|entries| entries.collect::<std::io::Result<Vec<_>>>())
-                .with_context(|| format!("cannot read {}", path.display()))?;
-            files.sort_by_key(|f| f.file_name());
-            for file in files {
-                let path = file.path();
-                if path.extension().is_none_or(|x| x != "md") {
-                    continue;
-                }
+            for (path, content) in self.record_files(dir)? {
+                files.insert(Self::file_key(dir, &path), Self::file_hash(&content));
                 let read = || -> Result<Entry> {
-                    ensure!(file.file_type()?.is_file(), "record is not a regular file");
-                    let raw = fs::read_to_string(&path)?;
+                    let raw = content?;
                     let r = decode(&raw)?;
                     ensure!(
                         r.data.directory() == *dir,
                         "object kind does not match directory"
                     );
                     ensure!(
-                        file.file_name().to_string_lossy() == format!("{}.md", r.id),
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                            == format!("{}.md", r.id),
                         "filename must match object ID"
                     );
                     ensure!(
@@ -1031,9 +1457,11 @@ impl Store {
             }
         }
         snap.objects.sort_by(|a, b| a.record.id.cmp(&b.record.id));
-        // Each stored file is read and hashed once, however many data
-        // records name it: its length and start, or why it is not intact.
-        let mut blobs: BTreeMap<String, std::result::Result<(usize, Vec<u8>), String>> =
+        // Each stored file is checked once per size a record states for it
+        // (normally one): its length, or why it is not intact.
+        // The error comes with its code: `Attachment`, or `ChangedBytes` for
+        // bytes only hashing tells apart.
+        let mut blobs: BTreeMap<(String, u64), std::result::Result<u64, (Code, String)>> =
             BTreeMap::new();
         let mut previews = BTreeMap::new();
         for entry in &snap.objects {
@@ -1044,23 +1472,14 @@ impl Store {
             }
             if let Data::Evidence { attachments, .. } = &entry.record.data {
                 for a in attachments {
-                    if let Err(e) = self.attachment_bytes(a) {
-                        let mut d = Diagnostic::new(
-                            &a.path,
+                    // A legacy attachment has no size: any change of its bytes
+                    // shows only when they are hashed (`hash_stored`).
+                    if let Err(e) = self.attachment_path(a) {
+                        snap.diagnostics.push(attachment_diagnostic(
+                            a,
                             Code::Attachment,
-                            format!("attachment missing, unsafe, or hash mismatch: {e:#}"),
-                        );
-                        d.repair = Some(Repair {
-                            note: Some(format!(
-                                "Restore hyp/{} as a regular file with the recorded bytes \
-                                 (sha256 {}), from a backup, version control or the source of \
-                                 the merge or sync; a symlink there must be replaced by a copy \
-                                 of what it points to. hyp check confirms the fix.",
-                                a.path, a.sha256
-                            )),
-                            commands: vec![],
-                        });
-                        snap.diagnostics.push(d);
+                            &format!("{e:#}"),
+                        ));
                     }
                 }
             }
@@ -1073,38 +1492,31 @@ impl Store {
             {
                 // An invalid hash is reported by `validate`; it names no file.
                 if crate::data::is_sha256(sha256) {
-                    let stored = blobs.entry(sha256.clone()).or_insert_with(|| {
-                        // The length and enough of the start for a preview.
-                        let keep = crate::data::PREVIEW_BYTES + 1;
-                        self.blob(sha256)
-                            .map(|b| (b.len(), b[..b.len().min(keep)].to_vec()))
-                            .map_err(|e| format!("{e:#}"))
-                    });
+                    let stored = blobs
+                        .entry((sha256.clone(), *size))
+                        .or_insert_with(|| {
+                            self.stored_len(sha256, *size)
+                                .map_err(|e| (Code::Attachment, format!("{e:#}")))
+                        })
+                        .clone();
                     let id = &entry.record.id;
                     let path = Self::path_of(&entry.record);
-                    let d = match stored {
+                    // The start of intact text bytes, for a preview.
+                    let start = match &stored {
+                        Ok(len) if len == size && media_type.starts_with("text/") => self
+                            .blob_start(sha256, crate::data::PREVIEW_BYTES + 1)
+                            .map(Some)
+                            .map_err(|e| (Code::Attachment, format!("{e:#}"))),
+                        _ => Ok(None),
+                    };
+                    let d = match (stored, start) {
                         // Missing or changed bytes: restore them.
-                        Err(why) => {
-                            let mut d = Diagnostic::new(
-                                path,
-                                Code::Attachment,
-                                format!("the bytes of data record {id} are not intact: {why}"),
-                            );
-                            d.repair = Some(Repair {
-                                note: Some(format!(
-                                    "Restore hyp/assets/{sha256} ({size} bytes, {media_type}) as a \
-                                     regular file from a backup, version control or the source \
-                                     of the merge or sync; or capture the original again (hyp \
-                                     capture FILE --origin \"...\"), which stores the same bytes \
-                                     at the same path. hyp check confirms the fix."
-                                )),
-                                commands: vec![],
-                            });
-                            Some(d)
+                        (Err((code, why)), _) | (_, Err((code, why))) => {
+                            Some(data_diagnostic(&entry.record, code, &why))
                         }
                         // Intact bytes, but the record describes them wrongly:
                         // the record file is what changed.
-                        Ok((len, _)) if *len as u64 != *size => {
+                        (Ok(len), _) if len != *size => {
                             let mut d = Diagnostic::new(
                                 path.clone(),
                                 Code::Invalid,
@@ -1124,9 +1536,9 @@ impl Store {
                             });
                             Some(d)
                         }
-                        Ok((_, start)) => {
-                            if media_type.starts_with("text/") {
-                                previews.insert(id.clone(), crate::data::preview(start));
+                        (Ok(_), Ok(start)) => {
+                            if let Some(start) = start {
+                                previews.insert(id.clone(), crate::data::preview(&start));
                             }
                             None
                         }
@@ -1158,13 +1570,19 @@ impl Store {
         // those bytes fail: report it, unless a data record or legacy
         // attachment check above reported it already.
         let assets = self.root.join("hyp/assets");
-        let entries = fs::read_dir(&assets)
-            .and_then(|entries| entries.collect::<std::io::Result<Vec<_>>>())
-            .with_context(|| format!("cannot read {}", assets.display()))?;
+        let entries = match fs::read_dir(&assets) {
+            // Copies drop an empty assets/; see `record_files`.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => vec![],
+            listed => listed
+                .and_then(|entries| entries.collect::<std::io::Result<Vec<_>>>())
+                .with_context(|| format!("cannot read {}", assets.display()))?,
+        };
         for entry in entries {
             let shown = format!("hyp/assets/{}", entry.file_name().to_string_lossy());
             let name = entry.file_name().to_string_lossy().into_owned();
-            let reported = blobs.get(&name).is_some_and(|b| b.is_err())
+            let reported = blobs
+                .iter()
+                .any(|((sha256, _), b)| *sha256 == name && b.is_err())
                 || snap
                     .diagnostics
                     .iter()
@@ -1187,7 +1605,7 @@ impl Store {
         }
         snap.previews = previews;
         snap.derive();
-        Ok(snap)
+        Ok((snap, files))
     }
     pub fn commit(&self, changes: Vec<Change>, expected_project: Option<&str>) -> Result<Snapshot> {
         self.commit_written(changes, expected_project)
@@ -1198,7 +1616,9 @@ impl Store {
     /// no-op is still listed.
     ///
     /// Diagnostics that block writes (malformed files, broken attachments,
-    /// invalid records) reject every write. Other errors, between loaded
+    /// invalid records) reject every write. Stored bytes are checked by
+    /// metadata there (`Verify::Metadata`); those a change newly cites are
+    /// hashed as well (`verify_cited`). Other errors, between loaded
     /// records, arrive from merges, syncs and hand edits; a write is accepted
     /// if it adds no error, identified by `Diagnostic::identity`, that the
     /// project did not already have. So a write may repair such errors, and
@@ -1220,7 +1640,9 @@ impl Store {
         expected_project: Option<&str>,
     ) -> Result<Committed> {
         let _lock = self.lock()?;
-        let before = self.read_unlocked()?;
+        // Read 1 of 2. Stored bytes are checked by metadata here; those the
+        // write newly relies on are hashed below (`verify_cited`).
+        let (before, files) = self.read_unlocked()?;
         before.assert_writable()?;
         if let Some(expected) = expected_project {
             if expected != before.revision {
@@ -1231,6 +1653,8 @@ impl Store {
         let mut after = before.clone();
         let mut writes = BTreeMap::new();
         let mut created = Vec::new();
+        // The hashes of stored bytes this commit has hashed.
+        let mut verified = BTreeSet::new();
         let mut references = References::default();
         // The object each change names: ID, kind, file, batch-local reference.
         let mut named: Vec<(String, Kind, String, Option<String>)> = Vec::new();
@@ -1298,6 +1722,7 @@ impl Store {
                                  link pre-existing evidence in an earlier write, re-read, then assess",
                                 unreviewed.join(", ")
                             );
+                            self.verify_basis(&after, &basis, &mut verified)?;
                             *based_on = fingerprint_of(&basis);
                             *supersedes = after
                                 .assessment_heads(hypothesis)
@@ -1346,6 +1771,7 @@ impl Store {
                                      them with hyp capture FILE --origin \"...\" (sha256 {sha256})"
                                 )
                             })?;
+                            verified.insert(sha256.clone());
                             *size = bytes.len() as u64;
                             if media_type.is_empty() {
                                 *media_type = crate::data::guess_media_type(None, &bytes);
@@ -1502,6 +1928,14 @@ impl Store {
             };
             if needed(&after) >= DATA_SCHEMA {
                 migrated = self.migrate_attachments(&mut after, &mut writes)?;
+                // The migration hashed the bytes of the records it created.
+                for id in &migrated {
+                    if let Some(Data::Captured { sha256, .. }) =
+                        after.get(id).map(|e| &e.record.data)
+                    {
+                        verified.insert(sha256.clone());
+                    }
+                }
             }
             let needed = needed(&after);
             if needed > config.schema_version {
@@ -1525,35 +1959,28 @@ impl Store {
             {
                 return Err(v.into());
             }
-            if let Data::Evidence { attachments, .. } = &e.record.data {
-                for attachment in attachments {
-                    let path = self
-                        .root
-                        .join("hyp")
-                        .join(&attachment.path)
-                        .canonicalize()
-                        .context("attachment does not exist; import it with hyp evidence attach")?;
-                    ensure!(
-                        path.starts_with(self.root.join("hyp/assets")),
-                        "attachment escapes assets directory"
-                    );
-                    ensure!(
-                        hash(fs::read(path)?) == attachment.sha256,
-                        "attachment hash mismatch"
-                    );
-                }
-            }
         }
-        // Verify a second time immediately before writing to detect ordinary editor saves.
-        if self.read_unlocked()?.revision != before.revision {
+        self.verify_cited(&before, &after, &writes, &mut verified)?;
+        // Check the files once more immediately before writing, to detect an
+        // editor save or a sync meanwhile: their bytes, not parsed again.
+        if self.files()? != files {
             bail!(Conflict::new("files changed during transaction"));
         }
-        atomic(
-            &self.root.join(".hyp/transaction.json"),
-            &serde_json::to_vec(&writes)?,
-        )?;
-        self.recover()?;
-        let snapshot = self.read_unlocked()?;
+        {
+            // No read is in progress while the journal exists (`read_lock`).
+            let _applying = self.applying()?;
+            let journal = self.root.join(JOURNAL);
+            atomic(&journal, &serde_json::to_vec(&writes)?).with_context(|| {
+                format!(
+                    "cannot write the journal {}: hyp needs write access to {}; nothing was written",
+                    journal.display(),
+                    self.root.join(".hyp").display()
+                )
+            })?;
+            self.recover()?;
+        }
+        // Read 2 of 2.
+        let (snapshot, _) = self.read_unlocked()?;
         let written = named
             .into_iter()
             .map(|(id, kind, file, reference)| Written {
@@ -1584,9 +2011,10 @@ impl Store {
         );
         Ok(self.root.join("hyp/assets").join(sha256))
     }
-    /// The stored bytes with hash `sha256`, checked: a regular file (not a
-    /// symlink) at `hyp/assets/<sha256>` whose content has that hash.
-    pub fn blob(&self, sha256: &str) -> Result<Vec<u8>> {
+    /// The length of the stored bytes with hash `sha256`, from metadata
+    /// only: a regular file (not a symlink) at `hyp/assets/<sha256>`. Its
+    /// content is not read; `blob` checks that.
+    fn blob_len(&self, sha256: &str) -> Result<u64> {
         let path = self.blob_path(sha256)?;
         let shown = format!("hyp/assets/{sha256}");
         let meta = match fs::symlink_metadata(&path) {
@@ -1599,7 +2027,38 @@ impl Store {
             meta.is_file(),
             "{shown} is not a regular file (a symlink or directory)"
         );
-        let bytes = fs::read(&path).with_context(|| format!("cannot read {shown}"))?;
+        Ok(meta.len())
+    }
+    /// The length of the stored bytes with hash `sha256`, by metadata. A
+    /// length other than `size` (what the record states) is checked by
+    /// content as well: that tells changed bytes (an error) from a changed
+    /// record (intact bytes of another length), and is rare.
+    fn stored_len(&self, sha256: &str, size: u64) -> Result<u64> {
+        let len = self.blob_len(sha256)?;
+        if len == size {
+            return Ok(len);
+        }
+        Ok(self.blob(sha256)?.len() as u64)
+    }
+    /// At most the first `n` stored bytes with hash `sha256`, unchecked
+    /// beyond `blob_len`: for previews.
+    fn blob_start(&self, sha256: &str, n: usize) -> Result<Vec<u8>> {
+        use std::io::Read;
+        self.blob_len(sha256)?;
+        let path = self.blob_path(sha256)?;
+        let mut start = Vec::with_capacity(n);
+        File::open(&path)
+            .and_then(|f| f.take(n as u64).read_to_end(&mut start))
+            .with_context(|| format!("cannot read hyp/assets/{sha256}"))?;
+        Ok(start)
+    }
+    /// The stored bytes with hash `sha256`, checked: a regular file (not a
+    /// symlink) at `hyp/assets/<sha256>` whose content has that hash.
+    pub fn blob(&self, sha256: &str) -> Result<Vec<u8>> {
+        self.blob_len(sha256)?;
+        let shown = format!("hyp/assets/{sha256}");
+        let bytes =
+            fs::read(self.blob_path(sha256)?).with_context(|| format!("cannot read {shown}"))?;
         ensure!(
             hash(&bytes) == sha256,
             "{shown} changed: its content no longer has that sha256"
@@ -1625,11 +2084,9 @@ impl Store {
         atomic(&path, bytes).with_context(|| format!("cannot store {}", path.display()))?;
         Ok(sha256)
     }
-    /// The bytes of a legacy attachment, checked: a regular file (not a
-    /// symlink) inside `hyp/assets/` with the recorded hash. `read_unlocked`
-    /// reports an attachment that fails this, and the schema-3 migration
-    /// reads its bytes through it.
-    fn attachment_bytes(&self, a: &Attachment) -> Result<Vec<u8>> {
+    /// Where a legacy attachment's bytes are, checked by metadata only: a
+    /// regular file (not a symlink) inside `hyp/assets/`.
+    fn attachment_path(&self, a: &Attachment) -> Result<PathBuf> {
         let joined = self.root.join("hyp").join(&a.path);
         let meta = fs::symlink_metadata(&joined)
             .with_context(|| format!("attachment {} does not exist", a.path))?;
@@ -1646,13 +2103,198 @@ impl Store {
             "attachment {} escapes the assets directory",
             a.path
         );
-        let bytes = fs::read(&path)?;
+        Ok(path)
+    }
+    /// The bytes of a legacy attachment, checked: `attachment_path`, and the
+    /// recorded hash. `read_unlocked` reports an attachment that fails this
+    /// (by metadata only, except for `hyp check`), and the schema-3
+    /// migration reads its bytes through it.
+    fn attachment_bytes(&self, a: &Attachment) -> Result<Vec<u8>> {
+        let path = self.attachment_path(a)?;
+        let bytes = fs::read(&path).with_context(|| format!("cannot read {}", path.display()))?;
         ensure!(
             hash(&bytes) == a.sha256,
             "attachment {} does not match its hash",
             a.path
         );
         Ok(bytes)
+    }
+    /// `Verify::Content`, after `read_unlocked`: hashes every stored file
+    /// that the read found in place (by metadata), once per hash, and adds a
+    /// diagnostic for each that is not intact: `ChangedBytes` for content
+    /// that no longer has its hash, `Attachment` for a file that went
+    /// missing or became unreadable since the read. Runs without a lock: hyp
+    /// stores bytes under their hash and never rewrites them in place, so a
+    /// concurrent write cannot change what is hashed; a file removed or
+    /// replaced meanwhile is reported as such.
+    fn hash_stored(&self, snap: &mut Snapshot) {
+        // Records and attachments already reported (missing, unsafe, or a
+        // size that does not match) are not hashed again.
+        let reported: BTreeSet<String> = snap
+            .diagnostics
+            .iter()
+            .filter(|d| matches!(d.code, Code::Attachment | Code::Invalid))
+            .map(|d| d.path.clone())
+            .collect();
+        type Checked = std::result::Result<(), (Code, String)>;
+        let check = |path: &Path, sha256: &str, shown: &str| -> Checked {
+            match hash_file(path) {
+                Err(e) => Err((Code::Attachment, format!("cannot read {shown}: {e}"))),
+                Ok(h) if h != sha256 => Err((
+                    Code::ChangedBytes,
+                    format!("{shown} changed: its content no longer has that sha256"),
+                )),
+                Ok(_) => Ok(()),
+            }
+        };
+        let mut hashed: BTreeMap<String, Checked> = BTreeMap::new();
+        let mut found = Vec::new();
+        for entry in &snap.objects {
+            let r = &entry.record;
+            match &r.data {
+                Data::Captured { sha256, .. }
+                    if crate::data::is_sha256(sha256) && !reported.contains(&Self::path_of(r)) =>
+                {
+                    let result = hashed.entry(sha256.clone()).or_insert_with(|| {
+                        let shown = format!("hyp/assets/{sha256}");
+                        self.blob_len(sha256)
+                            .map_err(|e| (Code::Attachment, format!("{e:#}")))?;
+                        check(&self.root.join("hyp/assets").join(sha256), sha256, &shown)
+                    });
+                    if let Err((code, why)) = result {
+                        found.push((data_diagnostic(r, *code, why), Some(r.id.clone())));
+                    }
+                }
+                Data::Evidence { attachments, .. } => {
+                    for a in attachments.iter().filter(|a| !reported.contains(&a.path)) {
+                        let result = match self.attachment_path(a) {
+                            Err(e) => Err((Code::Attachment, format!("{e:#}"))),
+                            Ok(path) => check(&path, &a.sha256, &a.path),
+                        };
+                        if let Err((code, why)) = result {
+                            found.push((attachment_diagnostic(a, code, &why), None));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if found.is_empty() {
+            return;
+        }
+        for (d, data_id) in found {
+            // No preview of bytes that are not what the record names.
+            if let Some(id) = data_id {
+                snap.previews.remove(&id);
+            }
+            snap.diagnostics.push(d);
+        }
+        // The diagnostics are part of the revision.
+        snap.derive();
+    }
+    /// Hashes the stored bytes that a record this write stores cites and
+    /// did not cite before the write (in `before`): a data reference new to
+    /// the record, or a legacy attachment new to the evidence. Reads check
+    /// stored bytes by metadata only (`Verify::Metadata`), so this is where a
+    /// write that would rely on bytes changed in place is refused. Bytes
+    /// already hashed by this commit (`verified`) are not hashed again.
+    /// Citations a record already had are not re-checked, so a write that
+    /// removes one to broken bytes is not blocked by them.
+    fn verify_cited(
+        &self,
+        before: &Snapshot,
+        after: &Snapshot,
+        writes: &BTreeMap<String, Option<String>>,
+        verified: &mut BTreeSet<String>,
+    ) -> Result<()> {
+        let written = after.objects.iter().filter(|e| {
+            writes
+                .get(&Self::relative(&e.record))
+                .is_some_and(Option::is_some)
+        });
+        for e in written {
+            let old = before.get(&e.record.id).map(|o| &o.record);
+            let id = &e.record.id;
+            for data_id in &e.record.data_refs {
+                if old.is_some_and(|o| o.data_refs.contains(data_id)) {
+                    continue;
+                }
+                // A reference to no data record is `validate`'s to report.
+                let Some(Data::Captured { sha256, .. }) =
+                    after.get(data_id).map(|d| &d.record.data)
+                else {
+                    continue;
+                };
+                if verified.contains(sha256) {
+                    continue;
+                }
+                self.blob(sha256).with_context(|| {
+                    format!(
+                        "{id} would cite data record {data_id}, whose stored bytes are not \
+                         intact; hyp check shows the repair"
+                    )
+                })?;
+                verified.insert(sha256.clone());
+            }
+            if let Data::Evidence { attachments, .. } = &e.record.data {
+                let had = |a: &Attachment| {
+                    old.is_some_and(|o| {
+                        matches!(&o.data, Data::Evidence { attachments: had, .. }
+                            if had.iter().any(|h| h.path == a.path && h.sha256 == a.sha256))
+                    })
+                };
+                for a in attachments.iter().filter(|a| !had(a)) {
+                    self.attachment_bytes(a).with_context(|| {
+                        format!("{id} would cite attachment {}, which is not intact", a.path)
+                    })?;
+                }
+            }
+        }
+        Ok(())
+    }
+    /// Hashes the stored bytes that the records of an assessment's `basis`
+    /// (`Snapshot::basis`, in `after`) cite: their data references and legacy
+    /// attachments. An assessment judges them, and reads check stored bytes
+    /// by metadata only, so this keeps a judgment from being recorded over
+    /// bytes changed in place. Bounded by the basis; judgments are rare.
+    fn verify_basis(
+        &self,
+        after: &Snapshot,
+        basis: &BTreeMap<String, serde_json::Value>,
+        verified: &mut BTreeSet<String>,
+    ) -> Result<()> {
+        for id in basis.keys() {
+            let Some(e) = after.get(id) else { continue };
+            for data_id in &e.record.data_refs {
+                let Some(Data::Captured { sha256, .. }) =
+                    after.get(data_id).map(|d| &d.record.data)
+                else {
+                    continue;
+                };
+                if verified.contains(sha256) {
+                    continue;
+                }
+                self.blob(sha256).with_context(|| {
+                    format!(
+                        "cannot assess: {id}, in the basis, cites data record {data_id}, whose \
+                         stored bytes are not intact; hyp check shows the repair"
+                    )
+                })?;
+                verified.insert(sha256.clone());
+            }
+            if let Data::Evidence { attachments, .. } = &e.record.data {
+                for a in attachments {
+                    self.attachment_bytes(a).with_context(|| {
+                        format!(
+                            "cannot assess: {id}, in the basis, has attachment {}, which is \
+                             not intact; hyp check shows the repair",
+                            a.path
+                        )
+                    })?;
+                }
+            }
+        }
+        Ok(())
     }
     /// decision-0005: every evidence attachment in `after` becomes a data
     /// record, as the write raises the notebook to `DATA_SCHEMA` (or, at it,
@@ -2007,6 +2649,75 @@ pub fn read_capped(reader: impl std::io::Read, what: &str) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
 
+    /// HYPO-0004: a commit reads the notebook fully twice, before and after
+    /// writing; its last-moment check for files changed meanwhile only
+    /// hashes the record files.
+    #[test]
+    fn a_commit_reads_the_notebook_fully_twice() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::init(dir.path()).unwrap();
+        let hypothesis = || {
+            Record::new(
+                "A claim",
+                Data::Hypothesis {
+                    scope: String::new(),
+                    assumptions: String::new(),
+                    lifecycle: Lifecycle::Draft,
+                    untestable_reason: String::new(),
+                },
+            )
+        };
+        let create = |r: Record| Change::Create {
+            record: r,
+            expected: None,
+        };
+        store.commit(vec![create(hypothesis())], None).unwrap();
+        FULL_READS.with(|n| n.set(0));
+        store.commit(vec![create(hypothesis())], None).unwrap();
+        assert_eq!(FULL_READS.with(std::cell::Cell::get), 2);
+    }
+    /// `hyp check` hashes stored bytes after letting go of its lock: a file
+    /// that went missing between the read and the hashing is reported as
+    /// missing (blocking writes), one changed meanwhile as changed.
+    #[test]
+    fn bytes_hashed_after_the_read_are_reported_as_they_are_then() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::init(dir.path()).unwrap();
+        let capture = |bytes: &[u8]| {
+            store
+                .capture(Capture {
+                    bytes: bytes.to_vec(),
+                    title: "Log".into(),
+                    origin: "here".into(),
+                    media_type: None,
+                    name: None,
+                    note: String::new(),
+                    allow_empty: false,
+                })
+                .unwrap();
+            store.root.join("hyp/assets").join(hash(bytes))
+        };
+        let (gone, changed) = (capture(b"first"), capture(b"other"));
+        let (mut snap, _) = store.read_unlocked().unwrap();
+        let revision = snap.revision.clone();
+        fs::remove_file(&gone).unwrap();
+        fs::write(&changed, "OTHER").unwrap();
+        store.hash_stored(&mut snap);
+        let codes: Vec<Code> = snap.diagnostics.iter().map(|d| d.code).collect();
+        assert!(codes.contains(&Code::Attachment), "{codes:?}");
+        assert!(codes.contains(&Code::ChangedBytes), "{codes:?}");
+        let missing = snap
+            .diagnostics
+            .iter()
+            .find(|d| d.code == Code::Attachment)
+            .unwrap();
+        assert!(missing.message.contains("missing"), "{}", missing.message);
+        assert!(missing.blocks_writes);
+        assert_ne!(
+            snap.revision, revision,
+            "the revision covers the diagnostics"
+        );
+    }
     fn config(schema_version: u32) -> Config {
         Config {
             schema_version,

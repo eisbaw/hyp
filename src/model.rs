@@ -438,6 +438,7 @@ impl Entry {
 values!(Code {
     Malformed => "malformed",
     Attachment => "attachment",
+    ChangedBytes => "changed_bytes",
     Invalid => "invalid",
     DanglingReference => "dangling_reference",
     Cycle => "cycle",
@@ -453,12 +454,19 @@ impl Code {
     }
     /// Whether this problem blocks every write. hyp cannot load a malformed
     /// file (it may hold a record other records depend on) and cannot trust
-    /// stored bytes that are missing or changed (`attachment`: a data
-    /// record's or a legacy attachment's); an invalid record breaks rules of its own fields,
+    /// stored bytes that are missing or changed as every read sees it
+    /// (`attachment`: a data record's or a legacy attachment's, missing, not
+    /// a regular file, or of another length); an invalid record breaks rules of its own fields,
     /// including naming a record by a short ID or one of the wrong kind (the
     /// ID prefix gives the kind). The other errors are between loaded
     /// records, as a merge, sync or hand edit leaves them; writes that add no
     /// new error may repair them (see `Store::commit_written`).
+    /// `changed_bytes` (stored bytes changed in place to bytes of the same
+    /// length) is found only by `hyp check`, which hashes them; ordinary
+    /// reads, and so writes, do not see it. It blocks only writes that newly
+    /// cite those bytes and assessments whose basis holds them
+    /// (`Store::verify_cited`, `Store::verify_basis`), so it does not claim
+    /// to block every write.
     pub fn blocks_writes(self) -> bool {
         matches!(self, Self::Malformed | Self::Attachment | Self::Invalid)
     }

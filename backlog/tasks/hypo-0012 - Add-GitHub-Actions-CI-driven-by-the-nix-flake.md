@@ -4,7 +4,7 @@ title: Add GitHub Actions CI driven by the nix flake
 status: To Do
 assignee: []
 created_date: '2026-09-29 22:16'
-updated_date: '2026-09-29 22:40'
+updated_date: '2026-10-01 01:41'
 labels:
   - tooling
   - ci
@@ -34,4 +34,6 @@ Do not push to GitHub or enable the workflow on a remote without explicit approv
 
 <!-- SECTION:NOTES:BEGIN -->
 Forward-carried from HYPO-0011: nix flake check -L now includes checks.<system>.e2e-dom (jsdom UI test against the packaged binary), so CI running nix flake check covers the same DOM test as just e2e. npm tarballs are fetched as fixed-output derivations from the committed scripts/package-lock.json (importNpmLock); CI needs registry.npmjs.org reachable or a cache that has them.
+
+From the HYPO-0004 QA: tests/reads.rs contains wall-clock-bound concurrency tests (starvation < 5 s debug, atomicity races); 5 clean runs locally, but they may flake on slow or busy CI runners. Consider a CI-specific timeout multiplier env var or running them in a separate, retried job.
 <!-- SECTION:NOTES:END -->
