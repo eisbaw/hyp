@@ -489,7 +489,7 @@ pub enum Command {
         output: Option<PathBuf>,
     },
 }
-/// The long help of `hyp apply`: enough to write a batch without the README.
+/// The long help of `hyp apply`: enough to write a batch without docs/usage.md.
 const APPLY_HELP: &str = r#"Changes:
   {"op": "create",  "record": RECORD}
   {"op": "patch",   "id": ID, "expected_revision": REV, "set": {FIELD: VALUE}}
