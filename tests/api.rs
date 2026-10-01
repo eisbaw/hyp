@@ -411,3 +411,24 @@ async fn data_is_previewed_as_json_text_and_its_bytes_are_never_served() {
         assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
     }
 }
+/// The page and the HTML export show this hyp's version in the header, as
+/// the crate states it, not a number written into web/index.html.
+#[tokio::test]
+async fn the_page_and_the_export_show_the_crate_version() {
+    let (_dir, app, store) = app();
+    let response = app
+        .oneshot(req("GET", "/", serde_json::Value::Null))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let page = String::from_utf8(body.to_vec()).unwrap();
+    let export = hyp::web::export_html(&store.snapshot().unwrap()).unwrap();
+    let shown = format!(
+        "<span class=\"version\"> / {}</span>",
+        env!("CARGO_PKG_VERSION")
+    );
+    for (name, html) in [("served page", &page), ("HTML export", &export)] {
+        assert!(html.contains(&shown), "{name} lacks {shown}");
+    }
+}

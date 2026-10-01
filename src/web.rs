@@ -80,8 +80,15 @@ async fn guard(
     headers.insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
     response
 }
-async fn index() -> Html<&'static str> {
-    Html(include_str!("../web/index.html"))
+/// Where web/index.html shows the version; `index_html` fills it in.
+const VERSION_SLOT: &str = "{{HYP_VERSION}}";
+/// web/index.html with this hyp's version in its header: the page served at
+/// `/` and the base of the HTML export, so neither states a stale version.
+fn index_html() -> String {
+    include_str!("../web/index.html").replace(VERSION_SLOT, env!("CARGO_PKG_VERSION"))
+}
+async fn index() -> Html<String> {
+    Html(index_html())
 }
 async fn css() -> impl IntoResponse {
     (
@@ -270,7 +277,7 @@ pub fn export_html(s: &Snapshot) -> Result<String> {
         .replace('<', "\\u003c")
         .replace('>', "\\u003e")
         .replace('&', "\\u0026");
-    Ok(include_str!("../web/index.html")
+    Ok(index_html()
         .replace(
             "<link rel=\"stylesheet\" href=\"/style.css\" />",
             &format!("<style>{}</style>", include_str!("../web/style.css")),
