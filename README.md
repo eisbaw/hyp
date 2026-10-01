@@ -305,7 +305,7 @@ hyp export --format html --output notebook.html
 hyp graph --focus H-… > graph.mmd
 ```
 
-The HTML export embeds the current dataset and all assets and is an offline, read-only copy of the WebUI. It contains sources, notes and observations; share it deliberately. The graph command emits Mermaid source. Exported reports do not embed the stored bytes of data records; the JSON and HTML exports include the text previews the WebUI shows (`previews`, the first 4 KiB of each `text/*` data record).
+The HTML export embeds the current dataset and all assets and is an offline, read-only copy of the WebUI. It contains sources, notes and observations; share it deliberately. The graph command emits Mermaid source. Exported reports do not embed the stored bytes of data records; the JSON and HTML exports include the text previews the WebUI shows (`previews`, the first 4 KiB of each `text/*` data record). They also carry `unexplained_observations`: the IDs of the observations no live hypothesis accounts for, in project order, the same set `hyp --json status` lists under that name as `{"id", "title"}` objects (the export has the titles in `objects`). Like `bearings` and `previews` it is derived on read and not part of `revision`.
 
 ## Development
 

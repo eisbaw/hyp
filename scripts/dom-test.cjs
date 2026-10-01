@@ -420,7 +420,9 @@ async function recoversWithoutEvents(w, answer, shown) {
  * events are dropped meanwhile, so no later read hides the effect. */
 async function olderReadAfterSave(w) {
   const real = w.fetch;
-  let release, held = 0;
+  let release,
+    held = 0,
+    consumed = 0;
   const gate = new Promise((r) => (release = r));
   w.fetch = async (u, o) => {
     if (!String(u).includes("/api/snapshot")) return real(u, o);
@@ -428,7 +430,14 @@ async function olderReadAfterSave(w) {
     const body = await res.text();
     held += 1;
     await gate;
-    return new Response(body, { status: res.status });
+    const answer = new Response(body, { status: res.status });
+    const json = answer.json.bind(answer);
+    answer.json = async () => {
+      const value = await json();
+      consumed += 1;
+      return value;
+    };
+    return answer;
   };
   try {
     cli("add", "Write whose read is held back");
@@ -443,9 +452,53 @@ async function olderReadAfterSave(w) {
       "saved record shown",
     );
     release();
-    // The held answer is delivered now; give the page time to take it.
-    await new Promise((r) => setTimeout(r, 300));
+    // The page has decoded every held answer; one more task lets it act.
+    await wait(() => consumed === held, "held answers taken by the page");
+    await new Promise((r) => setTimeout(r, 0));
     assert.equal(h1(w), "Saved while an older read was on its way");
+  } finally {
+    w.fetch = real;
+    release();
+    muted = false;
+  }
+}
+/** A read issued while a save is on its way may carry newer state (here a
+ * CLI write to the saved record): the save's answer must not replace it
+ * (`write` in app.js). The save's answer is held until a read has returned
+ * the newer state; events are then dropped, so no later read can hide what
+ * the page did with the save's answer. */
+async function newerReadDuringSave(w) {
+  const real = w.fetch;
+  const renamed = "Renamed while the save was answered";
+  let release,
+    held = 0,
+    newer = 0;
+  const gate = new Promise((r) => (release = r));
+  w.fetch = async (u, o) => {
+    if (String(u).includes("/api/snapshot")) {
+      const res = await real(u, o);
+      const body = await res.text();
+      if (body.includes(renamed)) newer += 1;
+      return new Response(body, { status: res.status });
+    }
+    if (!String(u).includes("/api/transaction")) return real(u, o);
+    const res = await real(u, o);
+    const body = await res.text();
+    held += 1;
+    await gate;
+    return new Response(body, { status: res.status });
+  };
+  try {
+    click(w, "#new");
+    field(w, "title", "Saved before a newer write");
+    click(w, 'button[type="submit"]');
+    await wait(() => held > 0, "the save's answer held back");
+    const saved = demo("hypothesis", "Saved before a newer write");
+    cli("set", saved.id, "--title", renamed);
+    await wait(() => newer > 0, "a read returned the newer state");
+    muted = true;
+    release();
+    await wait(() => h1(w) === renamed, "the newer state wins over the save's answer");
   } finally {
     w.fetch = real;
     release();
@@ -956,6 +1009,7 @@ async function main() {
     "briefly invalid",
   );
   await olderReadAfterSave(w);
+  await newerReadDuringSave(w);
   const hypDir = path.join(root, "hyp");
   fs.renameSync(hypDir, hypDir + ".moved");
   await wait(
@@ -988,7 +1042,7 @@ async function main() {
   );
   assert.deepEqual(errors, []);
   console.log(
-    "PASS: relationships named from both ends, runs on the hypothesis page, frozen targets marked when changed, record status/outcome/roles/direction, evidence card interpretations, interpretation ends fixed, unexplained observations and bears-on, hypothesis created from an observation in one write, long titles wrap while controls do not, unknown observation time kept on edit, DOM forms, real HTTP writes, CLI↔UI SSE updates, editor changes, two tabs, dirty-form preservation, conflicts by status, saves despite unrelated writes, stale assessment rejected, evidence required and linked-only, criteria, evidence interpretations, criterion-meeting evidence counted against, falsification assessment, experiment and run, all views, captured data with escaped text previews, malformed-file recovery, saves and CLI repair despite a dangling link, unavailable-project cause, recovery when an event is lost, an older read not replacing a save, and offline export.",
+    "PASS: relationships named from both ends, runs on the hypothesis page, frozen targets marked when changed, record status/outcome/roles/direction, evidence card interpretations, interpretation ends fixed, unexplained observations and bears-on, hypothesis created from an observation in one write, long titles wrap while controls do not, unknown observation time kept on edit, DOM forms, real HTTP writes, CLI↔UI SSE updates, editor changes, two tabs, dirty-form preservation, conflicts by status, saves despite unrelated writes, stale assessment rejected, evidence required and linked-only, criteria, evidence interpretations, criterion-meeting evidence counted against, falsification assessment, experiment and run, all views, captured data with escaped text previews, malformed-file recovery, saves and CLI repair despite a dangling link, unavailable-project cause, recovery when an event is lost, an older read not replacing a save nor a save a newer read, and offline export.",
   );
 }
 main()

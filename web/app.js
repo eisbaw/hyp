@@ -204,6 +204,16 @@ function adopt(next) {
   reads += 1;
   snapshot = next;
 }
+/** Sends `changes` and takes the answer as the page's state, unless a read
+ * was issued while the write was on its way: that read may carry newer
+ * state (another writer's change announced meanwhile), so the page reads
+ * again instead of going back to the write's answer. */
+async function write(changes) {
+  const sent = ++reads;
+  const next = await transact(changes);
+  if (sent === reads) adopt(next);
+  else refresh();
+}
 async function refresh() {
   if (readOnly) return;
   // Reads overlap (server events, retries, closing the editor); an older
@@ -550,20 +560,31 @@ function frozenFields(body) {
   if (!r || typeof r !== "object")
     return `<pre class="raw">${esc(body)}</pre>`;
   const skip = ["id", "kind", "archived", "created_at", "updated_at"];
+  const blank = (v) =>
+    v == null || v === "" || (Array.isArray(v) && !v.length);
+  // Lists of plain values joined; anything holding objects as JSON.
+  const text = (v) =>
+    typeof v !== "object"
+      ? String(v)
+      : Array.isArray(v) && v.every((x) => typeof x !== "object" || x === null)
+        ? v.join(", ")
+        : JSON.stringify(v);
   return Object.entries(r)
-    .filter(([k, v]) => !skip.includes(k) && v !== "" && !(Array.isArray(v) && !v.length))
+    .filter(([k, v]) => !skip.includes(k) && !blank(v))
     .map(
       ([k, v]) =>
-        `<div class="meta-line"><span>${esc(human(k))}</span><strong class="notes">${esc(Array.isArray(v) ? v.join(", ") : v)}</strong></div>`,
+        `<div class="meta-line"><span>${esc(human(k))}</span><strong class="notes">${esc(text(v))}</strong></div>`,
     )
     .join("");
 }
-/** A run's plan: the experiment as it was when the run was recorded. */
+/** A run's plan: the experiment as it was when the run was recorded. Its
+ * frozen body is the encoded Markdown record (front matter and procedure,
+ * `Store::commit`), shown as that text: the page has no front-matter parser. */
 function planSection(run) {
   const p = run.plan || {};
   const now = find(p.id);
   const changed = !now || now.revision !== p.revision;
-  return `<section class="section" data-section="plan" data-changed="${changed}"><div class="section-head"><h2>Frozen plan</h2></div><p class="small">${changed ? "The experiment has changed since this run; this is the plan as it ran." : "The experiment is unchanged since this run."} Revision ${esc((p.revision || "").slice(0, 12))}.</p><details><summary class="small">${esc(p.title)}</summary>${frozenFields(p.body)}</details></section>`;
+  return `<section class="section" data-section="plan" data-changed="${changed}"><div class="section-head"><h2>Frozen plan</h2></div><p class="small">${changed ? "The experiment has changed since this run; this is the plan as it ran." : "The experiment is unchanged since this run."} Revision ${esc((p.revision || "").slice(0, 12))}.</p><details><summary class="small">${esc(p.title)}</summary><pre class="raw">${esc(p.body)}</pre></details></section>`;
 }
 /** A link's direction: from, relation, to. */
 function directionPanel(r) {
@@ -1296,7 +1317,7 @@ async function save(ev) {
           fd.get("reason") || EXPLAINS_REASON,
         ),
       });
-    adopt(await transact(changes));
+    await write(changes);
     dirty = false;
     pending = false;
     $("#editor").close();
@@ -1345,16 +1366,14 @@ async function action(e) {
   )
     return;
   try {
-    adopt(
-      await transact([
-        {
-          op: action === "delete" ? "delete" : "archive",
-          id,
-          expected_revision: entry.revision,
-          ...(action === "delete" ? {} : { archived: action === "archive" }),
-        },
-      ]),
-    );
+    await write([
+      {
+        op: action === "delete" ? "delete" : "archive",
+        id,
+        expected_revision: entry.revision,
+        ...(action === "delete" ? {} : { archived: action === "archive" }),
+      },
+    ]);
     toast(
       action === "restore"
         ? "Restored"

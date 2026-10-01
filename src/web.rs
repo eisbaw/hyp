@@ -107,7 +107,9 @@ const UNAVAILABLE: &str = "unavailable";
 /// published, the poll that then saw the project as before announced
 /// nothing, and that client kept showing the failure. A read that publishes
 /// an older revision than a concurrent one is corrected by the monitor's
-/// next poll.
+/// next poll. Clients treat an event only as a trigger to read
+/// `/api/snapshot` again and never use the revision it carries, so a
+/// briefly stale value in an event is harmless.
 fn announce(events: &watch::Sender<String>, seen: &str) {
     events.send_if_modified(|last| {
         let changed = last != seen;
