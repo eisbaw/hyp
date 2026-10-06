@@ -161,8 +161,10 @@ fn edit_during_concurrent_write(project: &Path, id: &str, concurrent: &str) -> O
     let editor = project.join("editor.sh");
     std::fs::write(
         &editor,
-        "#!/bin/sh\nset -e\n\"$HYP_BIN\" --project \"$HYP_PROJECT\" $HYP_CONCURRENT >/dev/null\n\
-         sed -i 's/^title: .*/title: Edited in editor/' \"$1\"\n",
+        format!(
+            "#!/bin/sh\nset -e\n\"$HYP_BIN\" --project \"$HYP_PROJECT\" $HYP_CONCURRENT >/dev/null\n{}\n",
+            sed_in_place("s/^title: .*/title: Edited in editor/")
+        ),
     )
     .unwrap();
     std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -444,14 +446,12 @@ fn mode(path: impl AsRef<Path>) -> u32 {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path).unwrap().permissions().mode() & 0o777
 }
-/// This process's umask, read without changing it.
+/// This process's umask, read without changing it: a child inherits it, and
+/// setting it to read it back would race with other tests' threads.
 fn umask() -> u32 {
-    let status = read("/proc/self/status");
-    let line = status
-        .lines()
-        .find_map(|l| l.strip_prefix("Umask:"))
-        .unwrap();
-    u32::from_str_radix(line.trim(), 8).unwrap()
+    let out = Command::new("sh").args(["-c", "umask"]).output().unwrap();
+    assert!(out.status.success(), "sh -c umask: {}", stderr_of(&out));
+    u32::from_str_radix(stdout_of(&out).trim(), 8).unwrap()
 }
 fn fails(project: &Path, args: &[&str], message: &str) {
     let out = run(project, args);
@@ -2368,14 +2368,19 @@ fn pty() -> (std::fs::File, std::fs::File) {
     };
     let master = open("/dev/ptmx");
     let fd = master.as_raw_fd();
-    let mut name = [0 as libc::c_char; 128];
-    // SAFETY: libc calls on a descriptor `master` owns; ptsname_r writes a
-    // NUL-terminated name into the buffer on success.
+    // ptsname returns a static buffer, so calls are serialized; ptsname_r
+    // would not need that, but macOS's libc does not offer it.
+    static PTSNAME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // SAFETY: libc calls on a descriptor `master` owns; ptsname's result is
+    // NUL-terminated and stays valid until the next ptsname call, which the
+    // lock defers until it has been copied.
     let path = unsafe {
+        let _guard = PTSNAME.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(libc::grantpt(fd), 0, "grantpt");
         assert_eq!(libc::unlockpt(fd), 0, "unlockpt");
-        assert_eq!(libc::ptsname_r(fd, name.as_mut_ptr(), name.len()), 0);
-        std::ffi::CStr::from_ptr(name.as_ptr())
+        let name = libc::ptsname(fd);
+        assert!(!name.is_null(), "ptsname");
+        std::ffi::CStr::from_ptr(name)
             .to_string_lossy()
             .into_owned()
     };
@@ -2410,7 +2415,8 @@ fn on_terminal(mut command: Command, input: Option<&str>) -> (Output, String) {
     drop(command);
     drop(slave);
     // Once no process holds the slave, reading the master drains what is
-    // buffered and then fails (EIO on Linux), which ends the reader.
+    // buffered and then fails (EIO on Linux) or ends (EOF on macOS), either
+    // of which ends the reader.
     let (sender, chunks) = mpsc::channel();
     let mut reader = master.try_clone().unwrap();
     std::thread::spawn(move || {
@@ -2478,6 +2484,13 @@ fn writes_summarise_on_a_terminal_and_hint_at_stdin() {
     assert_eq!(record(p, &new)["title"], "Typed claim");
 }
 
+/// A shell command editing the file `$1` with sed `script`, written back into
+/// the same file, which keeps its inode and mode. Not `sed -i`: BSD sed
+/// (macOS) spells that differently.
+fn sed_in_place(script: &str) -> String {
+    assert!(!script.contains('\''), "single-quoted below: {script}");
+    format!("sed '{script}' \"$1\" >\"$1.new\" && cat \"$1.new\" >\"$1\" && rm \"$1.new\"")
+}
 /// An editor for `hyp edit` tests: `$DIR/round-N.sh FILE` edits the file the
 /// N-th time it opens (a missing script saves it unchanged); it logs a copy
 /// of what it was shown as `$DIR/seen-N.md`.
@@ -2541,8 +2554,8 @@ fn edit_reopens_with_the_error_and_keeps_the_users_text() {
     let editor = scripted_editor(
         dir,
         &[
-            "sed -i 's/^title: .*/title: Kept edit/; s/^scope: .*/scope: [unclosed/' \"$1\"",
-            "sed -i 's/^scope: .*/scope: Fixed/' \"$1\"",
+            &sed_in_place("s/^title: .*/title: Kept edit/; s/^scope: .*/scope: [unclosed/"),
+            &sed_in_place("s/^scope: .*/scope: Fixed/"),
         ],
     );
     let (out, stderr) = edit_with(p, &editor, &h, dir, true);
@@ -2583,7 +2596,9 @@ fn edit_aborts_keeping_the_text_when_the_reopened_file_is_saved_unchanged() {
     let dir = scratch.path();
     let editor = scripted_editor(
         dir,
-        &["sed -i 's/^title: .*/title: Precious/; s/^kind: .*/kind: prediction/' \"$1\""],
+        &[&sed_in_place(
+            "s/^title: .*/title: Precious/; s/^kind: .*/kind: prediction/",
+        )],
     );
     let (out, stderr) = edit_with(p, &editor, &h, dir, true);
     assert_eq!(out.status.code(), Some(1), "{stderr}");

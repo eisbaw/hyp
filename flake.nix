@@ -3,7 +3,9 @@
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
   outputs = { self, nixpkgs }:
     let
-      systems = [ "x86_64-linux" "aarch64-linux" ];
+      # Nixpkgs 26.05 is the last release supporting x86_64-darwin: drop it
+      # here when updating past that.
+      systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
       eachSystem = nixpkgs.lib.genAttrs systems;
       # node_modules for scripts/*.cjs, built from the committed scripts/package-lock.json.
       # Shared by the dev shell (NODE_PATH) and checks.e2e-dom, so both run the same jsdom.
@@ -88,14 +90,15 @@
             installPhase = "mkdir -p $out";
           });
           # jsdom UI test against the packaged binary and a real server on loopback.
-          e2e-dom = pkgs.runCommand "hyp-e2e-dom" { nativeBuildInputs = [ pkgs.nodejs pkgs.bash ]; } ''
+          # Both e2e checks serve on loopback, which the Darwin sandbox allows only when asked.
+          e2e-dom = pkgs.runCommand "hyp-e2e-dom" { nativeBuildInputs = [ pkgs.nodejs pkgs.bash ]; __darwinAllowLocalNetworking = true; } ''
             export HYP_BIN=${self.packages.${system}.default}/bin/hyp
             export NODE_PATH=${jsTestDeps pkgs}/node_modules
             node ${./scripts/dom-test.cjs}
             touch $out
           '';
           # Playwright test in headless Chromium, as `just browser-test` runs it.
-          e2e-browser = pkgs.runCommand "hyp-e2e-browser" ({ nativeBuildInputs = [ pkgs.nodejs ]; } // playwrightEnv pkgs) ''
+          e2e-browser = pkgs.runCommand "hyp-e2e-browser" ({ nativeBuildInputs = [ pkgs.nodejs ]; __darwinAllowLocalNetworking = true; } // playwrightEnv pkgs) ''
             export HOME=$TMPDIR
             # The sandbox has no /etc/fonts; without fonts Chromium aborts.
             export FONTCONFIG_FILE=${pkgs.makeFontsConf { fontDirectories = [ pkgs.dejavu_fonts ]; }}

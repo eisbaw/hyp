@@ -21,7 +21,7 @@ nix flake check                # package tests, formatting, clippy, the jsdom an
 nix run . -- --help
 ```
 
-The flake pins nixpkgs and supports `x86_64-linux` and `aarch64-linux`. All Cargo dependencies are pinned in `Cargo.lock`. A first build requires network access or a populated Nix cache; the installed application works offline.
+The flake pins nixpkgs and supports `x86_64-linux`, `aarch64-linux`, `x86_64-darwin` and `aarch64-darwin`. All Cargo dependencies are pinned in `Cargo.lock`. A first build requires network access or a populated Nix cache; the installed application works offline.
 
 Or build directly with a recent Rust toolchain:
 
