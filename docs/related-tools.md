@@ -144,7 +144,7 @@ This is the method behind hyp's evidence matrix: weigh every observation against
 
 ## Where hyp is weaker overall
 
-- Young (0.x, no tagged releases), and tested on x86_64 Linux only.
+- Young (0.x, no tagged releases). CI tests x86_64 Linux and macOS (Apple Silicon and Intel); aarch64 Linux and Windows are untested.
 - Local and single-worktree: it handles concurrent processes and browser tabs, but has no networked multi-user editing and no access control.
 - No rule that someone other than the author must review a judgment (RigorGraph).
 - No quantitative fields on predictions (Kliewer's popper).

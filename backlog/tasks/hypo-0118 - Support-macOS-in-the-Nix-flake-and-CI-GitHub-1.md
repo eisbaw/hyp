@@ -5,7 +5,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-10-06 13:02'
-updated_date: '2026-10-06 14:06'
+updated_date: '2026-10-07 00:45'
 labels:
   - github
   - portability
@@ -41,11 +41,11 @@ Triage note (not part of the issue): current master has two more GNU `sed -i` us
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 flake.nix exposes packages, apps, devShells and checks for x86_64-darwin and aarch64-darwin
+- [x] #1 flake.nix exposes packages, apps, devShells and checks for x86_64-darwin and aarch64-darwin
 - [x] #2 umask test reads the umask without /proc/self/status
 - [x] #3 No test script relies on GNU-only sed -i
 - [x] #4 Path assertions in tests/reads.rs pass when the temp dir is behind a symlink (/var -> /private/var)
-- [ ] #5 PTY tests work on Linux and macOS without ptsname_r (absent for Apple in the libc crate), keeping the descriptors close-on-exec from the moment they are opened
+- [x] #5 PTY tests work on Linux and macOS without ptsname_r (absent for Apple in the libc crate), keeping the descriptors close-on-exec from the moment they are opened
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -69,3 +69,22 @@ Triage note (not part of the issue): current master has two more GNU `sed -i` us
 - QA follow-up: e2e-dom and e2e-browser set __darwinAllowLocalNetworking, since both serve on loopback.
 - AC #1 and #5 stay open until the macOS CI jobs pass.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+hyp builds and passes all its tests on macOS (Apple Silicon and Intel) in CI: GitHub #1, PR #2.
+
+Changes:
+- flake.nix: x86_64-darwin and aarch64-darwin outputs; a `browser-test` app runs the Playwright test against the packaged hyp; the e2e-browser check wraps it on non-Darwin systems only.
+- Tests: portable sed, umask via `sh -c umask`, ptsname under a lock (no ptsname_r on Apple), a canonical-path assertion (/var is /private/var).
+- CI: nix flake check on ubuntu-latest, macos-15 and macos-15-intel; on macOS also `nix run .#browser-test` and `nix develop -c just build`.
+
+Why no e2e-browser check on macOS: Chromium traps in libxpc (xpc_connection_set_target_uid, via AppKit) when run as a Nix build user. Found with diagnostic CI runs and macOS crash reports; the evidence is in the hyp notebook.
+
+Tests: CI run 37549940819 is green on all three runners, including the PTY terminal tests and both UI tests on macOS.
+
+Risks and follow-ups:
+- x86_64-darwin depends on end-of-line tooling (nixpkgs 26.05, the Determinate installer's Intel fallback): HYPO-0119.
+- VALIDATION.md is stale on the browser test: HYPO-0120.
+<!-- SECTION:FINAL_SUMMARY:END -->
