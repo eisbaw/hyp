@@ -17,7 +17,7 @@ Omit `--demo` for an empty notebook. `init` creates a `hyp/` data directory and 
 
 ```bash
 nix build                      # result/bin/hyp
-nix flake check                # package tests, formatting, clippy, the jsdom and browser UI tests
+nix flake check                # package tests, formatting, clippy, the jsdom and (not on macOS) browser UI tests
 nix run . -- --help
 ```
 

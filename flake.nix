@@ -35,6 +35,20 @@
         PLAYWRIGHT_BROWSERS_PATH = "${playwrightBrowsers pkgs}";
         PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS = "true";
       };
+      # scripts/browser-test.cjs against the packaged hyp: run by the
+      # e2e-browser check, and by `nix run .#browser-test` where that check
+      # does not exist (macOS, see checks).
+      browserTest = system:
+        let pkgs = import nixpkgs { inherit system; };
+        in pkgs.writeShellApplication {
+          name = "hyp-browser-test";
+          runtimeInputs = [ pkgs.nodejs ];
+          runtimeEnv = {
+            HYP_BIN = "${self.packages.${system}.default}/bin/hyp";
+            NODE_PATH = "${jsTestDeps pkgs}/node_modules";
+          } // playwrightEnv pkgs;
+          text = "exec node ${./scripts/browser-test.cjs}";
+        };
     in {
       packages = eachSystem (system:
         let pkgs = import nixpkgs { inherit system; };
@@ -58,6 +72,7 @@
         });
       apps = eachSystem (system: {
         default = { type = "app"; program = "${self.packages.${system}.default}/bin/hyp"; meta.description = "Hypothesis notebook CLI and live WebUI"; };
+        browser-test = { type = "app"; program = "${browserTest system}/bin/hyp-browser-test"; meta.description = "Playwright UI test of the packaged hyp in headless Chromium"; };
       });
       devShells = eachSystem (system:
         let pkgs = import nixpkgs { inherit system; };
@@ -69,7 +84,16 @@
           } // playwrightEnv pkgs);
         });
       checks = eachSystem (system:
-        let pkgs = import nixpkgs { inherit system; };
+        let
+          pkgs = import nixpkgs { inherit system; };
+          # Playwright test in headless Chromium, as `just browser-test` runs it.
+          e2eBrowser = pkgs.runCommand "hyp-e2e-browser" { } ''
+            export HOME=$TMPDIR
+            # The sandbox has no /etc/fonts; without fonts Chromium aborts.
+            export FONTCONFIG_FILE=${pkgs.makeFontsConf { fontDirectories = [ pkgs.dejavu_fonts ]; }}
+            ${browserTest system}/bin/hyp-browser-test
+            touch $out
+          '';
         in {
           package = self.packages.${system}.default;
           formatting = pkgs.runCommand "hyp-formatting" { nativeBuildInputs = [ pkgs.rustfmt ]; } ''
@@ -89,24 +113,19 @@
             doCheck = false;
             installPhase = "mkdir -p $out";
           });
-          # jsdom UI test against the packaged binary and a real server on loopback.
-          # Both e2e checks serve on loopback, which the Darwin sandbox allows only when asked.
+          # jsdom UI test against the packaged binary and a real server on
+          # loopback, which the Darwin sandbox allows only when asked.
           e2e-dom = pkgs.runCommand "hyp-e2e-dom" { nativeBuildInputs = [ pkgs.nodejs pkgs.bash ]; __darwinAllowLocalNetworking = true; } ''
             export HYP_BIN=${self.packages.${system}.default}/bin/hyp
             export NODE_PATH=${jsTestDeps pkgs}/node_modules
             node ${./scripts/dom-test.cjs}
             touch $out
           '';
-          # Playwright test in headless Chromium, as `just browser-test` runs it.
-          e2e-browser = pkgs.runCommand "hyp-e2e-browser" ({ nativeBuildInputs = [ pkgs.nodejs ]; __darwinAllowLocalNetworking = true; } // playwrightEnv pkgs) ''
-            export HOME=$TMPDIR
-            # The sandbox has no /etc/fonts; without fonts Chromium aborts.
-            export FONTCONFIG_FILE=${pkgs.makeFontsConf { fontDirectories = [ pkgs.dejavu_fonts ]; }}
-            export HYP_BIN=${self.packages.${system}.default}/bin/hyp
-            export NODE_PATH=${jsTestDeps pkgs}/node_modules
-            node ${./scripts/browser-test.cjs}
-            touch $out
-          '';
+        } // pkgs.lib.optionalAttrs (!pkgs.stdenv.hostPlatform.isDarwin) {
+          # Not on macOS: there, Chromium run as a Nix build user (_nixbld)
+          # traps in libxpc (xpc_connection_set_target_uid, called by AppKit),
+          # in or out of Nix. CI runs `nix run .#browser-test` on macOS instead.
+          e2e-browser = e2eBrowser;
         });
       formatter = eachSystem (system: nixpkgs.legacyPackages.${system}.nixfmt);
     };

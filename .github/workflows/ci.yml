@@ -1,7 +1,8 @@
-# Thin wrapper: all checks live in the flake (`nix flake check`), so CI and a
+# Thin wrapper: the checks live in the flake (`nix flake check`), so CI and a
 # developer run the same thing, on Linux and on macOS (Apple Silicon and
-# Intel). aarch64-linux is not built here. macos-15-intel is GitHub's last
-# Intel image, and nixpkgs 26.05 the last release for x86_64-darwin.
+# Intel), except the browser test on macOS (see e2e-browser in flake.nix).
+# aarch64-linux is not built here. macos-15-intel is GitHub's last Intel
+# image, and nixpkgs 26.05 the last release for x86_64-darwin.
 name: CI
 
 on:
@@ -38,3 +39,10 @@ jobs:
           use-flakehub: disabled
           diagnostic-endpoint: ""
       - run: nix flake check -L
+      # macOS has no e2e-browser check (see flake.nix): the same test of the
+      # packaged hyp runs as the runner user. Reported even if the checks fail.
+      - if: ${{ !cancelled() && runner.os == 'macOS' }}
+        run: nix run .#browser-test
+      # nix flake check only evaluates the dev shell; this builds hyp in it.
+      - if: ${{ !cancelled() && runner.os == 'macOS' }}
+        run: nix develop -c just build
