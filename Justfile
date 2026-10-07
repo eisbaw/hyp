@@ -79,7 +79,7 @@ fmt-check:
 lint:
     cargo clippy --locked --all-targets -- -D warnings
 
-# Run every flake check (package tests, clippy, formatting, e2e-dom, e2e-browser) on the Git-tracked tree.
+# Run every flake check (package tests, clippy, formatting, e2e-dom, and e2e-browser except on macOS) on the Git-tracked tree.
 [group('quality')]
 check:
     nix flake check -L

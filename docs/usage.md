@@ -17,11 +17,11 @@ Omit `--demo` for an empty notebook. `init` creates a `hyp/` data directory and 
 
 ```bash
 nix build                      # result/bin/hyp
-nix flake check                # package tests, formatting, clippy, the jsdom and browser UI tests
+nix flake check                # package tests, formatting, clippy, the jsdom and (not on macOS) browser UI tests
 nix run . -- --help
 ```
 
-The flake pins nixpkgs and supports `x86_64-linux` and `aarch64-linux`. All Cargo dependencies are pinned in `Cargo.lock`. A first build requires network access or a populated Nix cache; the installed application works offline.
+The flake pins nixpkgs and supports `x86_64-linux`, `aarch64-linux`, `x86_64-darwin` and `aarch64-darwin`. All Cargo dependencies are pinned in `Cargo.lock`. A first build requires network access or a populated Nix cache; the installed application works offline.
 
 Or build directly with a recent Rust toolchain:
 

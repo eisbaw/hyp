@@ -477,8 +477,12 @@ fn a_write_without_access_to_hyp_dir_says_so_whichever_lock_is_missing() {
         let err: serde_json::Value = serde_json::from_slice(&add.stderr).unwrap();
         let message = err["error"].as_str().unwrap();
         assert!(
-            message.contains(&format!("needs write access to {}", hyp_dir.display()))
-                && message.contains("nothing was written"),
+            // hyp names the canonical path, which differs when the temporary
+            // directory is behind a symlink (on macOS, /var is /private/var).
+            message.contains(&format!(
+                "needs write access to {}",
+                hyp_dir.canonicalize().unwrap().display()
+            )) && message.contains("nothing was written"),
             "{missing}: {message}"
         );
         assert_eq!(err["kind"], "io", "{missing}");
